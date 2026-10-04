@@ -28,7 +28,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.26'      # ★ 必须 ≥ go.mod 里的版本
+          go-version: '1.26'
           cache: false
 
       - name: Show Go version
@@ -40,7 +40,9 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      # ★ 直接用 runner 自带的 Android SDK（避免 setup-android@v3 的 tools 缺失问题）
+      # ============================================================
+      # Android SDK / NDK
+      # ============================================================
       - name: Locate Android SDK
         shell: bash
         run: |
@@ -150,6 +152,7 @@ jobs:
           time gomobile bind \
             -target=android \
             -androidapi 26 \
+            -ldflags "-checklinkname=0" \
             -o ../app/libs/n2nclient.aar \
             .
           echo ""
