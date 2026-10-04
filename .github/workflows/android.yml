@@ -28,7 +28,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version: '1.26'      # ★ 必须 ≥ go.mod 里的版本
           cache: false
 
       - name: Show Go version
@@ -40,11 +40,10 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      # ★ 关键：不用 setup-android@v3，直接用 runner 自带的 SDK
+      # ★ 直接用 runner 自带的 Android SDK（避免 setup-android@v3 的 tools 缺失问题）
       - name: Locate Android SDK
         shell: bash
         run: |
-          # GitHub ubuntu-latest runner 自带 Android SDK
           if [ -z "$ANDROID_HOME" ] && [ -z "$ANDROID_SDK_ROOT" ]; then
             export ANDROID_HOME=/usr/local/lib/android/sdk
           fi
@@ -52,7 +51,6 @@ jobs:
           echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
           echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> $GITHUB_ENV
 
-          # 找 sdkmanager
           SDKMGR=""
           for p in "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
                    "$ANDROID_HOME/cmdline-tools/16.0/bin/sdkmanager" \
@@ -81,7 +79,6 @@ jobs:
       - name: Setup Android NDK
         shell: bash
         run: |
-          # 检查是否已装
           if [ -d "$ANDROID_HOME/ndk/26.1.10909125" ]; then
             echo "✅ NDK 26.1.10909125 已存在（runner 自带）"
           else
@@ -91,7 +88,6 @@ jobs:
 
           if [ ! -d "$ANDROID_HOME/ndk/26.1.10909125" ]; then
             echo "::error::NDK 安装失败"
-            echo "--- 现有 NDK 版本 ---"
             ls "$ANDROID_HOME/ndk/" || echo "ndk 目录不存在"
             exit 1
           fi
@@ -198,7 +194,6 @@ jobs:
           fi
           SIZE=$(du -h "$APK" | cut -f1)
           echo "✅ APK: $APK ($SIZE)"
-          echo "SIZE=$SIZE" >> $GITHUB_ENV
 
       # ============================================================
       # 上传产物
