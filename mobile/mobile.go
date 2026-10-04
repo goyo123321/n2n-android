@@ -37,8 +37,7 @@ func (c *Client) SetTunFD(fd int) {
 	c.tunFd = fd
 }
 
-// FetchVirtualIP 独立连一次信令拿虚拟 IP，然后断开
-// 用于 Android 侧提前建 TUN 绑定正确的 IP
+// FetchVirtualIP 独立连一次信令拿虚拟 IP
 func (c *Client) FetchVirtualIP(cfg *Config) string {
 	icfg := &internal.Config{
 		SignalingURL: cfg.SignalingURL,
@@ -162,4 +161,16 @@ func (c *Client) GetPeersJSON() string {
 		return "[]"
 	}
 	return edge.GetPeersJSON()
+}
+
+// ============ 日志查看（package-level 静态方法）============
+
+// GetLogs 返回全部日志
+func GetLogs() string {
+	return internal.GetLogs()
+}
+
+// ClearLogs 清空日志
+func ClearLogs() {
+	internal.ClearLogs()
 }
