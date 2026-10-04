@@ -1,31 +1,27 @@
 <?xml version="1.0" encoding="utf-8"?>
-<androidx.coordinatorlayout.widget.CoordinatorLayout
-    xmlns:android="http://schemas.android.com/apk/res/android"
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="@color/brand_bg">
+    android:background="@color/brand_bg"
+    android:orientation="vertical">
 
-    <com.google.android.material.appbar.AppBarLayout
+    <!-- Toolbar -->
+    <com.google.android.material.appbar.MaterialToolbar
+        android:id="@+id/toolbar"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
+        android:layout_height="?attr/actionBarSize"
         android:background="@color/brand_surface"
-        app:elevation="0dp">
+        app:title="@string/title_app"
+        app:titleTextColor="@color/brand_text" />
 
-        <com.google.android.material.appbar.MaterialToolbar
-            android:id="@+id/toolbar"
-            android:layout_width="match_parent"
-            android:layout_height="?attr/actionBarSize"
-            app:title="@string/title_app"
-            app:titleTextColor="@color/brand_text" />
-    </com.google.android.material.appbar.AppBarLayout>
-
+    <!-- 可滚动内容 -->
     <androidx.core.widget.NestedScrollView
         android:layout_width="match_parent"
-        android:layout_height="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
         android:clipToPadding="false"
-        android:paddingBottom="96dp"
-        app:layout_behavior="@string/appbar_scrolling_view_behavior">
+        android:paddingBottom="16dp">
 
         <LinearLayout
             android:layout_width="match_parent"
@@ -374,49 +370,54 @@
         </LinearLayout>
     </androidx.core.widget.NestedScrollView>
 
-    <!-- 底部按钮栏 -->
-    <LinearLayout
+    <!-- ★ 底部固定按钮栏 -->
+    <FrameLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_gravity="bottom"
         android:background="@color/brand_surface"
-        android:orientation="horizontal"
-        android:padding="16dp"
-        app:layout_behavior="@string/appbar_scrolling_view_behavior">
+        android:elevation="8dp"
+        android:padding="16dp">
 
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/btnSave"
-            style="@style/Widget.Material3.Button.OutlinedButton"
-            android:layout_width="0dp"
+        <!-- 保存 + 启动 -->
+        <LinearLayout
+            android:id="@+id/bottomBarIdle"
+            android:layout_width="match_parent"
             android:layout_height="48dp"
-            android:layout_marginEnd="8dp"
-            android:layout_weight="1"
-            android:text="@string/btn_save"
-            android:textColor="@color/brand_text"
-            app:strokeColor="@color/brand_border" />
+            android:orientation="horizontal">
 
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnSave"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_marginEnd="8dp"
+                android:layout_weight="1"
+                android:text="@string/btn_save"
+                android:textColor="@color/brand_text"
+                app:strokeColor="@color/brand_border" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnStart"
+                style="@style/Widget.Material3.Button"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_marginStart="8dp"
+                android:layout_weight="2"
+                android:text="@string/btn_start"
+                android:textColor="#FFFFFF"
+                app:backgroundTint="@color/brand_accent" />
+        </LinearLayout>
+
+        <!-- 停止按钮（运行时显示） -->
         <com.google.android.material.button.MaterialButton
-            android:id="@+id/btnStart"
+            android:id="@+id/btnStop"
             style="@style/Widget.Material3.Button"
-            android:layout_width="0dp"
+            android:layout_width="match_parent"
             android:layout_height="48dp"
-            android:layout_marginStart="8dp"
-            android:layout_weight="2"
-            android:text="@string/btn_start"
+            android:text="@string/btn_stop"
             android:textColor="#FFFFFF"
-            app:backgroundTint="@color/brand_accent" />
-    </LinearLayout>
+            android:visibility="gone"
+            app:backgroundTint="@color/brand_danger" />
+    </FrameLayout>
 
-    <com.google.android.material.button.MaterialButton
-        android:id="@+id/btnStop"
-        style="@style/Widget.Material3.Button"
-        android:layout_width="match_parent"
-        android:layout_height="48dp"
-        android:layout_gravity="bottom"
-        android:layout_margin="16dp"
-        android:visibility="gone"
-        android:text="@string/btn_stop"
-        android:textColor="#FFFFFF"
-        app:backgroundTint="@color/brand_danger" />
-
-</androidx.coordinatorlayout.widget.CoordinatorLayout>
+</LinearLayout>
