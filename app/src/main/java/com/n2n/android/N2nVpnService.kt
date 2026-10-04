@@ -42,6 +42,10 @@ class N2nVpnService : VpnService() {
         return START_STICKY
     }
 
+    // ============================================================
+    // 启动
+    // ============================================================
+
     private fun handleStart(intent: Intent) {
         if (started) {
             Log.w(TAG, "already started")
@@ -60,6 +64,7 @@ class N2nVpnService : VpnService() {
         val shareDir = intent.getStringExtra(EXTRA_SHARE_DIR)
             ?: ShareDirManager.getDefaultShareDir(this).absolutePath
 
+        // 1. 建立 TUN
         val pfd = buildTunInterface()
         if (pfd == null) {
             Log.e(TAG, "failed to establish TUN")
@@ -68,8 +73,10 @@ class N2nVpnService : VpnService() {
         }
         tunInterface = pfd
 
+        // 2. 前台通知
         startForeground(NOTIF_ID, buildNotification("正在启动..."))
 
+        // 3. 组装 Config
         val config = Config().apply {
             setSignalingURL(signalingUrl)
             setRoomID(roomId)
@@ -79,6 +86,7 @@ class N2nVpnService : VpnService() {
             setShareDir(shareDir)
         }
 
+        // 4. 启动 Go 客户端
         val err = N2nController.start(pfd.detachFd(), config)
         if (err.isNotEmpty()) {
             Log.e(TAG, "client start failed: $err")
@@ -88,12 +96,16 @@ class N2nVpnService : VpnService() {
 
         started = true
 
-        // 重新绑定上传进度监听
+        // 5. 重新绑定上传进度监听
         N2nController.setProgressListener(UploadProgressListener(applicationContext))
 
         updateNotification("已连接 · 虚拟 IP ${N2nController.getVirtualIP()}")
         Log.i(TAG, "VPN started, virtual IP = ${N2nController.getVirtualIP()}")
     }
+
+    // ============================================================
+    // 停止
+    // ============================================================
 
     private fun handleStop() {
         if (started) {
@@ -114,13 +126,17 @@ class N2nVpnService : VpnService() {
         stopSelf()
     }
 
+    // ============================================================
+    // TUN 接口
+    // ============================================================
+
     private fun buildTunInterface(): ParcelFileDescriptor? {
         return try {
             Builder()
                 .setSession("n2n-client")
-                .setMtu(1280)
-                .addAddress("10.64.0.2", 24)
-                .addRoute("10.64.0.0", 24)
+                .setMtu(1280)                  // gVisor netstack 路径 MTU 较小
+                .addAddress("10.64.0.2", 24)   // 虚拟 IP（正式版应从信令获取）
+                .addRoute("10.64.0.0", 24)     // 只路由 n2n 网段
                 .addDnsServer("1.1.1.1")
                 .setBlocking(true)
                 .establish()
@@ -129,6 +145,10 @@ class N2nVpnService : VpnService() {
             null
         }
     }
+
+    // ============================================================
+    // 通知
+    // ============================================================
 
     private fun buildNotification(text: String): Notification {
         createChannelIfNeeded()
@@ -140,15 +160,18 @@ class N2nVpnService : VpnService() {
         return NotificationCompat.Builder(this, NOTIF_CHANNEL_ID)
             .setContentTitle("n2n 组网")
             .setContentText(text)
-            .setSmallIcon(android.R.drawable.stat_sys_vpn_ic)
+            .setSmallIcon(android.R.drawable.stat_sys_download_done)  // ★ 系统内置图标
             .setContentIntent(pi)
             .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
     }
 
     private fun updateNotification(text: String) {
-        val nm = getSystemService(NotificationManager::class.java)
-        nm.notify(NOTIF_ID, buildNotification(text))
+        try {
+            val nm = getSystemService(NotificationManager::class.java)
+            nm.notify(NOTIF_ID, buildNotification(text))
+        } catch (_: Exception) {}
     }
 
     private fun createChannelIfNeeded() {
@@ -159,11 +182,17 @@ class N2nVpnService : VpnService() {
                     NOTIF_CHANNEL_ID,
                     "n2n VPN",
                     NotificationManager.IMPORTANCE_LOW
-                ).apply { description = "n2n 组网运行状态" }
+                ).apply {
+                    description = "n2n 组网运行状态"
+                }
                 nm.createNotificationChannel(ch)
             }
         }
     }
+
+    // ============================================================
+    // 生命周期
+    // ============================================================
 
     override fun onDestroy() {
         handleStop()
