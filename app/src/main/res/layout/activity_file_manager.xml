@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/brand_bg"
+    android:orientation="vertical">
+
+    <!-- Toolbar -->
+    <com.google.android.material.appbar.MaterialToolbar
+        android:id="@+id/toolbar"
+        android:layout_width="match_parent"
+        android:layout_height="?attr/actionBarSize"
+        android:background="@color/brand_surface"
+        app:navigationIcon="@drawable/ic_arrow_back"
+        app:title="@string/file_manager_title"
+        app:titleTextColor="@color/brand_text" />
+
+    <!-- 当前路径 -->
+    <TextView
+        android:id="@+id/tvPath"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@color/brand_surface_2"
+        android:ellipsize="start"
+        android:fontFamily="monospace"
+        android:paddingHorizontal="16dp"
+        android:paddingVertical="10dp"
+        android:singleLine="true"
+        android:text="/"
+        android:textColor="@color/brand_text_dim"
+        android:textSize="12sp" />
+
+    <!-- 空状态 -->
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1">
+
+        <TextView
+            android:id="@+id/tvEmpty"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:drawablePadding="12dp"
+            android:gravity="center"
+            android:padding="48dp"
+            android:text="@string/empty_folder"
+            android:textColor="@color/brand_text_dim"
+            android:textSize="14sp"
+            android:visibility="gone" />
+
+        <!-- 文件列表 -->
+        <androidx.recyclerview.widget.RecyclerView
+            android:id="@+id/rvFiles"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:clipToPadding="false"
+            android:paddingBottom="8dp"
+            android:scrollbars="vertical" />
+    </FrameLayout>
+
+    <!-- 底部操作栏 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@color/brand_surface"
+        android:elevation="8dp"
+        android:orientation="horizontal"
+        android:padding="12dp">
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnNewFolder"
+            style="@style/Widget.Material3.Button.OutlinedButton"
+            android:layout_width="0dp"
+            android:layout_height="48dp"
+            android:layout_marginEnd="6dp"
+            android:layout_weight="1"
+            android:text="@string/btn_new_folder"
+            android:textColor="@color/brand_text"
+            app:strokeColor="@color/brand_border" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnUpload"
+            style="@style/Widget.Material3.Button"
+            android:layout_width="0dp"
+            android:layout_height="48dp"
+            android:layout_marginStart="6dp"
+            android:layout_weight="1"
+            android:text="@string/btn_upload"
+            android:textColor="#FFFFFF"
+            app:backgroundTint="@color/brand_accent" />
+    </LinearLayout>
+
+</LinearLayout>
