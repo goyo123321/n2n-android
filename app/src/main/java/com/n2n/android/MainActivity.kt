@@ -23,12 +23,21 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
 
+    // 每 3 秒刷新节点列表
     private val peersTicker = object : Runnable {
         override fun run() {
             if (N2nController.isRunning()) {
                 refreshPeers()
             }
             binding.root.postDelayed(this, 3000)
+        }
+    }
+
+    // ★ 每 1 秒刷新状态（自动切换启动/停止按钮）
+    private val statusTicker = object : Runnable {
+        override fun run() {
+            refreshStatus()
+            binding.root.postDelayed(this, 1000)
         }
     }
 
@@ -72,21 +81,14 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        // 加载配置
         loadConfig(savedInstanceState)
         handleIntentParams(intent)
         refreshShareDirDisplay(Prefs.loadShareDirUri(this))
 
-        // 通知权限
         requestNotifPermissionIfNeeded()
-
-        // 首次启动提示（共享目录）
         showFirstLaunchDialogIfNeeded()
-
-        // ★ 检查 WSS 是否为空
         checkSignalingUrl()
 
-        // Toolbar 菜单
         binding.toolbar.inflateMenu(R.menu.menu_main)
         binding.toolbar.setOnMenuItemClickListener { item ->
             when (item.itemId) {
@@ -98,7 +100,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // 按钮
         binding.btnStart.setOnClickListener { saveThenRequest() }
         binding.btnStop.setOnClickListener { stopVpnService() }
         binding.btnSave.setOnClickListener {
@@ -112,6 +113,7 @@ class MainActivity : AppCompatActivity() {
 
         refreshStatus()
         binding.root.postDelayed(peersTicker, 3000)
+        binding.root.postDelayed(statusTicker, 1000)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -135,6 +137,7 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         binding.root.removeCallbacks(peersTicker)
+        binding.root.removeCallbacks(statusTicker)
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -210,7 +213,6 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    // ★ 新增：WSS 为空时弹窗提示填写
     private fun checkSignalingUrl() {
         val currentUrl = binding.etSignalingUrl.text.toString().trim()
         if (currentUrl.isNotEmpty()) return
@@ -310,6 +312,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun saveCurrentInput() {
+        // ★ Client ID 为空时自动生成一个持久化的
+        if (binding.etClientId.text.toString().trim().isEmpty()) {
+            val autoId = Prefs.loadOrCreateClientId(this)
+            binding.etClientId.setText(autoId)
+        }
+
         Prefs.save(this, Prefs.Config(
             signalingUrl = binding.etSignalingUrl.text.toString().trim(),
             roomId = binding.etRoomId.text.toString().trim(),
@@ -331,7 +339,6 @@ class MainActivity : AppCompatActivity() {
     private fun requestVpnPermission() {
         val url = binding.etSignalingUrl.text.toString().trim()
 
-        // ★ WSS 为空：弹窗提示
         if (url.isEmpty()) {
             toast("请先填写 WSS 地址")
             checkSignalingUrl()
@@ -376,7 +383,8 @@ class MainActivity : AppCompatActivity() {
         }
         startForegroundService(intent)
         toast("正在启动...")
-        binding.root.postDelayed({ refreshStatus() }, 1500)
+        // 立即刷新一次（显示"启动中"），后续 statusTicker 会自动刷新
+        binding.root.postDelayed({ refreshStatus() }, 500)
     }
 
     private fun stopVpnService() {
@@ -414,8 +422,6 @@ class MainActivity : AppCompatActivity() {
 
             binding.btnStart.visibility = View.GONE
             binding.btnStop.visibility = View.VISIBLE
-
-            refreshPeers()
         } else {
             binding.tvStatus.text = getString(R.string.status_stopped)
             binding.tvStatus.setTextColor(getColor(R.color.brand_text_dim))
@@ -426,8 +432,6 @@ class MainActivity : AppCompatActivity() {
 
             binding.btnStart.visibility = View.VISIBLE
             binding.btnStop.visibility = View.GONE
-
-            refreshPeers()
         }
     }
 
