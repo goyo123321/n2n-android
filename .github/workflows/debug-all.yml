@@ -80,6 +80,7 @@ jobs:
           gomobile bind \
             -target=android \
             -androidapi 26 \
+            -javapkg=com.n2n.client \
             -ldflags "-checklinkname=0" \
             -o ../app/libs/n2nclient.aar \
             . 2>&1 | tee /tmp/step1.log
