@@ -15,8 +15,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AppCompatDelegate
-import com.n2n.mobile.databinding.ActivityMainBinding
-import com.n2n.mobile.databinding.ItemPeerBinding
+import com.n2n.android.databinding.ActivityMainBinding
+import com.n2n.android.databinding.ItemPeerBinding
 import org.json.JSONArray
 
 class MainActivity : AppCompatActivity() {
