@@ -40,28 +40,64 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      # ★ 关键：不用 setup-android@v3，直接用 runner 自带的 SDK
+      - name: Locate Android SDK
+        shell: bash
+        run: |
+          # GitHub ubuntu-latest runner 自带 Android SDK
+          if [ -z "$ANDROID_HOME" ] && [ -z "$ANDROID_SDK_ROOT" ]; then
+            export ANDROID_HOME=/usr/local/lib/android/sdk
+          fi
+          export ANDROID_HOME="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> $GITHUB_ENV
 
-      # ★ 关键：接受所有 Android SDK license（CI 非交互环境必须）
+          # 找 sdkmanager
+          SDKMGR=""
+          for p in "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+                   "$ANDROID_HOME/cmdline-tools/16.0/bin/sdkmanager" \
+                   "$ANDROID_HOME/tools/bin/sdkmanager"; do
+            if [ -x "$p" ]; then
+              SDKMGR="$p"
+              break
+            fi
+          done
+          if [ -z "$SDKMGR" ]; then
+            echo "::error::找不到 sdkmanager"
+            find "$ANDROID_HOME" -name sdkmanager 2>/dev/null || true
+            exit 1
+          fi
+          echo "SDKMANAGER=$SDKMGR" >> $GITHUB_ENV
+          echo "✅ ANDROID_HOME=$ANDROID_HOME"
+          echo "✅ sdkmanager=$SDKMGR"
+          "$SDKMGR" --version
+
       - name: Accept Android SDK licenses
         shell: bash
         run: |
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
           echo "✅ 已接受所有 SDK licenses"
 
-      # ★ 安装 NDK 并验证
       - name: Setup Android NDK
         shell: bash
         run: |
-          yes | sdkmanager --install "ndk;26.1.10909125" > /dev/null 2>&1 || true
+          # 检查是否已装
+          if [ -d "$ANDROID_HOME/ndk/26.1.10909125" ]; then
+            echo "✅ NDK 26.1.10909125 已存在（runner 自带）"
+          else
+            echo "安装 NDK 26.1.10909125..."
+            yes | "$SDKMANAGER" --install "ndk;26.1.10909125" > /dev/null 2>&1 || true
+          fi
+
           if [ ! -d "$ANDROID_HOME/ndk/26.1.10909125" ]; then
             echo "::error::NDK 安装失败"
-            ls -la "$ANDROID_HOME/ndk/" || echo "ndk 目录不存在"
+            echo "--- 现有 NDK 版本 ---"
+            ls "$ANDROID_HOME/ndk/" || echo "ndk 目录不存在"
             exit 1
           fi
+
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125" >> $GITHUB_ENV
-          echo "✅ NDK 已安装: $ANDROID_HOME/ndk/26.1.10909125"
+          echo "✅ ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125"
 
       - name: Verify NDK
         shell: bash
