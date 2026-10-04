@@ -1,0 +1,165 @@
+name: Fix Databinding Import
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: '目标分支'
+        required: true
+        type: string
+        default: 'main'
+      dry_run:
+        description: 'Dry run（只检测不改文件）'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ============================================================
+      # 检测当前状态
+      # ============================================================
+      - name: Detect current state
+        id: detect
+        shell: bash
+        run: |
+          echo "=== 当前所有 databinding import ==="
+          grep -rn "databinding" app/src/main/java/com/n2n/android/ || echo "(无)"
+
+          echo ""
+          echo "=== 当前 com.n2n.mobile.databinding 引用数 ==="
+          WRONG=$(grep -rc "com\.n2n\.mobile\.databinding" app/src/main/java/com/n2n/android/*.kt 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')
+          echo "错误引用数: $WRONG"
+
+          echo ""
+          echo "=== 当前 com.n2n.android.databinding 引用数 ==="
+          RIGHT=$(grep -rc "com\.n2n\.android\.databinding" app/src/main/java/com/n2n/android/*.kt 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')
+          echo "正确引用数: $RIGHT"
+
+          echo "wrong_count=$WRONG" >> $GITHUB_OUTPUT
+          echo "right_count=$RIGHT" >> $GITHUB_OUTPUT
+
+          if [ "$WRONG" -gt 0 ]; then
+            echo "need_fix=true" >> $GITHUB_OUTPUT
+            echo "::notice::检测到 $WRONG 处错误引用需要修复"
+          else
+            echo "need_fix=false" >> $GITHUB_OUTPUT
+            echo "::notice::无需修复"
+          fi
+
+      # ============================================================
+      # 修复：只改 databinding 那一行
+      # ============================================================
+      - name: Fix databinding imports
+        if: steps.detect.outputs.need_fix == 'true' && !inputs.dry_run
+        shell: bash
+        run: |
+          cd app/src/main/java/com/n2n/android
+
+          echo "=== 修改前 ==="
+          grep -n "databinding" *.kt || echo "(无)"
+
+          for f in *.kt; do
+            sed -i 's|com\.n2n\.mobile\.databinding|com.n2n.android.databinding|g' "$f"
+          done
+
+          echo ""
+          echo "=== 修改后 ==="
+          grep -n "databinding" *.kt || echo "(无)"
+
+      # ============================================================
+      # 显示 diff
+      # ============================================================
+      - name: Show diff
+        if: steps.detect.outputs.need_fix == 'true'
+        shell: bash
+        run: |
+          echo "=== git diff ==="
+          git diff --stat
+          echo ""
+          git diff app/src/main/java/com/n2n/android/ | head -100
+
+      # ============================================================
+      # 提交
+      # ============================================================
+      - name: Commit and push
+        if: steps.detect.outputs.need_fix == 'true' && !inputs.dry_run
+        shell: bash
+        env:
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add app/src/main/java/com/n2n/android/*.kt
+
+          MSG="fix: databinding import 改回 com.n2n.android（修复上次误改） [skip ci]"
+          git commit -m "$MSG"
+          git push origin "$BRANCH"
+          echo "✅ 已推送到 $BRANCH"
+
+      # ============================================================
+      # 修复后验证
+      # ============================================================
+      - name: Verify after fix
+        if: always()
+        shell: bash
+        run: |
+          echo ""
+          echo "=========== 最终验证 ==========="
+          echo "--- databinding（应为 com.n2n.android.databinding）---"
+          grep -rn "databinding" app/src/main/java/com/n2n/android/ || echo "(无)"
+          echo ""
+          echo "--- com.n2n.mobile（应为 AAR 生成的类）---"
+          grep -rn "import com\.n2n\.mobile\." app/src/main/java/com/n2n/android/ || echo "(无)"
+
+      # ============================================================
+      # Summary
+      # ============================================================
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          echo "## Fix Databinding Import 结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- 分支: \`${{ inputs.branch }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Dry run: \`${{ inputs.dry_run }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 检测结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- 错误引用数（\`com.n2n.mobile.databinding\`）: \`${{ steps.detect.outputs.wrong_count }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- 正确引用数（\`com.n2n.android.databinding\`）: \`${{ steps.detect.outputs.right_count }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- 是否需要修复: \`${{ steps.detect.outputs.need_fix }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.detect.outputs.need_fix }}" = "true" ] && [ "${{ inputs.dry_run }}" = "false" ]; then
+            echo "### ✅ 已自动修复并推送" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.detect.outputs.need_fix }}" = "true" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "### 🔍 Dry run：检测到需要修复，但未改动文件" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ✅ 无需修复" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 最终 import 检查" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**databinding（应为 com.n2n.android.databinding）**" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          grep -rn "databinding" app/src/main/java/com/n2n/android/ >> $GITHUB_STEP_SUMMARY || echo "(无)" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**com.n2n.mobile（应为 AAR 生成的类）**" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          grep -rn "import com\.n2n\.mobile\." app/src/main/java/com/n2n/android/ >> $GITHUB_STEP_SUMMARY || echo "(无)" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
