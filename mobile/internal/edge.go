@@ -42,10 +42,10 @@ type Edge struct {
 	virtualIP string
 	roomId    string
 
-	ws          *WSTransport
-	relayMgr    *RelayManager
-	turnClient  *TURNClient
-	tun         *TUNDevice
+	ws         *WSTransport
+	relayMgr   *RelayManager
+	turnClient *TURNClient
+	tun        *TUNDevice
 
 	udpConn *net.UDPConn
 	udpPort int
@@ -66,6 +66,60 @@ type Edge struct {
 
 var httpClient = &http.Client{Timeout: 30 * time.Second}
 
+// generateDefaultClientID 生成默认 Client ID
+// ★ 固定规则（不用随机），保证 FetchVirtualIP 和 Start 用同一个 ID
+func generateDefaultClientID() string {
+	hostname, _ := os.Hostname()
+	if hostname == "" {
+		hostname = "android"
+	}
+	return fmt.Sprintf("%s-android", hostname)
+}
+
+// ============ 提前获取虚拟 IP（Android 侧用）============
+
+// FetchVirtualIP 连一次信令拿虚拟 IP，然后断开
+// 用于 Android 提前建 TUN 绑定正确的 IP
+func FetchVirtualIP(cfg *Config) string {
+	if cfg.SignalingURL == "" {
+		return ""
+	}
+
+	clientId := cfg.ClientID
+	if clientId == "" {
+		clientId = generateDefaultClientID()
+	}
+
+	ws, err := NewWSTransport(cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken)
+	if err != nil {
+		log.Printf("[FetchVIP] 连接信令失败: %v", err)
+		return ""
+	}
+	defer ws.Close()
+
+	done := make(chan string, 1)
+	ws.onMessage = func(msg map[string]interface{}) {
+		t, _ := msg["type"].(string)
+		if t == "ready" {
+			payload, _ := msg["payload"].(map[string]interface{})
+			vip, _ := payload["virtualIp"].(string)
+			select {
+			case done <- vip:
+			default:
+			}
+		}
+	}
+
+	select {
+	case vip := <-done:
+		log.Printf("[FetchVIP] 拿到虚拟 IP: %s", vip)
+		return vip
+	case <-time.After(15 * time.Second):
+		log.Printf("[FetchVIP] 超时")
+		return ""
+	}
+}
+
 // Start 启动客户端
 func Start(cfg *Config, tunFd int) (*Edge, error) {
 	if cfg.SignalingURL == "" {
@@ -75,10 +129,10 @@ func Start(cfg *Config, tunFd int) (*Edge, error) {
 		return nil, fmt.Errorf("TUN fd 无效")
 	}
 
+	// ★ 用固定规则生成 Client ID（和 FetchVirtualIP 一致）
 	clientId := cfg.ClientID
 	if clientId == "" {
-		hostname, _ := os.Hostname()
-		clientId = fmt.Sprintf("%s-%d", hostname, time.Now().UnixNano()%1e9)
+		clientId = generateDefaultClientID()
 	}
 	nodeName := cfg.NodeName
 	if nodeName == "" {
@@ -167,7 +221,6 @@ func Start(cfg *Config, tunFd int) (*Edge, error) {
 	return e, nil
 }
 
-
 // Stop 停止
 func (e *Edge) Stop() {
 	e.closeMu.Lock()
@@ -211,7 +264,7 @@ func (e *Edge) GetClientID() string {
 	return e.clientId
 }
 
-// GetPeersJSON 返回节点列表 JSON
+// GetPeersJSON 节点列表 JSON
 func (e *Edge) GetPeersJSON() string {
 	e.peersMu.RLock()
 	defer e.peersMu.RUnlock()
@@ -224,7 +277,6 @@ func (e *Edge) GetPeersJSON() string {
 	for id, p := range e.peers {
 		list = append(list, pair{id, p})
 	}
-	// 简单排序
 	for i := 0; i < len(list); i++ {
 		for j := i + 1; j < len(list); j++ {
 			if list[i].id > list[j].id {
@@ -276,7 +328,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		e.peersMu.Unlock()
 		log.Printf("[信令] 分配虚拟 IP: %s", vip)
 
-		// ★ 初始化 netstack + 共享盘
+		// 初始化 netstack + 共享盘
 		if e.netstack == nil && vip != "" {
 			ns, err := NewNetstackHost(vip)
 			if err != nil {
@@ -320,7 +372,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			},
 		})
 
-		// 处理已有 peers
 		if peers, ok := payload["peers"].([]interface{}); ok {
 			for _, p := range peers {
 				pm, ok := p.(map[string]interface{})
@@ -489,12 +540,10 @@ func (e *Edge) udpReadLoop() {
 		if n < 4 {
 			continue
 		}
-		// 打洞探测包
 		if buf[0] == 'N' && buf[1] == '2' && buf[2] == 'N' && buf[3] == 'P' {
 			e.notePeerTraffic(addr)
 			continue
 		}
-		// IPv4
 		if buf[0]>>4 == 4 {
 			e.notePeerTraffic(addr)
 			e.onRemotePacket(buf[:n])
@@ -521,13 +570,11 @@ func (e *Edge) tunReadLoop() {
 		dstIP := net.IP(buf[16:20]).String()
 		vip := e.GetVirtualIP()
 
-		// ★ 目标是本机 → 交给 netstack
 		if dstIP == vip && e.netstack != nil {
 			e.netstack.InjectTUNPacket(buf[:n])
 			continue
 		}
 
-		// 目标是别的 peer → 转发
 		e.peersMu.RLock()
 		var target *PeerInfo
 		for _, p := range e.peers {
@@ -614,7 +661,6 @@ func (e *Edge) enqueueTUN(data []byte) {
 	}
 }
 
-// onRemotePacket 处理从对端收到的包
 func (e *Edge) onRemotePacket(data []byte) {
 	if len(data) < 20 || data[0]>>4 != 4 {
 		return
@@ -623,18 +669,13 @@ func (e *Edge) onRemotePacket(data []byte) {
 	dstIP := net.IP(data[16:20]).String()
 	vip := e.GetVirtualIP()
 
-	// ★ 目标是本机 → netstack
 	if dstIP == vip && e.netstack != nil {
 		e.netstack.InjectTUNPacket(data)
 		return
 	}
-
-	// 不是本机的包丢弃（避免死循环）
 	if dstIP != vip {
 		return
 	}
-
-	// netstack 未就绪 → 写回 TUN 兜底
 	e.enqueueTUN(data)
 }
 
