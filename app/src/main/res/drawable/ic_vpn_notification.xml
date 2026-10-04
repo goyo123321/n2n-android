@@ -160,7 +160,7 @@ class N2nVpnService : VpnService() {
         return NotificationCompat.Builder(this, NOTIF_CHANNEL_ID)
             .setContentTitle("n2n 组网")
             .setContentText(text)
-            .setSmallIcon(R.drawable.ic_vpn_notification)   // ★ 自定义图标
+            .setSmallIcon(android.R.drawable.stat_sys_download_done)  // ★ 系统内置图标
             .setContentIntent(pi)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
