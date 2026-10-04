@@ -12,6 +12,7 @@ import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import com.n2n.mobile.Client
 import com.n2n.mobile.Config
 
 class N2nVpnService : VpnService() {
@@ -37,7 +38,6 @@ class N2nVpnService : VpnService() {
 
     private val handler = Handler(Looper.getMainLooper())
 
-    /** ★ 轮询虚拟 IP，等 Go 端拿到后更新通知 */
     private val updateIpRunnable = object : Runnable {
         private var attempts = 0
         override fun run() {
@@ -47,7 +47,6 @@ class N2nVpnService : VpnService() {
                 updateNotification("已连接 · 虚拟 IP $ip")
                 Log.i(TAG, "VPN 虚拟 IP: $ip")
             } else if (attempts < 30) {
-                // 最多轮询 30 次（30 秒）
                 updateNotification("正在连接... (${attempts}s)")
                 handler.postDelayed(this, 1000)
             } else {
@@ -84,19 +83,9 @@ class N2nVpnService : VpnService() {
         val shareDir = intent.getStringExtra(EXTRA_SHARE_DIR)
             ?: ShareDirManager.getDefaultShareDir(this).absolutePath
 
-        // 1. 建立 TUN
-        val pfd = buildTunInterface()
-        if (pfd == null) {
-            Log.e(TAG, "failed to establish TUN")
-            stopSelf()
-            return
-        }
-        tunInterface = pfd
+        // 前台通知
+        startForeground(NOTIF_ID, buildNotification("正在获取虚拟 IP..."))
 
-        // 2. 前台通知（先显示"正在启动"）
-        startForeground(NOTIF_ID, buildNotification("正在启动..."))
-
-        // 3. 组装 Config
         val config = Config().apply {
             setSignalingURL(signalingUrl)
             setRoomID(roomId)
@@ -106,23 +95,50 @@ class N2nVpnService : VpnService() {
             setShareDir(shareDir)
         }
 
-        val tunFd = pfd.detachFd()
+        // ★ 后台线程：先 fetch VIP → 建 TUN → start
+        Thread {
+            Log.i(TAG, "正在获取虚拟 IP...")
+            val tmpClient = Client()
+            val vip = tmpClient.fetchVirtualIP(config)
 
-        // ★ 4. 异步启动 Go 客户端（不在主线程）
-        N2nController.startAsync(tunFd, config) { err ->
             handler.post {
-                if (err.isNotEmpty()) {
-                    Log.e(TAG, "client start failed: $err")
-                    updateNotification("启动失败: $err")
+                if (vip.isEmpty()) {
+                    Log.e(TAG, "获取虚拟 IP 失败")
+                    updateNotification("获取虚拟 IP 失败")
                     handler.postDelayed({ stopVpn() }, 3000)
-                } else {
-                    started = true
-                    Log.i(TAG, "Go 客户端已启动，等待虚拟 IP...")
-                    // ★ 启动轮询虚拟 IP
-                    handler.post(updateIpRunnable)
+                    return@post
+                }
+
+                Log.i(TAG, "拿到虚拟 IP: $vip")
+                updateNotification("虚拟 IP: $vip，正在建立 TUN...")
+
+                // 用这个 IP 建 TUN
+                val pfd = buildTunInterface(vip)
+                if (pfd == null) {
+                    Log.e(TAG, "建立 TUN 失败")
+                    updateNotification("建立 TUN 失败")
+                    handler.postDelayed({ stopVpn() }, 3000)
+                    return@post
+                }
+                tunInterface = pfd
+
+                // 启动 Go 客户端
+                val tunFd = pfd.detachFd()
+                N2nController.startAsync(tunFd, config) { err ->
+                    handler.post {
+                        if (err.isNotEmpty()) {
+                            Log.e(TAG, "client start failed: $err")
+                            updateNotification("启动失败: $err")
+                            handler.postDelayed({ stopVpn() }, 3000)
+                        } else {
+                            started = true
+                            Log.i(TAG, "Go 客户端已启动，等待数据就绪...")
+                            handler.post(updateIpRunnable)
+                        }
+                    }
                 }
             }
-        }
+        }.start()
     }
 
     private fun stopVpn() {
@@ -130,7 +146,6 @@ class N2nVpnService : VpnService() {
     }
 
     private fun handleStop() {
-        // 停止 IP 轮询
         handler.removeCallbacks(updateIpRunnable)
 
         if (started) {
@@ -151,12 +166,16 @@ class N2nVpnService : VpnService() {
         stopSelf()
     }
 
-    private fun buildTunInterface(): ParcelFileDescriptor? {
+    /**
+     * 用服务端分配的虚拟 IP 建 TUN
+     */
+    private fun buildTunInterface(vip: String): ParcelFileDescriptor? {
         return try {
+            Log.i(TAG, "建立 TUN，绑定 IP: $vip")
             Builder()
                 .setSession("n2n-client")
                 .setMtu(1280)
-                .addAddress("10.64.0.2", 24)
+                .addAddress(vip, 24)
                 .addRoute("10.64.0.0", 24)
                 .addDnsServer("1.1.1.1")
                 .setBlocking(true)
