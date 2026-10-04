@@ -14,6 +14,10 @@ on:
         type: boolean
         default: false
 
+# ★ 允许 workflow 写 Release（修复 "Resource not accessible by integration"）
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
