@@ -37,6 +37,20 @@ func (c *Client) SetTunFD(fd int) {
 	c.tunFd = fd
 }
 
+// FetchVirtualIP 独立连一次信令拿虚拟 IP，然后断开
+// 用于 Android 侧提前建 TUN 绑定正确的 IP
+func (c *Client) FetchVirtualIP(cfg *Config) string {
+	icfg := &internal.Config{
+		SignalingURL: cfg.SignalingURL,
+		RoomID:       cfg.RoomID,
+		ClientID:     cfg.ClientID,
+		NodeName:     cfg.NodeName,
+		ConnectToken: cfg.ConnectToken,
+		ShareDir:     cfg.ShareDir,
+	}
+	return internal.FetchVirtualIP(icfg)
+}
+
 func (c *Client) Start(cfg *Config) string {
 	c.mu.Lock()
 	if c.running {
