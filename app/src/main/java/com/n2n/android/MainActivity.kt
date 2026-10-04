@@ -9,7 +9,7 @@ import android.os.Build
 import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
-import android.widget.EditText
+import android.view.inputmethod.InputMethodManager
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
@@ -23,7 +23,6 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
 
-    // 节流刷新节点列表
     private val peersTicker = object : Runnable {
         override fun run() {
             if (N2nController.isRunning()) {
@@ -33,7 +32,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // VPN 权限
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -44,16 +42,10 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 通知权限（Android 13+）
     private val notifPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (!granted) {
-            // 用户拒绝通知权限，不影响功能，只是收不到上传进度提示
-        }
-    }
+    ) { /* 忽略 */ }
 
-    // SAF 目录选择
     private val pickDirLauncher = registerForActivityResult(
         ActivityResultContracts.OpenDocumentTree()
     ) { uri: Uri? ->
@@ -74,7 +66,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        // ★ 必须在 super.onCreate 之前应用主题
         applyThemeMode(Prefs.loadThemeMode(this))
         super.onCreate(savedInstanceState)
 
@@ -86,13 +77,16 @@ class MainActivity : AppCompatActivity() {
         handleIntentParams(intent)
         refreshShareDirDisplay(Prefs.loadShareDirUri(this))
 
-        // 通知权限（Android 13+）
+        // 通知权限
         requestNotifPermissionIfNeeded()
 
-        // 首次启动提示
+        // 首次启动提示（共享目录）
         showFirstLaunchDialogIfNeeded()
 
-        // Toolbar 菜单（主题切换）
+        // ★ 检查 WSS 是否为空
+        checkSignalingUrl()
+
+        // Toolbar 菜单
         binding.toolbar.inflateMenu(R.menu.menu_main)
         binding.toolbar.setOnMenuItemClickListener { item ->
             when (item.itemId) {
@@ -116,12 +110,7 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent(this, FileManagerActivity::class.java))
         }
 
-        // 注册上传进度监听
-
-        // 初始状态
         refreshStatus()
-
-        // 启动节点列表轮询
         binding.root.postDelayed(peersTicker, 3000)
     }
 
@@ -194,7 +183,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ============================================================
-    // 首次启动提示
+    // 首次启动
     // ============================================================
 
     private fun showFirstLaunchDialogIfNeeded() {
@@ -205,18 +194,55 @@ class MainActivity : AppCompatActivity() {
                 """
                 你的共享目录位于：
                 Android/media/com.n2n.android/shared/
-                
+
                 • MT 管理器可直接访问（无需授权）
                 • USB 连电脑可直接拖拽文件
                 • 微信/QQ 能直接选到里面的文件
                 • PC 端可通过 n2n 组网访问
-                
+
                 系统首次访问时会提示"允许访问媒体文件"，请点"允许"以启用外部访问。
                 """.trimIndent()
             )
             .setPositiveButton("知道了") { _, _ ->
                 Prefs.setFirstLaunchDone(this)
             }
+            .setCancelable(false)
+            .show()
+    }
+
+    // ★ 新增：WSS 为空时弹窗提示填写
+    private fun checkSignalingUrl() {
+        val currentUrl = binding.etSignalingUrl.text.toString().trim()
+        if (currentUrl.isNotEmpty()) return
+
+        AlertDialog.Builder(this)
+            .setTitle("首次使用：请填写服务器地址")
+            .setMessage(
+                """
+                你需要填写 edge-signal Worker 的 WSS 地址。
+
+                如果你已经部署了 edge-signal：
+                  • 打开 Cloudflare Dashboard
+                  • Workers & Pages → edge-signal
+                  • 复制访问地址（形如 wss://xxx.workers.dev）
+
+                如果你还没有部署：
+                  • 参考 edge-signal 项目文档
+                  • 或使用朋友分享给你的地址
+                """.trimIndent()
+            )
+            .setPositiveButton("我现在就填") { _, _ ->
+                binding.etSignalingUrl.requestFocus()
+                binding.etSignalingUrl.setSelection(
+                    binding.etSignalingUrl.text?.length ?: 0
+                )
+                val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
+                imm.showSoftInput(
+                    binding.etSignalingUrl,
+                    InputMethodManager.SHOW_IMPLICIT
+                )
+            }
+            .setNegativeButton("稍后再说", null)
             .setCancelable(false)
             .show()
     }
@@ -245,7 +271,6 @@ class MainActivity : AppCompatActivity() {
     private fun handleIntentParams(intent: Intent?) {
         intent ?: return
 
-        // n2n://connect?...
         if (intent.action == Intent.ACTION_VIEW && intent.data != null) {
             val data = intent.data!!
             if (data.scheme == "n2n" && data.host == "connect") {
@@ -262,7 +287,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // adb --es 参数
         val url = intent.getStringExtra(N2nVpnService.EXTRA_SIGNALING_URL)
         val room = intent.getStringExtra(N2nVpnService.EXTRA_ROOM_ID)
         val cid = intent.getStringExtra(N2nVpnService.EXTRA_CLIENT_ID)
@@ -306,10 +330,19 @@ class MainActivity : AppCompatActivity() {
 
     private fun requestVpnPermission() {
         val url = binding.etSignalingUrl.text.toString().trim()
+
+        // ★ WSS 为空：弹窗提示
+        if (url.isEmpty()) {
+            toast("请先填写 WSS 地址")
+            checkSignalingUrl()
+            return
+        }
+
         if (!url.startsWith("wss://") && !url.startsWith("ws://")) {
             toast("WSS 地址必须以 wss:// 或 ws:// 开头")
             return
         }
+
         val room = binding.etRoomId.text.toString().trim()
         if (room.isEmpty()) {
             toast("房间名不能为空")
@@ -371,7 +404,6 @@ class MainActivity : AppCompatActivity() {
             binding.tvClientId.visibility = View.VISIBLE
             binding.cardStatus.setStrokeColor(getColor(R.color.brand_success))
 
-            // 共享盘地址
             val vip = N2nController.getVirtualIP()
             if (vip.isNotEmpty()) {
                 binding.tvShareUrl.text = "共享盘: http://$vip:9090/"
@@ -395,7 +427,7 @@ class MainActivity : AppCompatActivity() {
             binding.btnStart.visibility = View.VISIBLE
             binding.btnStop.visibility = View.GONE
 
-            refreshPeers()   // 显示空列表
+            refreshPeers()
         }
     }
 
@@ -463,14 +495,18 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ============================================================
-    // 共享目录显示
+    // 共享目录
     // ============================================================
 
     private fun refreshShareDirDisplay(uri: String?) {
         binding.tvShareDir.text = if (uri.isNullOrEmpty()) {
             ShareDirManager.getDefaultShareDir(this).absolutePath
         } else {
-            uri
+            try {
+                java.net.URLDecoder.decode(uri, "UTF-8")
+            } catch (e: Exception) {
+                uri
+            }
         }
     }
 
