@@ -1,5 +1,4 @@
 // Package mobile 是 gomobile 的桥接层。
-// 只暴露 Client、Config、ProgressListener 给 Kotlin。
 package mobile
 
 import (
@@ -9,9 +8,6 @@ import (
 
 	"github.com/goyo123321a/n2n-android/mobile/internal"
 )
-
-// ProgressListener 类型别名
-type ProgressListener = internal.ProgressListener
 
 type Config struct {
 	SignalingURL string
@@ -29,7 +25,6 @@ type Client struct {
 	virtualIP string
 	clientID  string
 	edge      *internal.Edge
-	listener  ProgressListener
 }
 
 func NewClient() *Client {
@@ -40,15 +35,6 @@ func (c *Client) SetTunFD(fd int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.tunFd = fd
-}
-
-func (c *Client) SetProgressListener(l ProgressListener) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.listener = l
-	if c.edge != nil {
-		c.edge.SetProgressListener(l)
-	}
 }
 
 func (c *Client) Start(cfg *Config) string {
@@ -62,7 +48,6 @@ func (c *Client) Start(cfg *Config) string {
 		return "tun fd not set"
 	}
 	tunFd := c.tunFd
-	listener := c.listener
 	c.mu.Unlock()
 
 	icfg := &internal.Config{
@@ -77,9 +62,6 @@ func (c *Client) Start(cfg *Config) string {
 	edge, err := internal.Start(icfg, tunFd)
 	if err != nil {
 		return err.Error()
-	}
-	if listener != nil {
-		edge.SetProgressListener(listener)
 	}
 
 	c.mu.Lock()

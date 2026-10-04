@@ -97,7 +97,6 @@ class N2nVpnService : VpnService() {
         started = true
 
         // 5. 重新绑定上传进度监听
-        N2nController.setProgressListener(UploadProgressListener(applicationContext))
 
         updateNotification("已连接 · 虚拟 IP ${N2nController.getVirtualIP()}")
         Log.i(TAG, "VPN started, virtual IP = ${N2nController.getVirtualIP()}")

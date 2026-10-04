@@ -2,7 +2,6 @@ package com.n2n.android
 
 import com.n2n.mobile.Client
 import com.n2n.mobile.Config
-import com.n2n.mobile.ProgressListener
 import java.util.concurrent.atomic.AtomicBoolean
 
 object N2nController {
@@ -36,8 +35,4 @@ object N2nController {
     fun getVirtualIP(): String = client?.virtualIP ?: ""
     fun getClientID(): String = client?.clientID ?: ""
     fun getPeersJSON(): String = client?.peersJSON ?: "[]"
-
-    fun setProgressListener(l: ProgressListener) {
-        client?.setProgressListener(l)
-    }
 }

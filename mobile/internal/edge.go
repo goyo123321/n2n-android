@@ -167,13 +167,6 @@ func Start(cfg *Config, tunFd int) (*Edge, error) {
 	return e, nil
 }
 
-// SetProgressListener 设置上传进度回调
-func (e *Edge) SetProgressListener(l ProgressListener) {
-	e.progress = &ProgressDispatcher{Listener: l}
-	if e.netstack != nil {
-		e.netstack.progress = e.progress
-	}
-}
 
 // Stop 停止
 func (e *Edge) Stop() {

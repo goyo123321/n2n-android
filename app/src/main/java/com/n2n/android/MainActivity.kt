@@ -117,7 +117,6 @@ class MainActivity : AppCompatActivity() {
         }
 
         // 注册上传进度监听
-        N2nController.setProgressListener(UploadProgressListener(this))
 
         // 初始状态
         refreshStatus()
