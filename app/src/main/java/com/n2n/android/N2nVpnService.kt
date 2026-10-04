@@ -7,6 +7,8 @@ import android.app.PendingIntent
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -33,6 +35,28 @@ class N2nVpnService : VpnService() {
     private var tunInterface: ParcelFileDescriptor? = null
     private var started = false
 
+    private val handler = Handler(Looper.getMainLooper())
+
+    /** ★ 轮询虚拟 IP，等 Go 端拿到后更新通知 */
+    private val updateIpRunnable = object : Runnable {
+        private var attempts = 0
+        override fun run() {
+            attempts++
+            val ip = N2nController.getVirtualIP()
+            if (ip.isNotEmpty()) {
+                updateNotification("已连接 · 虚拟 IP $ip")
+                Log.i(TAG, "VPN 虚拟 IP: $ip")
+            } else if (attempts < 30) {
+                // 最多轮询 30 次（30 秒）
+                updateNotification("正在连接... (${attempts}s)")
+                handler.postDelayed(this, 1000)
+            } else {
+                updateNotification("连接超时")
+                Log.w(TAG, "等待虚拟 IP 超时")
+            }
+        }
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> handleStart(intent)
@@ -41,10 +65,6 @@ class N2nVpnService : VpnService() {
         }
         return START_STICKY
     }
-
-    // ============================================================
-    // 启动
-    // ============================================================
 
     private fun handleStart(intent: Intent) {
         if (started) {
@@ -73,7 +93,7 @@ class N2nVpnService : VpnService() {
         }
         tunInterface = pfd
 
-        // 2. 前台通知
+        // 2. 前台通知（先显示"正在启动"）
         startForeground(NOTIF_ID, buildNotification("正在启动..."))
 
         // 3. 组装 Config
@@ -86,27 +106,33 @@ class N2nVpnService : VpnService() {
             setShareDir(shareDir)
         }
 
-        // 4. 启动 Go 客户端
-        val err = N2nController.start(pfd.detachFd(), config)
-        if (err.isNotEmpty()) {
-            Log.e(TAG, "client start failed: $err")
-            stopSelf()
-            return
+        val tunFd = pfd.detachFd()
+
+        // ★ 4. 异步启动 Go 客户端（不在主线程）
+        N2nController.startAsync(tunFd, config) { err ->
+            handler.post {
+                if (err.isNotEmpty()) {
+                    Log.e(TAG, "client start failed: $err")
+                    updateNotification("启动失败: $err")
+                    handler.postDelayed({ stopVpn() }, 3000)
+                } else {
+                    started = true
+                    Log.i(TAG, "Go 客户端已启动，等待虚拟 IP...")
+                    // ★ 启动轮询虚拟 IP
+                    handler.post(updateIpRunnable)
+                }
+            }
         }
-
-        started = true
-
-        // 5. 重新绑定上传进度监听
-
-        updateNotification("已连接 · 虚拟 IP ${N2nController.getVirtualIP()}")
-        Log.i(TAG, "VPN started, virtual IP = ${N2nController.getVirtualIP()}")
     }
 
-    // ============================================================
-    // 停止
-    // ============================================================
+    private fun stopVpn() {
+        handleStop()
+    }
 
     private fun handleStop() {
+        // 停止 IP 轮询
+        handler.removeCallbacks(updateIpRunnable)
+
         if (started) {
             N2nController.stop()
             started = false
@@ -125,17 +151,13 @@ class N2nVpnService : VpnService() {
         stopSelf()
     }
 
-    // ============================================================
-    // TUN 接口
-    // ============================================================
-
     private fun buildTunInterface(): ParcelFileDescriptor? {
         return try {
             Builder()
                 .setSession("n2n-client")
-                .setMtu(1280)                  // gVisor netstack 路径 MTU 较小
-                .addAddress("10.64.0.2", 24)   // 虚拟 IP（正式版应从信令获取）
-                .addRoute("10.64.0.0", 24)     // 只路由 n2n 网段
+                .setMtu(1280)
+                .addAddress("10.64.0.2", 24)
+                .addRoute("10.64.0.0", 24)
                 .addDnsServer("1.1.1.1")
                 .setBlocking(true)
                 .establish()
@@ -144,10 +166,6 @@ class N2nVpnService : VpnService() {
             null
         }
     }
-
-    // ============================================================
-    // 通知
-    // ============================================================
 
     private fun buildNotification(text: String): Notification {
         createChannelIfNeeded()
@@ -159,7 +177,7 @@ class N2nVpnService : VpnService() {
         return NotificationCompat.Builder(this, NOTIF_CHANNEL_ID)
             .setContentTitle("n2n 组网")
             .setContentText(text)
-            .setSmallIcon(android.R.drawable.stat_sys_download_done)  // ★ 系统内置图标
+            .setSmallIcon(android.R.drawable.stat_sys_download_done)
             .setContentIntent(pi)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
@@ -189,11 +207,8 @@ class N2nVpnService : VpnService() {
         }
     }
 
-    // ============================================================
-    // 生命周期
-    // ============================================================
-
     override fun onDestroy() {
+        handler.removeCallbacks(updateIpRunnable)
         handleStop()
         super.onDestroy()
     }
