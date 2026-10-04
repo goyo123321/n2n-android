@@ -1,10 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- 基础权限 -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- 前台服务 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+
+    <!-- 通知（Android 13+） -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
@@ -16,6 +21,7 @@
         android:theme="@style/Theme.N2n"
         android:usesCleartextTraffic="true">
 
+        <!-- 主界面 -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -38,12 +44,21 @@
             </intent-filter>
         </activity>
 
+        <!-- 文件管理 -->
         <activity
             android:name=".FileManagerActivity"
             android:exported="false"
             android:label="文件管理"
             android:parentActivityName=".MainActivity" />
 
+        <!-- 运行日志 -->
+        <activity
+            android:name=".LogActivity"
+            android:exported="false"
+            android:label="运行日志"
+            android:parentActivityName=".MainActivity" />
+
+        <!-- VPN 服务 -->
         <service
             android:name=".N2nVpnService"
             android:exported="false"
@@ -57,6 +72,7 @@
                 android:value="n2n P2P VPN tunnel" />
         </service>
 
+        <!-- FileProvider（分享/预览/导出用） -->
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="com.n2n.android.fileprovider"
