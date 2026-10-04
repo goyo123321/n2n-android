@@ -40,9 +40,6 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      # ============================================================
-      # Android SDK / NDK
-      # ============================================================
       - name: Locate Android SDK
         shell: bash
         run: |
@@ -70,7 +67,6 @@ jobs:
           echo "SDKMANAGER=$SDKMGR" >> $GITHUB_ENV
           echo "✅ ANDROID_HOME=$ANDROID_HOME"
           echo "✅ sdkmanager=$SDKMGR"
-          "$SDKMGR" --version
 
       - name: Accept Android SDK licenses
         shell: bash
@@ -82,7 +78,7 @@ jobs:
         shell: bash
         run: |
           if [ -d "$ANDROID_HOME/ndk/26.1.10909125" ]; then
-            echo "✅ NDK 26.1.10909125 已存在（runner 自带）"
+            echo "✅ NDK 26.1.10909125 已存在"
           else
             echo "安装 NDK 26.1.10909125..."
             yes | "$SDKMANAGER" --install "ndk;26.1.10909125" > /dev/null 2>&1 || true
@@ -152,6 +148,7 @@ jobs:
           time gomobile bind \
             -target=android \
             -androidapi 26 \
+            -javapkg=com.n2n.client \
             -ldflags "-checklinkname=0" \
             -o ../app/libs/n2nclient.aar \
             .
