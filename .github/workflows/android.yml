@@ -128,6 +128,8 @@ jobs:
           echo "--- go.mod ---"
           cat go.mod
           echo ""
+          echo "--- mobile.go 第一行（package 名）---"
+          head -1 mobile.go
           echo "✅ go mod tidy 完成"
 
       - name: gomobile init
@@ -148,7 +150,7 @@ jobs:
           time gomobile bind \
             -target=android \
             -androidapi 26 \
-            -javapkg=com.n2n.client \
+            -javapkg=com.n2n \
             -ldflags "-checklinkname=0" \
             -o ../app/libs/n2nclient.aar \
             .
@@ -159,6 +161,9 @@ jobs:
             exit 1
           fi
           ls -la ../app/libs/
+          echo ""
+          echo "--- 检查 AAR 里的包名 ---"
+          unzip -l ../app/libs/n2nclient.aar | grep -E "com/n2n" | head -10 || true
           echo "✅ AAR 已生成"
 
       # ============================================================
