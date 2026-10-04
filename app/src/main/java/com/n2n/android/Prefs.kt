@@ -14,7 +14,8 @@ object Prefs {
     private const val KEY_THEME_MODE = "theme_mode"
     private const val KEY_FIRST_LAUNCH = "first_launch_done"
 
-    private const val DEFAULT_SIGNALING_URL = "wss://edge-signal.xloavnui.workers.dev"
+    // ★ 空默认值，让用户首次启动填
+    private const val DEFAULT_SIGNALING_URL = ""
     private const val DEFAULT_ROOM_ID = "default-room"
     private const val DEFAULT_NODE_NAME = "Android"
 
