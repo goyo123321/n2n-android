@@ -67,7 +67,7 @@ type Edge struct {
 var httpClient = &http.Client{Timeout: 30 * time.Second}
 
 // generateDefaultClientID 生成默认 Client ID
-// ★ 固定规则（不用随机），保证 FetchVirtualIP 和 Start 用同一个 ID
+// 固定规则（不用随机），保证 FetchVirtualIP 和 Start 用同一个 ID
 func generateDefaultClientID() string {
 	hostname, _ := os.Hostname()
 	if hostname == "" {
@@ -79,7 +79,6 @@ func generateDefaultClientID() string {
 // ============ 提前获取虚拟 IP（Android 侧用）============
 
 // FetchVirtualIP 连一次信令拿虚拟 IP，然后断开
-// 用于 Android 提前建 TUN 绑定正确的 IP
 func FetchVirtualIP(cfg *Config) string {
 	if cfg.SignalingURL == "" {
 		return ""
@@ -129,7 +128,6 @@ func Start(cfg *Config, tunFd int) (*Edge, error) {
 		return nil, fmt.Errorf("TUN fd 无效")
 	}
 
-	// ★ 用固定规则生成 Client ID（和 FetchVirtualIP 一致）
 	clientId := cfg.ClientID
 	if clientId == "" {
 		clientId = generateDefaultClientID()
@@ -372,7 +370,9 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			},
 		})
 
+		// ★ 打印已有节点列表（诊断用）
 		if peers, ok := payload["peers"].([]interface{}); ok {
+			log.Printf("[信令] ready: 服务端返回 %d 个已有节点", len(peers))
 			for _, p := range peers {
 				pm, ok := p.(map[string]interface{})
 				if !ok {
@@ -382,25 +382,51 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 				pip, _ := pm["virtualIp"].(string)
 				pubIP, _ := pm["publicIp"].(string)
 				pubPort := jsonInt(pm["publicPort"])
+				sharePort := jsonInt(pm["sharePort"])
 				relayAddr, _ := pm["turnRelayAddr"].(string)
 				if pid == "" || pip == "" {
 					continue
 				}
-				e.registerPeer(pid, pip, pubIP, pubPort, relayAddr)
+				e.registerPeer(pid, pip, pubIP, pubPort, sharePort)
+				if relayAddr != "" {
+					e.peersMu.Lock()
+					if pi, ok := e.peers[pid]; ok {
+						pi.TurnRelayAddr = relayAddr
+					}
+					e.peersMu.Unlock()
+				}
+				// ★ 每个已有节点打印一行日志
+				log.Printf("[信令] 已有节点: %s vip=%s pub=%s:%d share=%d",
+					pid, pip, pubIP, pubPort, sharePort)
 			}
+		} else {
+			log.Printf("[信令] ready: 服务端返回 0 个已有节点（房间里只有自己）")
 		}
 
 	case "joined":
 		payload, _ := msg["payload"].(map[string]interface{})
 		if payload == nil {
+			log.Printf("[信令] joined: payload 为空，忽略")
 			return
 		}
 		pip, _ := payload["virtualIp"].(string)
 		pubIP, _ := payload["publicIp"].(string)
 		pubPort := jsonInt(payload["publicPort"])
 		relayAddr, _ := payload["turnRelayAddr"].(string)
+
+		// ★ 打印原始信息（诊断用）
+		log.Printf("[信令] joined: from=%s vip=%s pub=%s:%d",
+			from, pip, pubIP, pubPort)
+
 		if from != "" && pip != "" {
-			e.registerPeer(from, pip, pubIP, pubPort, relayAddr)
+			e.registerPeer(from, pip, pubIP, pubPort, 0)
+			if relayAddr != "" {
+				e.peersMu.Lock()
+				if pi, ok := e.peers[from]; ok {
+					pi.TurnRelayAddr = relayAddr
+				}
+				e.peersMu.Unlock()
+			}
 			log.Printf("[信令] 节点上线: %s vip=%s", from, pip)
 		}
 
@@ -428,6 +454,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		return
 
 	case "left":
+		log.Printf("[信令] 节点离开: %s", from)
 		e.peersMu.Lock()
 		delete(e.peers, from)
 		e.peersMu.Unlock()
@@ -444,7 +471,7 @@ func jsonInt(v interface{}) int {
 	return 0
 }
 
-func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, relayAddr string) {
+func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, sharePort int) {
 	var udpAddr *net.UDPAddr
 	if pubIP != "" && pubPort > 0 {
 		udpAddr = &net.UDPAddr{IP: net.ParseIP(pubIP), Port: pubPort}
@@ -455,20 +482,26 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, relayAddr strin
 		if vip != "" {
 			p.VirtualIP = vip
 		}
+		if pubIP != "" {
+			p.PubIP = pubIP
+		}
+		if pubPort > 0 {
+			p.PubPort = pubPort
+		}
+		if sharePort > 0 {
+			p.SharePort = sharePort
+		}
 		if udpAddr != nil {
 			p.UDPAddr = udpAddr
 		}
-		if relayAddr != "" {
-			p.TurnRelayAddr = relayAddr
-		}
 	} else {
 		e.peers[pid] = &PeerInfo{
-			ClientID:      pid,
-			VirtualIP:     vip,
-			PubIP:         pubIP,
-			PubPort:       pubPort,
-			UDPAddr:       udpAddr,
-			TurnRelayAddr: relayAddr,
+			ClientID:  pid,
+			VirtualIP: vip,
+			PubIP:     pubIP,
+			PubPort:   pubPort,
+			SharePort: sharePort,
+			UDPAddr:   udpAddr,
 		}
 	}
 }
