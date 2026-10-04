@@ -1,0 +1,388 @@
+name: Check Project
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    name: 项目完整性自检
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: false
+
+      # ============================================================
+      # 1. Android 项目结构
+      # ============================================================
+      - name: Check 1 - Gradle Wrapper
+        id: gradle
+        shell: bash
+        run: |
+          echo "### 1. Gradle Wrapper" >> $GITHUB_STEP_SUMMARY
+          ok=0
+          fail=0
+          for f in gradlew gradlew.bat gradle/wrapper/gradle-wrapper.jar gradle/wrapper/gradle-wrapper.properties; do
+            if [ -e "$f" ]; then
+              echo "✅ $f"
+              echo "- ✅ \`$f\`" >> $GITHUB_STEP_SUMMARY
+              ok=$((ok+1))
+            else
+              echo "❌ 缺失: $f"
+              echo "- ❌ **缺失**: \`$f\`" >> $GITHUB_STEP_SUMMARY
+              fail=$((fail+1))
+            fi
+          done
+          echo "result=ok=$ok,fail=$fail" >> $GITHUB_OUTPUT
+          if [ "$fail" -gt 0 ]; then
+            echo "::error::缺少 $fail 个 Gradle Wrapper 文件"
+            echo ""
+            echo "修法（本地执行）:"
+            echo "  gradle wrapper --gradle-version 8.7"
+            echo "或者从其他 Android 项目复制 gradlew / gradlew.bat / gradle/wrapper/gradle-wrapper.jar"
+            exit 1
+          fi
+
+      # ============================================================
+      # 2. 顶层配置文件
+      # ============================================================
+      - name: Check 2 - 顶层配置
+        shell: bash
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 2. 顶层配置" >> $GITHUB_STEP_SUMMARY
+          fail=0
+          for f in build.gradle.kts settings.gradle.kts gradle.properties; do
+            if [ -e "$f" ]; then
+              echo "✅ $f"
+              echo "- ✅ \`$f\`" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "❌ 缺失: $f"
+              echo "- ❌ **缺失**: \`$f\`" >> $GITHUB_STEP_SUMMARY
+              fail=$((fail+1))
+            fi
+          done
+          if [ "$fail" -gt 0 ]; then
+            echo "::error::缺少顶层配置文件"
+            exit 1
+          fi
+
+      # ============================================================
+      # 3. app 模块配置
+      # ============================================================
+      - name: Check 3 - app 模块
+        shell: bash
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 3. app 模块" >> $GITHUB_STEP_SUMMARY
+          fail=0
+          for f in app/build.gradle.kts app/proguard-rules.pro app/src/main/AndroidManifest.xml; do
+            if [ -e "$f" ]; then
+              echo "✅ $f"
+              echo "- ✅ \`$f\`" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "❌ 缺失: $f"
+              echo "- ❌ **缺失**: \`$f\`" >> $GITHUB_STEP_SUMMARY
+              fail=$((fail+1))
+            fi
+          done
+          if [ "$fail" -gt 0 ]; then
+            echo "::error::缺少 app 模块配置"
+            exit 1
+          fi
+
+      # ============================================================
+      # 4. Kotlin 源文件（应有 8 个）
+      # ============================================================
+      - name: Check 4 - Kotlin 源文件
+        shell: bash
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 4. Kotlin 源文件（预期 8 个）" >> $GITHUB_STEP_SUMMARY
+          dir="app/src/main/java/com/n2n/android"
+          expected=(
+            MainActivity.kt
+            N2nVpnService.kt
+            N2nController.kt
+            Prefs.kt
+            ShareDirManager.kt
+            FileManagerActivity.kt
+            FileAdapter.kt
+            UploadProgressListener.kt
+          )
+          fail=0
+          for f in "${expected[@]}"; do
+            if [ -e "$dir/$f" ]; then
+              echo "✅ $f"
+              echo "- ✅ \`$f\`" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "❌ 缺失: $f"
+              echo "- ❌ **缺失**: \`$f\`" >> $GITHUB_STEP_SUMMARY
+              fail=$((fail+1))
+            fi
+          done
+          actual=$(ls "$dir"/*.kt 2>/dev/null | wc -l)
+          echo "实际 .kt 文件数: $actual"
+          if [ "$fail" -gt 0 ]; then
+            echo "::error::缺少 $fail 个 Kotlin 文件"
+            exit 1
+          fi
+
+      # ============================================================
+      # 5. 资源文件
+      # ============================================================
+      - name: Check 5 - 资源文件
+        shell: bash
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 5. 资源文件" >> $GITHUB_STEP_SUMMARY
+          expected=(
+            app/src/main/res/layout/activity_main.xml
+            app/src/main/res/layout/activity_file_manager.xml
+            app/src/main/res/layout/item_file.xml
+            app/src/main/res/layout/item_peer.xml
+            app/src/main/res/menu/menu_main.xml
+            app/src/main/res/values/strings.xml
+            app/src/main/res/values/colors.xml
+            app/src/main/res/values/themes.xml
+            app/src/main/res/values-night/colors.xml
+            app/src/main/res/xml/file_paths.xml
+            app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml
+            app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml
+            app/src/main/res/drawable/ic_launcher_background.xml
+            app/src/main/res/drawable/ic_launcher_foreground.xml
+            app/src/main/res/drawable/ic_arrow_back.xml
+            app/src/main/res/drawable/ic_theme.xml
+          )
+          fail=0
+          for f in "${expected[@]}"; do
+            if [ -e "$f" ]; then
+              echo "✅ $f"
+              echo "- ✅ \`$(basename $f)\`" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "❌ 缺失: $f"
+              echo "- ❌ **缺失**: \`$f\`" >> $GITHUB_STEP_SUMMARY
+              fail=$((fail+1))
+            fi
+          done
+          if [ "$fail" -gt 0 ]; then
+            echo "::error::缺少 $fail 个资源文件"
+            exit 1
+          fi
+
+      # ============================================================
+      # 6. Go 源文件（应有 11 个）
+      # ============================================================
+      - name: Check 6 - Go 源文件
+        shell: bash
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 6. Go 源文件（预期 11 个）" >> $GITHUB_STEP_SUMMARY
+          expected=(
+            config.go
+            edge.go
+            helpers.go
+            nat_probe.go
+            nathole_executor.go
+            netstack.go
+            progress.go
+            relay_fallback.go
+            tun_android.go
+            turn_client.go
+            ws_transport.go
+          )
+          fail=0
+          for f in "${expected[@]}"; do
+            if [ -e "mobile/internal/$f" ]; then
+              echo "✅ mobile/internal/$f"
+              echo "- ✅ \`internal/$f\`" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "❌ 缺失: mobile/internal/$f"
+              echo "- ❌ **缺失**: \`internal/$f\`" >> $GITHUB_STEP_SUMMARY
+              fail=$((fail+1))
+            fi
+          done
+          if [ -e "mobile/mobile.go" ]; then
+            echo "✅ mobile/mobile.go"
+            echo "- ✅ \`mobile.go\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ 缺失: mobile/mobile.go"
+            echo "- ❌ **缺失**: \`mobile.go\`" >> $GITHUB_STEP_SUMMARY
+            fail=$((fail+1))
+          fi
+          if [ "$fail" -gt 0 ]; then
+            echo "::error::缺少 $fail 个 Go 文件"
+            exit 1
+          fi
+
+      # ============================================================
+      # 7. go.mod 一致性
+      # ============================================================
+      - name: Check 7 - go.mod 一致性
+        shell: bash
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 7. go.mod 一致性" >> $GITHUB_STEP_SUMMARY
+
+          if [ ! -f mobile/go.mod ]; then
+            echo "❌ mobile/go.mod 不存在"
+            echo "- ❌ \`mobile/go.mod\` 不存在" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+          MODULE_LINE=$(head -1 mobile/go.mod)
+          echo "module 行: $MODULE_LINE"
+          echo "- module: \`$MODULE_LINE\`" >> $GITHUB_STEP_SUMMARY
+
+          # 检查 mobile.go 是否 import internal 包
+          if grep -q "n2n-android/mobile/internal" mobile/mobile.go; then
+            echo "✅ mobile.go 正确 import internal"
+            echo "- ✅ \`mobile.go\` 正确 import \`internal\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ mobile.go 未 import internal"
+            echo "- ❌ \`mobile.go\` 未 import \`internal\`" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+          # 检查 mobile.go 不应 import gVisor
+          if grep -q "gvisor" mobile/mobile.go; then
+            echo "❌ mobile.go 不应 import gVisor（会导致 gomobile 失败）"
+            echo "- ❌ \`mobile.go\` 错误 import gVisor" >> $GITHUB_STEP_SUMMARY
+            echo ""
+            echo "找到:"
+            grep -n "gvisor" mobile/mobile.go
+            exit 1
+          else
+            echo "✅ mobile.go 未 import gVisor（正确）"
+            echo "- ✅ \`mobile.go\` 未 import gVisor（正确）" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # ============================================================
+      # 8. Go 本地编译测试
+      # ============================================================
+      - name: Check 8 - Go 本地编译
+        shell: bash
+        working-directory: mobile
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 8. Go 本地编译" >> $GITHUB_STEP_SUMMARY
+
+          echo "--- go mod download ---"
+          go mod download
+
+          echo "--- go build ./... ---"
+          if go build ./... 2>&1; then
+            echo "✅ go build 通过"
+            echo "- ✅ \`go build ./...\` 通过" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ go build 失败"
+            echo "- ❌ \`go build ./...\` 失败" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+          echo "--- go vet ./... ---"
+          if go vet ./... 2>&1; then
+            echo "✅ go vet 通过"
+            echo "- ✅ \`go vet ./...\` 通过" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ go vet 有警告（不阻塞）"
+            echo "- ⚠️ \`go vet\` 有警告" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # ============================================================
+      # 9. go.sum 是否已提交
+      # ============================================================
+      - name: Check 9 - go.sum
+        shell: bash
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 9. go.sum" >> $GITHUB_STEP_SUMMARY
+
+          if [ -f mobile/go.sum ]; then
+            lines=$(wc -l < mobile/go.sum)
+            echo "✅ mobile/go.sum 存在（$lines 行）"
+            echo "- ✅ \`mobile/go.sum\` 存在（$lines 行）" >> $GITHUB_STEP_SUMMARY
+
+            # 检查是否被 git 跟踪
+            if git ls-files --error-unmatch mobile/go.sum >/dev/null 2>&1; then
+              echo "✅ mobile/go.sum 已被 git 跟踪"
+              echo "- ✅ \`mobile/go.sum\` 已被 git 跟踪" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "❌ mobile/go.sum 未被 git 跟踪"
+              echo "- ❌ \`mobile/go.sum\` **未**被 git 跟踪" >> $GITHUB_STEP_SUMMARY
+              echo "  请先运行 'Update go.sum' workflow"
+              exit 1
+            fi
+          else
+            echo "❌ mobile/go.sum 不存在"
+            echo "- ❌ \`mobile/go.sum\` 不存在" >> $GITHUB_STEP_SUMMARY
+            echo "  请先运行 'Update go.sum' workflow"
+            exit 1
+          fi
+
+          # 检查 .gitignore 是否忽略 go.sum
+          if grep -qE "^go\.sum$|^mobile/go\.sum$" .gitignore 2>/dev/null; then
+            echo "❌ .gitignore 忽略了 go.sum"
+            echo "- ❌ \`.gitignore\` 忽略了 \`go.sum\`" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "✅ .gitignore 未忽略 go.sum"
+            echo "- ✅ \`.gitignore\` 未忽略 \`go.sum\`" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # ============================================================
+      # 10. gomobile 试编译（仅 init + 检查依赖能否下载）
+      # ============================================================
+      - name: Check 10 - gVisor 依赖
+        shell: bash
+        working-directory: mobile
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 10. gVisor 依赖" >> $GITHUB_STEP_SUMMARY
+
+          if grep -q "gvisor.dev/gvisor" go.mod; then
+            echo "✅ go.mod 包含 gVisor"
+            echo "- ✅ \`go.mod\` 包含 gVisor" >> $GITHUB_STEP_SUMMARY
+            gvisor_ver=$(grep "gvisor.dev/gvisor" go.mod | head -1 | awk '{print $2}')
+            echo "版本: $gvisor_ver"
+            echo "- gVisor 版本: \`$gvisor_ver\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ go.mod 未包含 gVisor（共享盘功能将无法工作）"
+            echo "- ❌ \`go.mod\` 未包含 gVisor" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+          # 尝试下载 gVisor
+          if go list -m gvisor.dev/gvisor >/dev/null 2>&1; then
+            echo "✅ gVisor 可下载"
+            echo "- ✅ gVisor 可下载" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ gVisor 无法下载（网络问题或版本无效）"
+            echo "- ❌ gVisor 无法下载" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+      # ============================================================
+      # 汇总
+      # ============================================================
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "## ✅ 全部通过" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "可以运行 \`Build Android APK\` workflow 了。" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "## ❌ 存在问题" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "请根据上方 ❌ 项修复后再试。" >> $GITHUB_STEP_SUMMARY
+          fi
