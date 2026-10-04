@@ -6,7 +6,7 @@
     android:background="@color/brand_bg"
     android:orientation="vertical">
 
-    <!-- Toolbar -->
+    <!-- ============ Toolbar ============ -->
     <com.google.android.material.appbar.MaterialToolbar
         android:id="@+id/toolbar"
         android:layout_width="match_parent"
@@ -15,7 +15,7 @@
         app:title="@string/title_app"
         app:titleTextColor="@color/brand_text" />
 
-    <!-- 可滚动内容 -->
+    <!-- ============ 可滚动内容 ============ -->
     <androidx.core.widget.NestedScrollView
         android:layout_width="match_parent"
         android:layout_height="0dp"
@@ -29,7 +29,7 @@
             android:orientation="vertical"
             android:padding="16dp">
 
-            <!-- 状态卡片 -->
+            <!-- ---------- 状态卡片 ---------- -->
             <com.google.android.material.card.MaterialCardView
                 android:id="@+id/cardStatus"
                 android:layout_width="match_parent"
@@ -93,7 +93,7 @@
                 </LinearLayout>
             </com.google.android.material.card.MaterialCardView>
 
-            <!-- 服务器 -->
+            <!-- ---------- 服务器 ---------- -->
             <com.google.android.material.card.MaterialCardView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -159,7 +159,7 @@
                 </LinearLayout>
             </com.google.android.material.card.MaterialCardView>
 
-            <!-- 组网 -->
+            <!-- ---------- 组网 ---------- -->
             <com.google.android.material.card.MaterialCardView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -242,7 +242,7 @@
                 </LinearLayout>
             </com.google.android.material.card.MaterialCardView>
 
-            <!-- 共享盘 -->
+            <!-- ---------- 共享盘 ---------- -->
             <com.google.android.material.card.MaterialCardView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -307,7 +307,7 @@
                 </LinearLayout>
             </com.google.android.material.card.MaterialCardView>
 
-            <!-- 节点列表 -->
+            <!-- ---------- 节点列表 ---------- -->
             <com.google.android.material.card.MaterialCardView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -370,7 +370,7 @@
         </LinearLayout>
     </androidx.core.widget.NestedScrollView>
 
-    <!-- ★ 底部固定按钮栏 -->
+    <!-- ============ 底部固定按钮栏 ============ -->
     <FrameLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -378,7 +378,7 @@
         android:elevation="8dp"
         android:padding="16dp">
 
-        <!-- 保存 + 启动 -->
+        <!-- 保存 + 启动（未运行时显示） -->
         <LinearLayout
             android:id="@+id/bottomBarIdle"
             android:layout_width="match_parent"
@@ -408,7 +408,7 @@
                 app:backgroundTint="@color/brand_accent" />
         </LinearLayout>
 
-        <!-- 停止按钮（运行时显示） -->
+        <!-- 停止按钮（运行时显示，覆盖上方布局） -->
         <com.google.android.material.button.MaterialButton
             android:id="@+id/btnStop"
             style="@style/Widget.Material3.Button"
