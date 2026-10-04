@@ -11,9 +11,6 @@ object N2nController {
 
     fun isRunning(): Boolean = running.get()
 
-    /**
-     * 同步启动（旧接口，保留兼容）
-     */
     fun start(tunFd: Int, config: Config): String {
         if (running.get()) return "already running"
 
@@ -28,10 +25,6 @@ object N2nController {
         return ""
     }
 
-    /**
-     * ★ 异步启动：立即返回，后台线程执行 Go 端阻塞操作
-     * 避免主线程 ANR
-     */
     fun startAsync(tunFd: Int, config: Config, onResult: (String) -> Unit) {
         if (running.get()) {
             onResult("already running")
@@ -62,4 +55,21 @@ object N2nController {
     fun getVirtualIP(): String = client?.virtualIP ?: ""
     fun getClientID(): String = client?.clientID ?: ""
     fun getPeersJSON(): String = client?.peersJSON ?: "[]"
+
+    // ★ 日志转发（静态方法，不依赖 client 实例）
+    fun getLogs(): String {
+        return try {
+            com.n2n.mobile.Mobile.getLogs() ?: ""
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
+    fun clearLogs() {
+        try {
+            com.n2n.mobile.Mobile.clearLogs()
+        } catch (e: Exception) {
+            // ignore
+        }
+    }
 }
