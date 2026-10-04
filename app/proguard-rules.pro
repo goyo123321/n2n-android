@@ -1,0 +1,4 @@
+-keep class com.n2n.client.** { *; }
+-keep class go.** { *; }
+-dontwarn go.**
+-dontwarn com.n2n.client.**
