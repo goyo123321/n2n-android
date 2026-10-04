@@ -75,12 +75,15 @@ jobs:
           go mod tidy
           gomobile init
 
+          echo "--- mobile.go 第一行（package 名）---"
+          head -1 mobile.go
+
           mkdir -p ../app/libs
           set +e
           gomobile bind \
             -target=android \
             -androidapi 26 \
-            -javapkg=com.n2n.client \
+            -javapkg=com.n2n \
             -ldflags "-checklinkname=0" \
             -o ../app/libs/n2nclient.aar \
             . 2>&1 | tee /tmp/step1.log
@@ -93,6 +96,9 @@ jobs:
 
           if [ -f ../app/libs/n2nclient.aar ]; then
             ls -la ../app/libs/
+            echo ""
+            echo "--- AAR 里的包名（应该看到 com/n2n/client）---"
+            unzip -l ../app/libs/n2nclient.aar | grep -E "com/n2n" | head -10 || true
             echo "✅ AAR 生成"
           else
             echo "❌ AAR 未生成"
@@ -112,6 +118,11 @@ jobs:
           if [ -f "app/libs/n2nclient.aar" ]; then
             SIZE=$(du -h app/libs/n2nclient.aar | cut -f1)
             echo "✅ AAR: $SIZE" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### AAR 里的 com/n2n 包" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            unzip -l app/libs/n2nclient.aar | grep -E "com/n2n" | head -20 >> $GITHUB_STEP_SUMMARY || echo "(未找到 com/n2n)" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
           else
             echo "❌ AAR 未生成" >> $GITHUB_STEP_SUMMARY
           fi
@@ -156,6 +167,9 @@ jobs:
               echo '```' >> $GITHUB_STEP_SUMMARY
               echo "$ERRORS" >> $GITHUB_STEP_SUMMARY
               echo '```' >> $GITHUB_STEP_SUMMARY
+            else
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "✅ 无 Kotlin 错误" >> $GITHUB_STEP_SUMMARY
             fi
           fi
 
