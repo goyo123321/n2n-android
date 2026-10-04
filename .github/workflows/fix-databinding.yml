@@ -27,24 +27,23 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # ============================================================
-      # 检测当前状态
-      # ============================================================
       - name: Detect current state
         id: detect
         shell: bash
         run: |
+          set +e
+
           echo "=== 当前所有 databinding import ==="
           grep -rn "databinding" app/src/main/java/com/n2n/android/ || echo "(无)"
 
           echo ""
           echo "=== 当前 com.n2n.mobile.databinding 引用数 ==="
-          WRONG=$(grep -rc "com\.n2n\.mobile\.databinding" app/src/main/java/com/n2n/android/*.kt 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')
+          WRONG=$(grep -rh "com\.n2n\.mobile\.databinding" app/src/main/java/com/n2n/android/ 2>/dev/null | wc -l)
           echo "错误引用数: $WRONG"
 
           echo ""
           echo "=== 当前 com.n2n.android.databinding 引用数 ==="
-          RIGHT=$(grep -rc "com\.n2n\.android\.databinding" app/src/main/java/com/n2n/android/*.kt 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')
+          RIGHT=$(grep -rh "com\.n2n\.android\.databinding" app/src/main/java/com/n2n/android/ 2>/dev/null | wc -l)
           echo "正确引用数: $RIGHT"
 
           echo "wrong_count=$WRONG" >> $GITHUB_OUTPUT
@@ -58,9 +57,6 @@ jobs:
             echo "::notice::无需修复"
           fi
 
-      # ============================================================
-      # 修复：只改 databinding 那一行
-      # ============================================================
       - name: Fix databinding imports
         if: steps.detect.outputs.need_fix == 'true' && !inputs.dry_run
         shell: bash
@@ -78,9 +74,6 @@ jobs:
           echo "=== 修改后 ==="
           grep -n "databinding" *.kt || echo "(无)"
 
-      # ============================================================
-      # 显示 diff
-      # ============================================================
       - name: Show diff
         if: steps.detect.outputs.need_fix == 'true'
         shell: bash
@@ -90,9 +83,6 @@ jobs:
           echo ""
           git diff app/src/main/java/com/n2n/android/ | head -100
 
-      # ============================================================
-      # 提交
-      # ============================================================
       - name: Commit and push
         if: steps.detect.outputs.need_fix == 'true' && !inputs.dry_run
         shell: bash
@@ -109,13 +99,12 @@ jobs:
           git push origin "$BRANCH"
           echo "✅ 已推送到 $BRANCH"
 
-      # ============================================================
-      # 修复后验证
-      # ============================================================
       - name: Verify after fix
         if: always()
         shell: bash
         run: |
+          set +e
+
           echo ""
           echo "=========== 最终验证 ==========="
           echo "--- databinding（应为 com.n2n.android.databinding）---"
@@ -124,13 +113,12 @@ jobs:
           echo "--- com.n2n.mobile（应为 AAR 生成的类）---"
           grep -rn "import com\.n2n\.mobile\." app/src/main/java/com/n2n/android/ || echo "(无)"
 
-      # ============================================================
-      # Summary
-      # ============================================================
       - name: Summary
         if: always()
         shell: bash
         run: |
+          set +e
+
           echo "## Fix Databinding Import 结果" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- 分支: \`${{ inputs.branch }}\`" >> $GITHUB_STEP_SUMMARY
