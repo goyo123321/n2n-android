@@ -33,7 +33,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ★ 每 1 秒刷新状态（自动切换启动/停止按钮）
+    // 每 1 秒刷新状态（自动切换启动/停止按钮）
     private val statusTicker = object : Runnable {
         override fun run() {
             refreshStatus()
@@ -89,9 +89,14 @@ class MainActivity : AppCompatActivity() {
         showFirstLaunchDialogIfNeeded()
         checkSignalingUrl()
 
+        // ============ Toolbar 菜单 ============
         binding.toolbar.inflateMenu(R.menu.menu_main)
         binding.toolbar.setOnMenuItemClickListener { item ->
             when (item.itemId) {
+                R.id.action_logs -> {                                   // ★ 新增：打开日志
+                    startActivity(Intent(this, LogActivity::class.java))
+                    true
+                }
                 R.id.action_theme -> {
                     showThemePicker()
                     true
@@ -100,6 +105,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // 按钮
         binding.btnStart.setOnClickListener { saveThenRequest() }
         binding.btnStop.setOnClickListener { stopVpnService() }
         binding.btnSave.setOnClickListener {
@@ -312,7 +318,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun saveCurrentInput() {
-        // ★ Client ID 为空时自动生成一个持久化的
+        // Client ID 为空时自动生成一个持久化的
         if (binding.etClientId.text.toString().trim().isEmpty()) {
             val autoId = Prefs.loadOrCreateClientId(this)
             binding.etClientId.setText(autoId)
@@ -383,7 +389,6 @@ class MainActivity : AppCompatActivity() {
         }
         startForegroundService(intent)
         toast("正在启动...")
-        // 立即刷新一次（显示"启动中"），后续 statusTicker 会自动刷新
         binding.root.postDelayed({ refreshStatus() }, 500)
     }
 
