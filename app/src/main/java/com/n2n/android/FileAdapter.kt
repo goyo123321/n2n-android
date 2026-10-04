@@ -3,7 +3,7 @@ package com.n2n.android
 import android.view.LayoutInflater
 import android.view.ViewGroup
 import androidx.recyclerview.widget.RecyclerView
-import com.n2n.android.databinding.ItemFileBinding
+import com.n2n.mobile.databinding.ItemFileBinding
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date

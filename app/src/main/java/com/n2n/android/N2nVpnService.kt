@@ -10,7 +10,7 @@ import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import com.n2n.client.Config
+import com.n2n.mobile.Config
 
 class N2nVpnService : VpnService() {
 

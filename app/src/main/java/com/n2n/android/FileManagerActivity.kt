@@ -16,7 +16,7 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.FileProvider
 import androidx.recyclerview.widget.LinearLayoutManager
-import com.n2n.android.databinding.ActivityFileManagerBinding
+import com.n2n.mobile.databinding.ActivityFileManagerBinding
 import java.io.File
 
 class FileManagerActivity : AppCompatActivity() {

@@ -1,8 +1,8 @@
 package com.n2n.android
 
-import com.n2n.client.Client
-import com.n2n.client.Config
-import com.n2n.client.ProgressListener
+import com.n2n.mobile.Client
+import com.n2n.mobile.Config
+import com.n2n.mobile.ProgressListener
 import java.util.concurrent.atomic.AtomicBoolean
 
 object N2nController {

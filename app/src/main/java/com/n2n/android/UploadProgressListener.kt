@@ -5,7 +5,7 @@ import android.content.Intent
 import android.app.PendingIntent
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
-import com.n2n.client.ProgressListener
+import com.n2n.mobile.ProgressListener
 import java.util.concurrent.ConcurrentHashMap
 
 /**
