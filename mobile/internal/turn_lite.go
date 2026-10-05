@@ -45,7 +45,7 @@ const (
 	attrXorMappedAddress = 0x0020
 )
 
-// REQUESTED-TRANSPORT 值（UDP）
+// REQUESTED-TRANSPORT = 17 (UDP)，按 RFC 5766 §14.7，协议号在 32 位值的**第一个字节**
 const transportUDP = 17
 
 const (
@@ -68,8 +68,6 @@ type stunMessage struct {
 	attrs   map[uint16][]byte
 }
 
-// TURNLite 精简版 TURN 客户端
-// 纯标准库实现，不依赖 netlink，Android 上可用
 type TURNLite struct {
 	serverAddr string
 	username   string
@@ -97,12 +95,10 @@ type TURNLite struct {
 	stopCh  chan struct{}
 }
 
-// NewTURNLite 创建 UDP transport 版本
 func NewTURNLite(serverAddr, username, password string) *TURNLite {
 	return NewTURNLiteWithTCP(serverAddr, username, password, false)
 }
 
-// NewTURNLiteWithTCP 创建指定 transport 版本
 func NewTURNLiteWithTCP(serverAddr, username, password string, useTCP bool) *TURNLite {
 	return &TURNLite{
 		serverAddr:  serverAddr,
@@ -115,7 +111,7 @@ func NewTURNLiteWithTCP(serverAddr, username, password string, useTCP bool) *TUR
 	}
 }
 
-// ============ STUN 消息编解码 ============
+// ============ STUN 编解码 ============
 
 func buildSTUNMsg(msgType uint16, txid [12]byte, attrs []stunAttr) []byte {
 	total := 20
@@ -169,7 +165,7 @@ func parseSTUNMsg(data []byte) (*stunMessage, error) {
 	}, nil
 }
 
-// ============ XOR 地址编解码 ============
+// ============ XOR 地址 ============
 
 var magicBytes = [4]byte{0x21, 0x12, 0xA4, 0x42}
 
@@ -226,38 +222,28 @@ func xorDecodePeer(data []byte) (net.IP, int, error) {
 
 // ============ HMAC-SHA1 签名（RFC 5389 §15.4） ============
 
-// sign 添加 MESSAGE-INTEGRITY 属性
-//
-// ★ 关键：RFC 5389 §15.4 要求 HMAC 计算时，STUN 消息头里的长度字段
-//    必须"假装" MESSAGE-INTEGRITY 属性已经存在（即包含 24 字节）
 func (t *TURNLite) sign(msg []byte) []byte {
 	if t.key == nil {
 		return msg
 	}
 
-	// ★ 新的 body 长度 = 原 body 长度 + MI 属性长度（4 字节头 + 20 字节值）
+	// ★ RFC 5389 §15.4：HMAC 计算时长度字段必须"假装" MI 已经存在
 	newBodyLen := len(msg) - 20 + 24
 
-	// ★ 拷贝一份，把长度字段更新为"含 MI"的长度
 	tmp := make([]byte, len(msg))
 	copy(tmp, msg)
 	binary.BigEndian.PutUint16(tmp[2:4], uint16(newBodyLen))
 
-	// ★ 用更新长度后的消息算 HMAC（RFC 要求）
 	mac := hmac.New(sha1.New, t.key)
 	mac.Write(tmp)
 	sig := mac.Sum(nil)
 
-	// 构造最终消息：原 msg + MI 属性
 	out := make([]byte, len(msg)+24)
 	copy(out, msg)
 	binary.BigEndian.PutUint16(out[len(msg):len(msg)+2], attrMessageIntegrity)
 	binary.BigEndian.PutUint16(out[len(msg)+2:len(msg)+4], 20)
 	copy(out[len(msg)+4:], sig)
-
-	// 消息头里的长度字段也要更新为"含 MI"
 	binary.BigEndian.PutUint16(out[2:4], uint16(newBodyLen))
-
 	return out
 }
 
@@ -267,7 +253,7 @@ func randTxID() [12]byte {
 	return t
 }
 
-// ============ 发送 + 等待响应 ============
+// ============ 发送 + 等待 ============
 
 func (t *TURNLite) sendRequest(msgType uint16, attrs []stunAttr, withAuth bool) (*stunMessage, error) {
 	txid := randTxID()
@@ -285,7 +271,6 @@ func (t *TURNLite) sendRequest(msgType uint16, attrs []stunAttr, withAuth bool) 
 		msg = t.sign(msg)
 	}
 
-	// 清空 respCh（防止残留）
 	for {
 		select {
 		case <-t.respCh:
@@ -340,10 +325,12 @@ func (t *TURNLite) Allocate() error {
 
 	go t.readLoop()
 
-	// ---- 第 1 步：无认证 Allocate → 期待 401 ----
+	// ★ REQUESTED-TRANSPORT：协议号在第一个字节（RFC 5766 §14.7）
+	reqTransport := []byte{transportUDP, 0, 0, 0}
+
 	log.Printf("[TURN-Lite] 发送初始 Allocate（无认证）")
 	resp, err := t.sendRequest(msgAllocateRequest, []stunAttr{
-		{typ: attrRequestedTransID, value: []byte{0, transportUDP, 0, 0}},
+		{typ: attrRequestedTransID, value: reqTransport},
 	}, false)
 	if err != nil {
 		t.Close()
@@ -363,7 +350,7 @@ func (t *TURNLite) Allocate() error {
 		h := md5.Sum([]byte(fmt.Sprintf("%s:%s:%s", t.username, t.realm, t.password)))
 		t.key = h[:]
 
-		log.Printf("[TURN-Lite] 401 realm=%q（username=%s）", realm, t.username)
+		log.Printf("[TURN-Lite] 401 realm=%q nonce=%d 字节 (username=%s)", realm, len(nonce), t.username)
 	} else if resp.msgType == msgAllocateSuccess {
 		return t.extractAllocateResult(resp)
 	} else {
@@ -371,10 +358,9 @@ func (t *TURNLite) Allocate() error {
 		return fmt.Errorf("初始 Allocate 返回意外类型 0x%04x", resp.msgType)
 	}
 
-	// ---- 第 2 步：带认证 Allocate ----
 	log.Printf("[TURN-Lite] 发送 Allocate（带认证）")
 	resp, err = t.sendRequest(msgAllocateRequest, []stunAttr{
-		{typ: attrRequestedTransID, value: []byte{0, transportUDP, 0, 0}},
+		{typ: attrRequestedTransID, value: reqTransport},
 		{typ: attrLifetime, value: uint32ToBytes(turnDefaultLifetime)},
 	}, true)
 	if err != nil {
@@ -440,7 +426,7 @@ func (t *TURNLite) ensurePermission(ip net.IP) error {
 	return nil
 }
 
-// ============ 发送数据 ============
+// ============ 发送 ============
 
 func (t *TURNLite) SendTo(data []byte, peerAddr *net.UDPAddr) error {
 	if t.conn == nil {
@@ -527,16 +513,13 @@ func (t *TURNLite) readLoopTCP() {
 	}
 }
 
-// readTCPPacket 从 TCP 流读取一个完整的 STUN 或 ChannelData 消息
-//
-// ★ 修复：STUN 长度字段在 header[2:4]，之前错用 rest[2:4]
+// readTCPPacket：STUN 长度字段在 header[2:4]
 func readTCPPacket(conn net.Conn) ([]byte, error) {
 	header := make([]byte, 4)
 	if _, err := io.ReadFull(conn, header); err != nil {
 		return nil, err
 	}
 
-	// ChannelData（高 2 位 = 01）
 	if header[0]&0xC0 == 0x40 {
 		length := int(binary.BigEndian.Uint16(header[2:4]))
 		totalAfterHeader := length + ((4 - length%4) & 3)
@@ -550,7 +533,6 @@ func readTCPPacket(conn net.Conn) ([]byte, error) {
 		return full, nil
 	}
 
-	// STUN：先读 16 字节（magic 4 + txid 12）
 	rest := make([]byte, 16)
 	if _, err := io.ReadFull(conn, rest); err != nil {
 		return nil, err
@@ -558,7 +540,6 @@ func readTCPPacket(conn net.Conn) ([]byte, error) {
 
 	// ★ 长度字段在 header[2:4]，不是 rest[2:4]
 	bodyLen := int(binary.BigEndian.Uint16(header[2:4]))
-
 	if bodyLen > 65535-20 {
 		return nil, fmt.Errorf("非法 STUN bodyLen: %d", bodyLen)
 	}
@@ -580,7 +561,6 @@ func (t *TURNLite) handleIncoming(data []byte) {
 	if len(data) < 4 {
 		return
 	}
-	// ChannelData（暂不处理）
 	if data[0]&0xC0 == 0x40 {
 		return
 	}
