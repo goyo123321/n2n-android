@@ -56,8 +56,8 @@ type Edge struct {
 	tunWriteCh chan []byte
 	natMeta    *NATMetadata
 
-	netstack *NetstackHost
-	progress *ProgressDispatcher
+	netstack   *NetstackHost
+	progress   *ProgressDispatcher
 	wsOutbound *WSOutbound
 	httpProxy  *HTTPProxy
 
@@ -171,7 +171,7 @@ func Start(cfg *Config, tunFd int) (*Edge, error) {
 	// 3. NAT 探测（IPv4-only）
 	e.natMeta = probeNAT(e.udpPort, nil)
 
-	// 4. 连接信令（支持优选 IP）
+	// 4. 连接信令
 	ws, err := NewWSTransport(
 		cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken,
 		cfg.PreferredIP, cfg.PreferredPort,
@@ -188,7 +188,7 @@ func Start(cfg *Config, tunFd int) (*Edge, error) {
 		e.onRemotePacket(data)
 	}
 
-	// 6. 中继
+	// 6. 中继管理
 	e.relayMgr = NewRelayManager(ws, e.turnClient, e)
 	e.relayMgr.Report(10 * time.Second)
 
@@ -223,7 +223,6 @@ func Start(cfg *Config, tunFd int) (*Edge, error) {
 			})
 		}
 
-		// Workers 出口
 		wsOut, err := NewWSOutbound(
 			cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken,
 			cfg.PreferredIP, cfg.PreferredPort,
@@ -346,6 +345,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	t, _ := msg["type"].(string)
 	from, _ := msg["from"].(string)
 
+	// WebSocket 重连事件
 	if t == "_reconnected" {
 		log.Printf("[信令] WebSocket 重连成功，重新上报元数据")
 		e.reportMetadata()
@@ -361,7 +361,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		e.peersMu.Unlock()
 		log.Printf("[信令] 分配虚拟 IP: %s", vip)
 
-		// ★ 兜底：STUN 失败时用服务端看到的公网 IP
+		// ★ 兜底：STUN 失败时用服务端看到的 IP
 		if e.natMeta.PublicEndpoint == "" {
 			if serverSeenIp, ok := payload["yourPublicIp"].(string); ok && serverSeenIp != "" {
 				endpoint := fmt.Sprintf("%s:%d", serverSeenIp, e.udpPort)
@@ -389,10 +389,10 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			}
 		}
 
-		// 上报元数据
+		// ★★★ 关键：上报 p2p_metadata 和 share_announce
 		e.reportMetadata()
 
-		// ★ 打印已有节点列表（诊断）
+		// 打印已有节点列表
 		if peers, ok := payload["peers"].([]interface{}); ok {
 			log.Printf("[信令] ready: 返回 %d 个已有节点", len(peers))
 			for _, p := range peers {
@@ -454,6 +454,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		raw, _ := json.Marshal(msg["payload"])
 		var instr NatHoleInstruction
 		if err := json.Unmarshal(raw, &instr); err != nil {
+			log.Printf("[NAT-HOLE] 指令解析失败: %v", err)
 			return
 		}
 		e.ensureTargetPeer(&instr)
@@ -484,7 +485,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	}
 }
 
-// reportMetadata 上报 p2p_metadata 和 share_announce
+// ★★★ 上报 p2p_metadata 和 share_announce（关键方法）
 func (e *Edge) reportMetadata() {
 	metaPayload := map[string]interface{}{
 		"natType":            e.natMeta.NATType,
@@ -498,6 +499,11 @@ func (e *Edge) reportMetadata() {
 	if e.natMeta.PublicEndpoint != "" {
 		metaPayload["publicEndpoint"] = e.natMeta.PublicEndpoint
 	}
+
+	// ★ 诊断日志
+	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%s p2pEndpoint=%s sharePort=9090",
+		e.natMeta.NATType, e.natMeta.PublicEndpoint, e.natMeta.P2PEndpoint)
+
 	_ = e.ws.Send(map[string]interface{}{
 		"type":    "p2p_metadata",
 		"payload": metaPayload,
