@@ -28,8 +28,16 @@ type WSTransport struct {
 }
 
 // NewWSTransport 建立 WebSocket 连接
-// preferredIP 非空时：直连该 IP，TLS SNI 用原域名
-// 支持 preferredIP 格式："1.2.3.4" 或 "1.2.3.4:8443"
+//
+// preferredIP 支持两种格式：
+//   "104.17.217.162"         → 默认端口 443（或 scheme 对应端口）
+//   "104.17.217.162:8443"    → 指定端口
+//
+// 优选 IP 时：
+//   - TCP 连接目标：优选 IP:port
+//   - URL：保持原域名（wss://原域名/ws/xxx）
+//   - SNI：原域名
+//   - HTTP Host header：原域名
 func NewWSTransport(signalingURL, roomId, clientId, connectToken, preferredIP string, preferredPort int) (*WSTransport, error) {
 	base := strings.TrimRight(signalingURL, "/")
 	fullURL := base + "/ws/" + url.PathEscape(roomId) + "?cid=" + url.QueryEscape(clientId)
@@ -43,45 +51,58 @@ func NewWSTransport(signalingURL, roomId, clientId, connectToken, preferredIP st
 	}
 	host := u.Hostname()
 
-	// ★ 解析优选 IP
-	var preferredHost string
-	var preferredPortNum int
+	defaultPort := 443
+	if u.Scheme == "ws" {
+		defaultPort = 80
+	}
 
+	dialer := &websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
+	}
+
+	// ★ 判断是否用优选 IP
 	if preferredIP != "" {
+		// 解析 ip:port
+		preferredHost := preferredIP
+		preferredPortNum := preferredPort
+
 		if h, pStr, err := net.SplitHostPort(preferredIP); err == nil {
 			preferredHost = h
 			if p, err := strconv.Atoi(pStr); err == nil && p > 0 && p <= 65535 {
 				preferredPortNum = p
 			}
-		} else {
-			preferredHost = preferredIP
+		}
+		if preferredPortNum <= 0 {
+			preferredPortNum = defaultPort
+		}
+
+		targetAddr := net.JoinHostPort(preferredHost, strconv.Itoa(preferredPortNum))
+		log.Printf("[WS] 优选 IP: %s (SNI=%s)", targetAddr, host)
+
+		// ★ SNI 用原域名
+		dialer.TLSClientConfig = &tls.Config{
+			ServerName: host,
+		}
+
+		// ★ 关键：自定义 TCP 拨号，URL 保持原域名
+		dialer.NetDial = func(network, addr string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 10 * time.Second}
+			// ★ 忽略 addr（原本是 url.jyece.kdns.fr:443），改连优选 IP
+			return d.Dial(network, targetAddr)
+		}
+	} else {
+		log.Printf("[WS] DNS 模式: %s", host)
+		dialer.TLSClientConfig = &tls.Config{
+			ServerName: host,
 		}
 	}
-
-	if preferredPortNum <= 0 {
-		if preferredPort > 0 {
-			preferredPortNum = preferredPort
-		} else {
-			preferredPortNum = 443
-		}
-	}
-
-	dialer := &websocket.Dialer{HandshakeTimeout: 10 * time.Second}
-
-	if preferredHost != "" {
-		log.Printf("[WS] 优选 IP: %s:%d (SNI=%s)", preferredHost, preferredPortNum, host)
-		u.Host = net.JoinHostPort(preferredHost, strconv.Itoa(preferredPortNum))
-		fullURL = u.String()
-	}
-
-	dialer.TLSClientConfig = &tls.Config{ServerName: host}
 
 	log.Printf("[WS] 连接 %s", maskToken(fullURL))
+
 	conn, _, err := dialer.Dial(fullURL, nil)
 	if err != nil {
 		return nil, err
 	}
-
 	ws := &WSTransport{
 		conn:     conn,
 		clientId: clientId,
@@ -109,9 +130,11 @@ func (ws *WSTransport) readLoop() {
 		msgType, data, err := ws.conn.ReadMessage()
 		if err != nil {
 			log.Printf("[WS] 读取错误: %v", err)
+
 			ws.reconnectMu.Lock()
 			stopping := ws.stopping
 			ws.reconnectMu.Unlock()
+
 			if stopping {
 				return
 			}
@@ -149,12 +172,7 @@ func (ws *WSTransport) tryReconnect() {
 		case <-time.After(d * time.Second):
 		}
 		log.Printf("[WS] 重连 (%d/10)...", i+1)
-
-		u, _ := url.Parse(ws.fullURL)
-		dialer := &websocket.Dialer{HandshakeTimeout: 10 * time.Second}
-		dialer.TLSClientConfig = &tls.Config{ServerName: u.Hostname()}
-
-		conn, _, err := dialer.Dial(ws.fullURL, nil)
+		conn, _, err := websocket.DefaultDialer.Dial(ws.fullURL, nil)
 		if err != nil {
 			continue
 		}
@@ -169,7 +187,6 @@ func (ws *WSTransport) tryReconnect() {
 		}
 		return
 	}
-	log.Printf("[WS] 重连 10 次全部失败")
 }
 
 func (ws *WSTransport) heartbeat(interval time.Duration) {
