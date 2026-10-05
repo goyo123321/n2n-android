@@ -10,8 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-
-	"github.com/pion/turn/v4"
+	"time"
 )
 
 type TURNServerInfo struct {
@@ -28,11 +27,10 @@ type TURNResponse struct {
 	Error   string           `json:"error,omitempty"`
 }
 
+// TURNClient 统一封装：优先用 TURNLite（纯标准库）
 type TURNClient struct {
 	mu           sync.RWMutex
-	client       *turn.Client
-	listenConn   net.PacketConn   // ★ 保存本地 UDP 连接，便于关闭
-	relayConn    net.PacketConn
+	lite         *TURNLite
 	relayAddr    net.Addr
 	server       *TURNServerInfo
 	signalingURL string
@@ -50,8 +48,6 @@ func NewTURNClient(signalingURL string, connectToken string, edge *Edge) *TURNCl
 		stopCh:       make(chan struct{}),
 	}
 }
-
-// ============ 请求凭证 ============
 
 func (tc *TURNClient) FetchAndSetup(ctx context.Context) error {
 	httpBase := tc.signalingURL
@@ -80,9 +76,8 @@ func (tc *TURNClient) FetchAndSetup(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusUnauthorized ||
-		resp.StatusCode == http.StatusForbidden {
-		return fmt.Errorf("turn-credentials 未授权 (CONNECT_TOKEN 不匹配, http=%d)", resp.StatusCode)
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return fmt.Errorf("turn-credentials 未授权 (http=%d)", resp.StatusCode)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("credentials endpoint returned %d", resp.StatusCode)
@@ -104,8 +99,6 @@ func (tc *TURNClient) FetchAndSetup(ctx context.Context) error {
 	return tc.setupAllocation(ctx)
 }
 
-// ============ 建立 TURN Allocation ============
-
 func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 	tc.mu.RLock()
 	srv := tc.server
@@ -114,7 +107,6 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 		return fmt.Errorf("TURN server not set")
 	}
 
-	// 规范化地址："turn://host:port" → "host:port"
 	turnAddr := srv.URL
 	turnAddr = strings.TrimPrefix(turnAddr, "turn://")
 	turnAddr = strings.TrimPrefix(turnAddr, "turns://")
@@ -122,105 +114,51 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 	turnAddr = strings.TrimPrefix(turnAddr, "turns:")
 	turnAddr = strings.TrimPrefix(turnAddr, "//")
 
-	// ★ 关键：为 TURN 客户端创建一个本地 UDP 连接
-	// pion/turn v4 要求 ClientConfig.Conn 必填，否则会报 "conn cannot not be nil"
-	listenConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
-	if err != nil {
-		return fmt.Errorf("listen udp for TURN: %w", err)
-	}
-
-	log.Printf("[TURN] 连接 TURN 服务器: %s (user=%s)", turnAddr, srv.Username)
-
-	cfg := &turn.ClientConfig{
-		TURNServerAddr: turnAddr,
-		Conn:           listenConn,   // ★ 关键：提供本地 UDP 连接
-		Username:       srv.Username,
-		Password:       srv.Password,
-	}
-	// Cloudflare 官方 TURN 使用 realm=cloudflare；自建 coturn 一般交给服务端下发
-	if strings.Contains(strings.ToLower(srv.URL), "cloudflare") {
-		cfg.Realm = "cloudflare"
-	}
-
-	turnClient, err := turn.NewClient(cfg)
-	if err != nil {
-		listenConn.Close()
-		return fmt.Errorf("create TURN client: %w", err)
-	}
-
-	if err := turnClient.Listen(); err != nil {
-		turnClient.Close()
-		listenConn.Close()
-		return fmt.Errorf("listen: %w", err)
-	}
-
-	relayConn, err := turnClient.Allocate()
-	if err != nil {
-		turnClient.Close()
-		listenConn.Close()
-		return fmt.Errorf("allocate: %w", err)
-	}
-
-	tc.mu.Lock()
-	tc.client = turnClient
-	tc.listenConn = listenConn
-	tc.relayConn = relayConn
-	tc.relayAddr = relayConn.LocalAddr()
-	tc.mu.Unlock()
-
-	log.Printf("[TURN] 中继地址: %s", tc.relayAddr)
-	go tc.readLoop()
-	return nil
-}
-
-// ============ 收发 ============
-
-func (tc *TURNClient) readLoop() {
-	buf := make([]byte, 65535)
-	for {
-		select {
-		case <-tc.stopCh:
-			return
-		default:
-		}
-
-		tc.mu.RLock()
-		conn := tc.relayConn
-		tc.mu.RUnlock()
-		if conn == nil {
-			return
-		}
-
-		n, addr, err := conn.ReadFrom(buf)
-		if err != nil {
-			select {
-			case <-tc.stopCh:
-				return
-			default:
-			}
-			log.Printf("[TURN] 读取错误: %v", err)
-			return
-		}
-		if tc.onMessage != nil && n > 0 {
-			data := make([]byte, n)
-			copy(data, buf[:n])
+	// 先试 UDP transport
+	log.Printf("[TURN] 尝试 UDP transport: %s", turnAddr)
+	lite := NewTURNLiteWithTCP(turnAddr, srv.Username, srv.Password, false)
+	lite.onMessage = func(data []byte, addr net.Addr) {
+		if tc.onMessage != nil {
 			tc.onMessage(data, addr)
 		}
 	}
+	if err := lite.Allocate(); err != nil {
+		log.Printf("[TURN] UDP transport 失败: %v，尝试 TCP transport", err)
+
+		lite2 := NewTURNLiteWithTCP(turnAddr, srv.Username, srv.Password, true)
+		lite2.onMessage = func(data []byte, addr net.Addr) {
+			if tc.onMessage != nil {
+				tc.onMessage(data, addr)
+			}
+		}
+		if err2 := lite2.Allocate(); err2 != nil {
+			return fmt.Errorf("TURN 全部失败: UDP=%v TCP=%v", err, err2)
+		}
+		lite = lite2
+	}
+
+	tc.mu.Lock()
+	tc.lite = lite
+	tc.relayAddr = lite.relayAddr
+	tc.mu.Unlock()
+
+	log.Printf("[TURN] ✅ 就绪: %s", tc.relayAddr)
+	return nil
 }
 
 func (tc *TURNClient) Send(data []byte, remoteAddr net.Addr) error {
 	tc.mu.RLock()
-	conn := tc.relayConn
+	lite := tc.lite
 	tc.mu.RUnlock()
-	if conn == nil {
+	if lite == nil {
 		return fmt.Errorf("TURN 未就绪")
 	}
-	_, err := conn.WriteTo(data, remoteAddr)
-	return err
+	udp, ok := remoteAddr.(*net.UDPAddr)
+	if !ok {
+		return fmt.Errorf("TURN 只支持 UDP 地址")
+	}
+	return lite.SendTo(data, udp)
 }
-
-// ============ 状态查询 ============
 
 func (tc *TURNClient) GetRelayAddr() string {
 	tc.mu.RLock()
@@ -234,10 +172,8 @@ func (tc *TURNClient) GetRelayAddr() string {
 func (tc *TURNClient) IsReady() bool {
 	tc.mu.RLock()
 	defer tc.mu.RUnlock()
-	return tc.relayConn != nil
+	return tc.lite != nil
 }
-
-// ============ 关闭 ============
 
 func (tc *TURNClient) Close() {
 	select {
@@ -245,27 +181,14 @@ func (tc *TURNClient) Close() {
 	default:
 		close(tc.stopCh)
 	}
-
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
-
-	if tc.client != nil {
-		tc.client.Close()
-		tc.client = nil
-	}
-	if tc.relayConn != nil {
-		tc.relayConn.Close()
-		tc.relayConn = nil
-	}
-	if tc.listenConn != nil {
-		tc.listenConn.Close()
-		tc.listenConn = nil
+	if tc.lite != nil {
+		tc.lite.Close()
+		tc.lite = nil
 	}
 }
 
-// ============ 辅助 ============
-
-// redactToken 日志里把 token 打码
 func redactToken(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -278,3 +201,6 @@ func redactToken(raw string) string {
 	}
 	return u.String()
 }
+
+// 未使用但保留：让编译器知道 time 被用到
+var _ = time.Now
