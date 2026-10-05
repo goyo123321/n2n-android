@@ -7,6 +7,7 @@ object Prefs {
     private const val NAME = "n2n_prefs"
 
     private const val KEY_SIGNALING_URL = "signaling_url"
+    private const val KEY_PREFERRED_IP = "preferred_ip"
     private const val KEY_ROOM_ID = "room_id"
     private const val KEY_CLIENT_ID = "client_id"
     private const val KEY_NODE_NAME = "node_name"
@@ -16,8 +17,7 @@ object Prefs {
     private const val KEY_FIRST_LAUNCH = "first_launch_done"
     private const val KEY_AUTO_CLIENT_ID = "auto_client_id"
 
-    // 默认值
-    private const val DEFAULT_SIGNALING_URL = ""   // 空 → 首次启动提示用户填
+    private const val DEFAULT_SIGNALING_URL = ""
     private const val DEFAULT_ROOM_ID = "default-room"
     private const val DEFAULT_NODE_NAME = "Android"
 
@@ -30,10 +30,6 @@ object Prefs {
     )
 
     private fun sp(ctx: Context) = ctx.getSharedPreferences(NAME, Context.MODE_PRIVATE)
-
-    // ============================================================
-    // Config 读写
-    // ============================================================
 
     fun load(ctx: Context): Config {
         val s = sp(ctx)
@@ -56,9 +52,16 @@ object Prefs {
             .apply()
     }
 
-    // ============================================================
-    // 共享目录 URI（SAF 选择后保存）
-    // ============================================================
+    // ============ 优选 IP ============
+
+    fun loadPreferredIp(ctx: Context): String =
+        sp(ctx).getString(KEY_PREFERRED_IP, "") ?: ""
+
+    fun savePreferredIp(ctx: Context, ip: String) {
+        sp(ctx).edit().putString(KEY_PREFERRED_IP, ip).apply()
+    }
+
+    // ============ 共享目录 URI ============
 
     fun loadShareDirUri(ctx: Context): String? =
         sp(ctx).getString(KEY_SHARE_DIR_URI, null)
@@ -70,10 +73,7 @@ object Prefs {
         }.apply()
     }
 
-    // ============================================================
-    // 主题模式
-    // 0 = 跟随系统，1 = 浅色，2 = 深色
-    // ============================================================
+    // ============ 主题 ============
 
     fun loadThemeMode(ctx: Context): Int = sp(ctx).getInt(KEY_THEME_MODE, 0)
 
@@ -81,9 +81,7 @@ object Prefs {
         sp(ctx).edit().putInt(KEY_THEME_MODE, mode).apply()
     }
 
-    // ============================================================
-    // 首次启动标记
-    // ============================================================
+    // ============ 首次启动 ============
 
     fun isFirstLaunch(ctx: Context): Boolean =
         !sp(ctx).getBoolean(KEY_FIRST_LAUNCH, false)
@@ -92,24 +90,13 @@ object Prefs {
         sp(ctx).edit().putBoolean(KEY_FIRST_LAUNCH, true).apply()
     }
 
-    // ============================================================
-    // ★ 自动生成 Client ID（首次调用生成，后续复用）
-    // 保证同一台设备重启后 Client ID 不变 → 虚拟 IP 不变
-    // ============================================================
+    // ============ 自动 Client ID ============
 
     fun loadOrCreateClientId(ctx: Context): String {
         val existing = sp(ctx).getString(KEY_AUTO_CLIENT_ID, null)
         if (!existing.isNullOrEmpty()) return existing
-
         val newId = "android-" + UUID.randomUUID().toString().take(8)
         sp(ctx).edit().putString(KEY_AUTO_CLIENT_ID, newId).apply()
         return newId
-    }
-
-    /**
-     * 手动重置 Client ID（用于"清除数据"等场景）
-     */
-    fun resetClientId(ctx: Context) {
-        sp(ctx).edit().remove(KEY_AUTO_CLIENT_ID).apply()
     }
 }

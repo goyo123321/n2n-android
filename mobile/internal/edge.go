@@ -56,18 +56,20 @@ type Edge struct {
 	tunWriteCh chan []byte
 	natMeta    *NATMetadata
 
-	netstack *NetstackHost
-	progress *ProgressDispatcher
+	netstack   *NetstackHost
+	progress   *ProgressDispatcher
+	wsOutbound *WSOutbound
+	httpProxy  *HTTPProxy
 
 	doneCh  chan struct{}
 	closeMu sync.Mutex
 	closed  bool
+	mu      sync.Mutex
 }
 
 var httpClient = &http.Client{Timeout: 30 * time.Second}
 
 // generateDefaultClientID 生成默认 Client ID
-// 固定规则（不用随机），保证 FetchVirtualIP 和 Start 用同一个 ID
 func generateDefaultClientID() string {
 	hostname, _ := os.Hostname()
 	if hostname == "" {
@@ -76,7 +78,7 @@ func generateDefaultClientID() string {
 	return fmt.Sprintf("%s-android", hostname)
 }
 
-// ============ 提前获取虚拟 IP（Android 侧用）============
+// ============ 提前获取虚拟 IP ============
 
 // FetchVirtualIP 连一次信令拿虚拟 IP，然后断开
 func FetchVirtualIP(cfg *Config) string {
@@ -89,7 +91,10 @@ func FetchVirtualIP(cfg *Config) string {
 		clientId = generateDefaultClientID()
 	}
 
-	ws, err := NewWSTransport(cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken)
+	ws, err := NewWSTransport(
+		cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken,
+		cfg.PreferredIP, cfg.PreferredPort,
+	)
 	if err != nil {
 		log.Printf("[FetchVIP] 连接信令失败: %v", err)
 		return ""
@@ -163,11 +168,14 @@ func Start(cfg *Config, tunFd int) (*Edge, error) {
 	}
 	e.udpConn = udpConn
 
-	// 3. NAT 探测
+	// 3. NAT 探测（IPv4-only）
 	e.natMeta = probeNAT(e.udpPort, nil)
 
 	// 4. 连接信令
-	ws, err := NewWSTransport(cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken)
+	ws, err := NewWSTransport(
+		cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken,
+		cfg.PreferredIP, cfg.PreferredPort,
+	)
 	if err != nil {
 		udpConn.Close()
 		return nil, fmt.Errorf("连接信令失败: %w", err)
@@ -180,7 +188,7 @@ func Start(cfg *Config, tunFd int) (*Edge, error) {
 		e.onRemotePacket(data)
 	}
 
-	// 6. 中继
+	// 6. 中继管理
 	e.relayMgr = NewRelayManager(ws, e.turnClient, e)
 	e.relayMgr.Report(10 * time.Second)
 
@@ -198,11 +206,12 @@ func Start(cfg *Config, tunFd int) (*Edge, error) {
 	// 9. progress 空初始化
 	e.progress = &ProgressDispatcher{}
 
-	// 10. TURN 异步初始化
+	// 10. TURN + WSOutbound 异步初始化
 	go func() {
 		time.Sleep(2 * time.Second)
 		ctx, cancel := contextWithTimeout(30 * time.Second)
 		defer cancel()
+
 		if err := e.turnClient.FetchAndSetup(ctx); err != nil {
 			log.Printf("[TURN] 初始化失败: %v", err)
 		} else {
@@ -213,6 +222,19 @@ func Start(cfg *Config, tunFd int) (*Edge, error) {
 				"relayAddr": e.turnClient.GetRelayAddr(),
 			})
 		}
+
+		wsOut, err := NewWSOutbound(
+			cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken,
+			cfg.PreferredIP, cfg.PreferredPort,
+		)
+		if err != nil {
+			log.Printf("[WSOut] 初始化失败: %v", err)
+			return
+		}
+		e.mu.Lock()
+		e.wsOutbound = wsOut
+		e.mu.Unlock()
+		log.Printf("[WSOut] Workers 出口代理就绪")
 	}()
 
 	log.Printf("[Edge] 已启动 clientId=%s room=%s", clientId, cfg.RoomID)
@@ -241,6 +263,12 @@ func (e *Edge) Stop() {
 	}
 	if e.tun != nil {
 		_ = e.tun.Close()
+	}
+	if e.wsOutbound != nil {
+		e.wsOutbound.Close()
+	}
+	if e.httpProxy != nil {
+		e.httpProxy.Close()
 	}
 	log.Printf("[Edge] 已停止")
 }
@@ -317,6 +345,13 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	t, _ := msg["type"].(string)
 	from, _ := msg["from"].(string)
 
+	// WebSocket 重连事件
+	if t == "_reconnected" {
+		log.Printf("[信令] WebSocket 重连成功，重新上报元数据")
+		e.reportMetadata()
+		return
+	}
+
 	switch t {
 	case "ready":
 		payload, _ := msg["payload"].(map[string]interface{})
@@ -325,6 +360,17 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		vip := e.virtualIP
 		e.peersMu.Unlock()
 		log.Printf("[信令] 分配虚拟 IP: %s", vip)
+
+		// ★ 兜底：STUN 失败时用服务端看到的 IP
+		if e.natMeta.PublicEndpoint == "" {
+			if serverSeenIp, ok := payload["yourPublicIp"].(string); ok && serverSeenIp != "" {
+				endpoint := fmt.Sprintf("%s:%d", serverSeenIp, e.udpPort)
+				e.natMeta.PublicEndpoint = endpoint
+				e.natMeta.P2PEndpoint = endpoint
+				e.natMeta.NATType = "EasyNAT"
+				log.Printf("[NAT] STUN 失败，用服务端 IP 兜底: %s", endpoint)
+			}
+		}
 
 		// 初始化 netstack + 共享盘
 		if e.netstack == nil && vip != "" {
@@ -343,36 +389,12 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			}
 		}
 
-		// 上报元数据
-		metaPayload := map[string]interface{}{
-			"natType":            e.natMeta.NATType,
-			"portsDifference":    e.natMeta.PortsDifference,
-			"regularPortsChange": e.natMeta.RegularPortsChange,
-			"behavior":           e.natMeta.Behavior,
-			"assistedSockets":    e.natMeta.AssistedSockets,
-			"sharePort":          9090,
-			"p2pEndpoint":        e.natMeta.P2PEndpoint,
-		}
-		if e.natMeta.PublicEndpoint != "" {
-			metaPayload["publicEndpoint"] = e.natMeta.PublicEndpoint
-		}
-		_ = e.ws.Send(map[string]interface{}{
-			"type":    "p2p_metadata",
-			"payload": metaPayload,
-		})
+		// ★★★ 关键：上报 p2p_metadata 和 share_announce
+		e.reportMetadata()
 
-		_ = e.ws.Send(map[string]interface{}{
-			"type": "share_announce",
-			"payload": map[string]interface{}{
-				"name":      e.nodeName,
-				"virtualIp": e.virtualIP,
-				"port":      9090,
-			},
-		})
-
-		// ★ 打印已有节点列表（诊断用）
+		// 打印已有节点列表
 		if peers, ok := payload["peers"].([]interface{}); ok {
-			log.Printf("[信令] ready: 服务端返回 %d 个已有节点", len(peers))
+			log.Printf("[信令] ready: 返回 %d 个已有节点", len(peers))
 			for _, p := range peers {
 				pm, ok := p.(map[string]interface{})
 				if !ok {
@@ -395,12 +417,11 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 					}
 					e.peersMu.Unlock()
 				}
-				// ★ 每个已有节点打印一行日志
 				log.Printf("[信令] 已有节点: %s vip=%s pub=%s:%d share=%d",
 					pid, pip, pubIP, pubPort, sharePort)
 			}
 		} else {
-			log.Printf("[信令] ready: 服务端返回 0 个已有节点（房间里只有自己）")
+			log.Printf("[信令] ready: 返回 0 个已有节点")
 		}
 
 	case "joined":
@@ -412,14 +433,13 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		pip, _ := payload["virtualIp"].(string)
 		pubIP, _ := payload["publicIp"].(string)
 		pubPort := jsonInt(payload["publicPort"])
+		sharePort := jsonInt(payload["sharePort"])
 		relayAddr, _ := payload["turnRelayAddr"].(string)
 
-		// ★ 打印原始信息（诊断用）
-		log.Printf("[信令] joined: from=%s vip=%s pub=%s:%d",
-			from, pip, pubIP, pubPort)
+		log.Printf("[信令] joined: from=%s vip=%s pub=%s:%d", from, pip, pubIP, pubPort)
 
 		if from != "" && pip != "" {
-			e.registerPeer(from, pip, pubIP, pubPort, 0)
+			e.registerPeer(from, pip, pubIP, pubPort, sharePort)
 			if relayAddr != "" {
 				e.peersMu.Lock()
 				if pi, ok := e.peers[from]; ok {
@@ -434,6 +454,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		raw, _ := json.Marshal(msg["payload"])
 		var instr NatHoleInstruction
 		if err := json.Unmarshal(raw, &instr); err != nil {
+			log.Printf("[NAT-HOLE] 指令解析失败: %v", err)
 			return
 		}
 		e.ensureTargetPeer(&instr)
@@ -462,6 +483,40 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	case "connection_status":
 		return
 	}
+}
+
+// ★★★ 上报 p2p_metadata 和 share_announce（关键方法）
+func (e *Edge) reportMetadata() {
+	metaPayload := map[string]interface{}{
+		"natType":            e.natMeta.NATType,
+		"portsDifference":    e.natMeta.PortsDifference,
+		"regularPortsChange": e.natMeta.RegularPortsChange,
+		"behavior":           e.natMeta.Behavior,
+		"assistedSockets":    e.natMeta.AssistedSockets,
+		"sharePort":          9090,
+		"p2pEndpoint":        e.natMeta.P2PEndpoint,
+	}
+	if e.natMeta.PublicEndpoint != "" {
+		metaPayload["publicEndpoint"] = e.natMeta.PublicEndpoint
+	}
+
+	// ★ 诊断日志
+	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%s p2pEndpoint=%s sharePort=9090",
+		e.natMeta.NATType, e.natMeta.PublicEndpoint, e.natMeta.P2PEndpoint)
+
+	_ = e.ws.Send(map[string]interface{}{
+		"type":    "p2p_metadata",
+		"payload": metaPayload,
+	})
+
+	_ = e.ws.Send(map[string]interface{}{
+		"type": "share_announce",
+		"payload": map[string]interface{}{
+			"name":      e.nodeName,
+			"virtualIp": e.GetVirtualIP(),
+			"port":      9090,
+		},
+	})
 }
 
 func jsonInt(v interface{}) int {

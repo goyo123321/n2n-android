@@ -38,10 +38,13 @@ func probeNAT(localUDPPort int, stunServers []string) *NATMetadata {
 	var results []result
 
 	for _, server := range stunServers {
-		c, err := stun.Dial("udp", server)
+		// ★ 强制使用 IPv4
+		c, err := stun.Dial("udp4", server)
 		if err != nil {
+			log.Printf("[NAT] STUN Dial 失败 %s: %v", server, err)
 			continue
 		}
+
 		msg := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
 		var xorAddr stun.XORMappedAddress
 
@@ -55,16 +58,28 @@ func probeNAT(localUDPPort int, stunServers []string) *NATMetadata {
 				_ = xorAddr.GetFrom(res.Message)
 			})
 		}()
+
 		select {
 		case <-done:
 		case <-time.After(3 * time.Second):
 			log.Printf("[NAT] STUN %s 超时", server)
 		}
 		_ = c.Close()
+
 		if xorAddr.Port == 0 {
 			continue
 		}
-		results = append(results, result{ip: xorAddr.IP.String(), port: xorAddr.Port})
+
+		// ★ 过滤 IPv6 结果
+		ipStr := xorAddr.IP.String()
+		ip4 := xorAddr.IP.To4()
+		if ip4 == nil {
+			log.Printf("[NAT] 忽略 IPv6 结果: %s", ipStr)
+			continue
+		}
+
+		results = append(results, result{ip: ip4.String(), port: xorAddr.Port})
+		log.Printf("[NAT] STUN %s → %s:%d", server, ip4.String(), xorAddr.Port)
 	}
 
 	if len(results) == 0 {

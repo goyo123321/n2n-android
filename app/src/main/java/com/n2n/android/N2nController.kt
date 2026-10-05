@@ -13,13 +13,10 @@ object N2nController {
 
     fun start(tunFd: Int, config: Config): String {
         if (running.get()) return "already running"
-
         val c = Client()
         c.setTunFD(tunFd.toLong())
         val err = c.start(config)
-        if (err.isNotEmpty()) {
-            return "start failed: $err"
-        }
+        if (err.isNotEmpty()) return "start failed: $err"
         client = c
         running.set(true)
         return ""
@@ -30,7 +27,6 @@ object N2nController {
             onResult("already running")
             return
         }
-
         Thread {
             val c = Client()
             c.setTunFD(tunFd.toLong())
@@ -56,7 +52,7 @@ object N2nController {
     fun getClientID(): String = client?.clientID ?: ""
     fun getPeersJSON(): String = client?.peersJSON ?: "[]"
 
-    // ★ 日志转发（静态方法，不依赖 client 实例）
+    // 日志转发（静态方法，不依赖 client 实例）
     fun getLogs(): String {
         return try {
             com.n2n.mobile.Mobile.getLogs() ?: ""

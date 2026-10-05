@@ -10,12 +10,14 @@ import (
 )
 
 type Config struct {
-	SignalingURL string
-	RoomID       string
-	ClientID     string
-	NodeName     string
-	ConnectToken string
-	ShareDir     string
+	SignalingURL  string
+	RoomID        string
+	ClientID      string
+	NodeName      string
+	ConnectToken  string
+	ShareDir      string
+	PreferredIP   string   // ★ 新增：优选 IP（空则 DNS 解析）
+	PreferredPort int      // ★ 新增：优选端口（默认 443）
 }
 
 type Client struct {
@@ -40,12 +42,14 @@ func (c *Client) SetTunFD(fd int) {
 // FetchVirtualIP 独立连一次信令拿虚拟 IP
 func (c *Client) FetchVirtualIP(cfg *Config) string {
 	icfg := &internal.Config{
-		SignalingURL: cfg.SignalingURL,
-		RoomID:       cfg.RoomID,
-		ClientID:     cfg.ClientID,
-		NodeName:     cfg.NodeName,
-		ConnectToken: cfg.ConnectToken,
-		ShareDir:     cfg.ShareDir,
+		SignalingURL:  cfg.SignalingURL,
+		RoomID:        cfg.RoomID,
+		ClientID:      cfg.ClientID,
+		NodeName:      cfg.NodeName,
+		ConnectToken:  cfg.ConnectToken,
+		ShareDir:      cfg.ShareDir,
+		PreferredIP:   cfg.PreferredIP,   // ★
+		PreferredPort: cfg.PreferredPort, // ★
 	}
 	return internal.FetchVirtualIP(icfg)
 }
@@ -64,12 +68,14 @@ func (c *Client) Start(cfg *Config) string {
 	c.mu.Unlock()
 
 	icfg := &internal.Config{
-		SignalingURL: cfg.SignalingURL,
-		RoomID:       cfg.RoomID,
-		ClientID:     cfg.ClientID,
-		NodeName:     cfg.NodeName,
-		ConnectToken: cfg.ConnectToken,
-		ShareDir:     cfg.ShareDir,
+		SignalingURL:  cfg.SignalingURL,
+		RoomID:        cfg.RoomID,
+		ClientID:      cfg.ClientID,
+		NodeName:      cfg.NodeName,
+		ConnectToken:  cfg.ConnectToken,
+		ShareDir:      cfg.ShareDir,
+		PreferredIP:   cfg.PreferredIP,   // ★
+		PreferredPort: cfg.PreferredPort, // ★
 	}
 
 	edge, err := internal.Start(icfg, tunFd)

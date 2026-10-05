@@ -6,7 +6,6 @@
     android:background="@color/brand_bg"
     android:orientation="vertical">
 
-    <!-- Toolbar -->
     <com.google.android.material.appbar.MaterialToolbar
         android:id="@+id/toolbar"
         android:layout_width="match_parent"
@@ -15,7 +14,6 @@
         app:title="@string/title_app"
         app:titleTextColor="@color/brand_text" />
 
-    <!-- 可滚动内容 -->
     <androidx.core.widget.NestedScrollView
         android:layout_width="match_parent"
         android:layout_height="0dp"
@@ -40,13 +38,11 @@
                 app:cardElevation="0dp"
                 app:strokeColor="@color/brand_border"
                 app:strokeWidth="1dp">
-
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:orientation="vertical"
                     android:padding="16dp">
-
                     <TextView
                         android:id="@+id/tvStatus"
                         android:layout_width="wrap_content"
@@ -55,18 +51,15 @@
                         android:textColor="@color/brand_text_dim"
                         android:textSize="16sp"
                         android:textStyle="bold" />
-
                     <TextView
                         android:id="@+id/tvVirtualIp"
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:layout_marginTop="8dp"
                         android:fontFamily="monospace"
-                        android:text="虚拟 IP: --"
                         android:textColor="@color/brand_text"
                         android:textSize="13sp"
                         android:visibility="gone" />
-
                     <TextView
                         android:id="@+id/tvClientId"
                         android:layout_width="match_parent"
@@ -75,11 +68,9 @@
                         android:ellipsize="middle"
                         android:fontFamily="monospace"
                         android:singleLine="true"
-                        android:text="Client ID: --"
                         android:textColor="@color/brand_text_dim"
                         android:textSize="12sp"
                         android:visibility="gone" />
-
                     <TextView
                         android:id="@+id/tvShareUrl"
                         android:layout_width="match_parent"
@@ -93,7 +84,7 @@
                 </LinearLayout>
             </com.google.android.material.card.MaterialCardView>
 
-            <!-- 服务器 -->
+            <!-- 服务器卡片 -->
             <com.google.android.material.card.MaterialCardView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -103,13 +94,11 @@
                 app:cardElevation="0dp"
                 app:strokeColor="@color/brand_border"
                 app:strokeWidth="1dp">
-
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:orientation="vertical"
                     android:padding="16dp">
-
                     <TextView
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
@@ -118,14 +107,12 @@
                         android:textColor="@color/brand_text"
                         android:textSize="14sp"
                         android:textStyle="bold" />
-
                     <com.google.android.material.textfield.TextInputLayout
                         style="@style/Widget.N2n.TextInputLayout"
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:hint="@string/hint_wss"
                         app:boxBackgroundColor="@color/brand_bg">
-
                         <com.google.android.material.textfield.TextInputEditText
                             android:id="@+id/etSignalingUrl"
                             android:layout_width="match_parent"
@@ -142,10 +129,27 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:layout_marginTop="12dp"
+                        android:hint="优选 IP（可选，如 104.17.128.1 或 104.17.128.1:8443）"
+                        app:boxBackgroundColor="@color/brand_bg">
+                        <com.google.android.material.textfield.TextInputEditText
+                            android:id="@+id/etPreferredIp"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:fontFamily="monospace"
+                            android:inputType="text"
+                            android:maxLines="1"
+                            android:textColor="@color/brand_text"
+                            android:textSize="13sp" />
+                    </com.google.android.material.textfield.TextInputLayout>
+
+                    <com.google.android.material.textfield.TextInputLayout
+                        style="@style/Widget.N2n.TextInputLayout"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="12dp"
                         android:hint="@string/hint_token"
                         app:boxBackgroundColor="@color/brand_bg"
                         app:endIconMode="password_toggle">
-
                         <com.google.android.material.textfield.TextInputEditText
                             android:id="@+id/etConnectToken"
                             android:layout_width="match_parent"
@@ -159,7 +163,7 @@
                 </LinearLayout>
             </com.google.android.material.card.MaterialCardView>
 
-            <!-- 组网 -->
+            <!-- 组网卡片 -->
             <com.google.android.material.card.MaterialCardView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -169,13 +173,11 @@
                 app:cardElevation="0dp"
                 app:strokeColor="@color/brand_border"
                 app:strokeWidth="1dp">
-
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:orientation="vertical"
                     android:padding="16dp">
-
                     <TextView
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
@@ -184,14 +186,12 @@
                         android:textColor="@color/brand_text"
                         android:textSize="14sp"
                         android:textStyle="bold" />
-
                     <com.google.android.material.textfield.TextInputLayout
                         style="@style/Widget.N2n.TextInputLayout"
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:hint="@string/hint_room"
                         app:boxBackgroundColor="@color/brand_bg">
-
                         <com.google.android.material.textfield.TextInputEditText
                             android:id="@+id/etRoomId"
                             android:layout_width="match_parent"
@@ -202,7 +202,6 @@
                             android:textColor="@color/brand_text"
                             android:textSize="13sp" />
                     </com.google.android.material.textfield.TextInputLayout>
-
                     <com.google.android.material.textfield.TextInputLayout
                         style="@style/Widget.N2n.TextInputLayout"
                         android:layout_width="match_parent"
@@ -210,7 +209,6 @@
                         android:layout_marginTop="12dp"
                         android:hint="@string/hint_node_name"
                         app:boxBackgroundColor="@color/brand_bg">
-
                         <com.google.android.material.textfield.TextInputEditText
                             android:id="@+id/etNodeName"
                             android:layout_width="match_parent"
@@ -220,7 +218,6 @@
                             android:textColor="@color/brand_text"
                             android:textSize="13sp" />
                     </com.google.android.material.textfield.TextInputLayout>
-
                     <com.google.android.material.textfield.TextInputLayout
                         style="@style/Widget.N2n.TextInputLayout"
                         android:layout_width="match_parent"
@@ -228,7 +225,6 @@
                         android:layout_marginTop="12dp"
                         android:hint="@string/hint_client_id"
                         app:boxBackgroundColor="@color/brand_bg">
-
                         <com.google.android.material.textfield.TextInputEditText
                             android:id="@+id/etClientId"
                             android:layout_width="match_parent"
@@ -242,7 +238,7 @@
                 </LinearLayout>
             </com.google.android.material.card.MaterialCardView>
 
-            <!-- 共享盘 -->
+            <!-- 共享盘卡片 -->
             <com.google.android.material.card.MaterialCardView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -252,13 +248,11 @@
                 app:cardElevation="0dp"
                 app:strokeColor="@color/brand_border"
                 app:strokeWidth="1dp">
-
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:orientation="vertical"
                     android:padding="16dp">
-
                     <TextView
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
@@ -267,7 +261,6 @@
                         android:textColor="@color/brand_text"
                         android:textSize="14sp"
                         android:textStyle="bold" />
-
                     <TextView
                         android:id="@+id/tvShareDir"
                         android:layout_width="match_parent"
@@ -277,14 +270,12 @@
                         android:singleLine="true"
                         android:textColor="@color/brand_text_dim"
                         android:textSize="12sp" />
-
                     <LinearLayout
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:layout_marginTop="12dp"
                         android:gravity="end"
                         android:orientation="horizontal">
-
                         <com.google.android.material.button.MaterialButton
                             android:id="@+id/btnPickDir"
                             style="@style/Widget.Material3.Button.OutlinedButton"
@@ -294,7 +285,6 @@
                             android:text="@string/btn_pick_dir"
                             android:textColor="@color/brand_accent"
                             app:strokeColor="@color/brand_accent" />
-
                         <com.google.android.material.button.MaterialButton
                             android:id="@+id/btnManageFiles"
                             style="@style/Widget.Material3.Button"
@@ -307,7 +297,7 @@
                 </LinearLayout>
             </com.google.android.material.card.MaterialCardView>
 
-            <!-- 节点列表 -->
+            <!-- 节点列表卡片 -->
             <com.google.android.material.card.MaterialCardView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -317,20 +307,17 @@
                 app:cardElevation="0dp"
                 app:strokeColor="@color/brand_border"
                 app:strokeWidth="1dp">
-
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:orientation="vertical"
                     android:padding="16dp">
-
                     <LinearLayout
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:layout_marginBottom="8dp"
                         android:gravity="center_vertical"
                         android:orientation="horizontal">
-
                         <TextView
                             android:layout_width="0dp"
                             android:layout_height="wrap_content"
@@ -339,7 +326,6 @@
                             android:textColor="@color/brand_text"
                             android:textSize="14sp"
                             android:textStyle="bold" />
-
                         <TextView
                             android:id="@+id/tvPeerCount"
                             android:layout_width="wrap_content"
@@ -348,7 +334,6 @@
                             android:textColor="@color/brand_text_dim"
                             android:textSize="12sp" />
                     </LinearLayout>
-
                     <TextView
                         android:id="@+id/tvPeersEmpty"
                         android:layout_width="match_parent"
@@ -358,7 +343,6 @@
                         android:text="@string/empty_peers"
                         android:textColor="@color/brand_text_dim"
                         android:textSize="13sp" />
-
                     <LinearLayout
                         android:id="@+id/peersContainer"
                         android:layout_width="match_parent"
@@ -370,21 +354,18 @@
         </LinearLayout>
     </androidx.core.widget.NestedScrollView>
 
-    <!-- 底部固定按钮栏 -->
+    <!-- 底部按钮 -->
     <FrameLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:background="@color/brand_surface"
         android:elevation="8dp"
         android:padding="16dp">
-
-        <!-- 未运行时：保存 + 启动 -->
         <LinearLayout
             android:id="@+id/bottomBarIdle"
             android:layout_width="match_parent"
             android:layout_height="48dp"
             android:orientation="horizontal">
-
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/btnSave"
                 style="@style/Widget.Material3.Button.OutlinedButton"
@@ -395,7 +376,6 @@
                 android:text="@string/btn_save"
                 android:textColor="@color/brand_text"
                 app:strokeColor="@color/brand_border" />
-
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/btnStart"
                 style="@style/Widget.Material3.Button"
@@ -407,8 +387,6 @@
                 android:textColor="#FFFFFF"
                 app:backgroundTint="@color/brand_accent" />
         </LinearLayout>
-
-        <!-- 运行时：停止按钮 -->
         <com.google.android.material.button.MaterialButton
             android:id="@+id/btnStop"
             style="@style/Widget.Material3.Button"

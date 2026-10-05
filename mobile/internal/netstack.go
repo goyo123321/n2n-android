@@ -23,11 +23,12 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 const shareServerPort uint16 = 9090
 
-// NetstackHost 用 gVisor 实现用户空间 TCP/IP 栈
 type NetstackHost struct {
 	stack     *stack.Stack
 	linkEP    *channel.Endpoint
@@ -37,9 +38,13 @@ type NetstackHost struct {
 	mu        sync.Mutex
 	started   bool
 	progress  *ProgressDispatcher
+
+	router         *Router
+	dnsCache       *DNSCache
+	dnsProxy       *DNSProxy
+	onProxyTCPConn func(targetIP string, targetPort int) (io.ReadWriteCloser, error)
 }
 
-// NewNetstackHost 创建 netstack
 func NewNetstackHost(virtualIP string) (*NetstackHost, error) {
 	ip := net.ParseIP(virtualIP).To4()
 	if ip == nil {
@@ -50,10 +55,10 @@ func NewNetstackHost(virtualIP string) (*NetstackHost, error) {
 
 	s := stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
-		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 	})
 
-	ep := channel.New(512, 1280, "")
+	ep := channel.New(1024, 1280, "")
 	if err := s.CreateNIC(1, ep); err != nil {
 		return nil, fmt.Errorf("CreateNIC: %v", err)
 	}
@@ -84,7 +89,143 @@ func NewNetstackHost(virtualIP string) (*NetstackHost, error) {
 	}, nil
 }
 
-// InjectTUNPacket 把从 TUN 收到的包喂给 netstack
+// ============ 出站集成 ============
+
+func (n *NetstackHost) SetRouter(r *Router, dns *DNSCache) {
+	n.router = r
+	n.dnsCache = dns
+}
+
+func (n *NetstackHost) SetDNSProxy(p *DNSProxy) {
+	n.dnsProxy = p
+}
+
+func (n *NetstackHost) SetProxyHandler(fn func(ip string, port int) (io.ReadWriteCloser, error)) {
+	n.onProxyTCPConn = fn
+	n.startTCPForwarder()
+	n.startUDPForwarder()
+}
+
+// ============ TCP Forwarder ============
+
+func (n *NetstackHost) startTCPForwarder() {
+	forwarder := tcp.NewForwarder(n.stack, 0, 65535, func(r *tcp.ForwarderRequest) {
+		id := r.ID()
+		targetIP := id.LocalAddress.String()
+		targetPort := int(id.LocalPort)
+
+		if targetIP == net.IP(n.v4[:]).String() {
+			r.Complete(true)
+			return
+		}
+
+		domain := ""
+		if n.dnsCache != nil {
+			domain = n.dnsCache.LookupDomainByIP(targetIP)
+		}
+
+		var action RouteAction = ActionProxy
+		if n.router != nil {
+			action, _ = n.router.Match(targetIP, targetPort, domain)
+		}
+
+		log.Printf("[Netstack-TCP] %s:%d domain=%q → %s", targetIP, targetPort, domain, action)
+
+		if action == ActionBlock {
+			r.Complete(true)
+			return
+		}
+
+		if n.onProxyTCPConn == nil {
+			r.Complete(true)
+			return
+		}
+
+		stream, err := n.onProxyTCPConn(targetIP, targetPort)
+		if err != nil {
+			log.Printf("[Netstack-TCP] 建立失败: %v", err)
+			r.Complete(true)
+			return
+		}
+
+		var wq waiter.Queue
+		ep, epErr := r.CreateEndpoint(&wq)
+		if epErr != nil {
+			stream.Close()
+			return
+		}
+		r.Complete(false)
+
+		conn := gonet.NewTCPConn(&wq, ep)
+		go func() {
+			defer conn.Close()
+			defer stream.Close()
+			go func() { io.Copy(stream, conn) }()
+			io.Copy(conn, stream)
+		}()
+	})
+
+	n.stack.SetTransportProtocolHandler(tcp.ProtocolNumber, forwarder.HandlePacket)
+}
+
+// ============ UDP Forwarder ============
+//
+// ★ 注意：udp.ForwarderRequest 没有 Complete() 方法
+
+func (n *NetstackHost) startUDPForwarder() {
+	forwarder := udp.NewForwarder(n.stack, func(r *udp.ForwarderRequest) {
+		id := r.ID()
+		targetIP := id.LocalAddress.String()
+		targetPort := int(id.LocalPort)
+
+		log.Printf("[Netstack-UDP] %s:%d", targetIP, targetPort)
+
+		// DNS 查询：UDP 53
+		if targetPort == 53 {
+			n.handleDNSUDP(r)
+			return
+		}
+
+		// 其他 UDP 直接忽略（不建立 endpoint，客户端超时）
+		// ★ 不调用 r.Complete()（UDP 没有这个方法）
+	})
+	n.stack.SetTransportProtocolHandler(udp.ProtocolNumber, forwarder.HandlePacket)
+}
+
+func (n *NetstackHost) handleDNSUDP(r *udp.ForwarderRequest) {
+	// ★ UDP 只需 CreateEndpoint，不需要 Complete
+	var wq waiter.Queue
+	ep, epErr := r.CreateEndpoint(&wq)
+	if epErr != nil {
+		log.Printf("[Netstack-UDP] CreateEndpoint 失败: %v", epErr)
+		return
+	}
+
+	conn := gonet.NewUDPConn(&wq, ep)
+	go func() {
+		defer conn.Close()
+		buf := make([]byte, 4096)
+		for {
+			_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+			nr, _, err := conn.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			query := make([]byte, nr)
+			copy(query, buf[:nr])
+
+			if n.dnsProxy != nil {
+				resp, err := n.dnsProxy.HandleDNSQuery(query)
+				if err == nil && resp != nil {
+					_, _ = conn.Write(resp)
+				}
+			}
+		}
+	}()
+}
+
+// ============ TUN 注入/读出 ============
+
 func (n *NetstackHost) InjectTUNPacket(data []byte) {
 	if len(data) < 20 {
 		return
@@ -98,7 +239,6 @@ func (n *NetstackHost) InjectTUNPacket(data []byte) {
 	pkt.DecRef()
 }
 
-// ReadTUNPacket 从 netstack 读出一个响应包
 func (n *NetstackHost) ReadTUNPacket() ([]byte, bool) {
 	pkt := n.linkEP.Read()
 	if pkt == nil {
@@ -113,7 +253,6 @@ func (n *NetstackHost) ReadTUNPacket() ([]byte, bool) {
 	return out, true
 }
 
-// ListenTCP 在 netstack 上监听
 func (n *NetstackHost) ListenTCP(port uint16) (net.Listener, error) {
 	addr := tcpip.FullAddress{
 		NIC:  1,
@@ -123,7 +262,8 @@ func (n *NetstackHost) ListenTCP(port uint16) (net.Listener, error) {
 	return gonet.ListenTCP(n.stack, addr, ipv4.ProtocolNumber)
 }
 
-// StartShareServer 启动共享盘 HTTP 服务器
+// ============ 共享盘 HTTP 服务 ============
+
 func (n *NetstackHost) StartShareServer(rootDir string) error {
 	n.mu.Lock()
 	if n.started {
@@ -158,8 +298,6 @@ func (n *NetstackHost) StartShareServer(rootDir string) error {
 	}()
 	return nil
 }
-
-// ============ HTTP Handlers ============
 
 func (n *NetstackHost) buildShareMux() *http.ServeMux {
 	mux := http.NewServeMux()
@@ -399,5 +537,4 @@ function nav(n){cur=(cur+'/'+n).replace(/\/+/g,'/');load()}
 load();
 </script></body></html>`
 
-// unused but kept for compatibility
 var _ = strconv.Itoa
