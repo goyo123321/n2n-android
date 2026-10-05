@@ -14,6 +14,8 @@ import (
 	"time"
 )
 
+// ============ STUN 常量 ============
+
 const stunMagicCookie = 0x2112A442
 
 const (
@@ -43,6 +45,7 @@ const (
 	attrXorMappedAddress = 0x0020
 )
 
+// REQUESTED-TRANSPORT 值（UDP）
 const transportUDP = 17
 
 const (
@@ -51,6 +54,8 @@ const (
 	turnRefreshInterval = 60 * time.Second
 	turnRequestTimeout  = 5 * time.Second
 )
+
+// ============ 内部结构 ============
 
 type stunAttr struct {
 	typ   uint16
@@ -63,6 +68,8 @@ type stunMessage struct {
 	attrs   map[uint16][]byte
 }
 
+// TURNLite 精简版 TURN 客户端
+// 纯标准库实现，不依赖 netlink，Android 上可用
 type TURNLite struct {
 	serverAddr string
 	username   string
@@ -90,10 +97,12 @@ type TURNLite struct {
 	stopCh  chan struct{}
 }
 
+// NewTURNLite 创建 UDP transport 版本
 func NewTURNLite(serverAddr, username, password string) *TURNLite {
 	return NewTURNLiteWithTCP(serverAddr, username, password, false)
 }
 
+// NewTURNLiteWithTCP 创建指定 transport 版本
 func NewTURNLiteWithTCP(serverAddr, username, password string, useTCP bool) *TURNLite {
 	return &TURNLite{
 		serverAddr:  serverAddr,
@@ -105,6 +114,8 @@ func NewTURNLiteWithTCP(serverAddr, username, password string, useTCP bool) *TUR
 		stopCh:      make(chan struct{}),
 	}
 }
+
+// ============ STUN 消息编解码 ============
 
 func buildSTUNMsg(msgType uint16, txid [12]byte, attrs []stunAttr) []byte {
 	total := 20
@@ -128,10 +139,10 @@ func buildSTUNMsg(msgType uint16, txid [12]byte, attrs []stunAttr) []byte {
 
 func parseSTUNMsg(data []byte) (*stunMessage, error) {
 	if len(data) < 20 {
-		return nil, fmt.Errorf("STUN 太短")
+		return nil, fmt.Errorf("STUN 消息太短")
 	}
 	if binary.BigEndian.Uint32(data[4:8]) != stunMagicCookie {
-		return nil, fmt.Errorf("magic 不匹配")
+		return nil, fmt.Errorf("magic cookie 不匹配")
 	}
 	msgLen := int(binary.BigEndian.Uint16(data[2:4]))
 	end := 20 + msgLen
@@ -157,6 +168,8 @@ func parseSTUNMsg(data []byte) (*stunMessage, error) {
 		attrs:   attrs,
 	}, nil
 }
+
+// ============ XOR 地址编解码 ============
 
 var magicBytes = [4]byte{0x21, 0x12, 0xA4, 0x42}
 
@@ -211,19 +224,40 @@ func xorDecodePeer(data []byte) (net.IP, int, error) {
 	return nil, 0, fmt.Errorf("未知地址族 0x%02x", family)
 }
 
+// ============ HMAC-SHA1 签名（RFC 5389 §15.4） ============
+
+// sign 添加 MESSAGE-INTEGRITY 属性
+//
+// ★ 关键：RFC 5389 §15.4 要求 HMAC 计算时，STUN 消息头里的长度字段
+//    必须"假装" MESSAGE-INTEGRITY 属性已经存在（即包含 24 字节）
 func (t *TURNLite) sign(msg []byte) []byte {
 	if t.key == nil {
 		return msg
 	}
+
+	// ★ 新的 body 长度 = 原 body 长度 + MI 属性长度（4 字节头 + 20 字节值）
+	newBodyLen := len(msg) - 20 + 24
+
+	// ★ 拷贝一份，把长度字段更新为"含 MI"的长度
+	tmp := make([]byte, len(msg))
+	copy(tmp, msg)
+	binary.BigEndian.PutUint16(tmp[2:4], uint16(newBodyLen))
+
+	// ★ 用更新长度后的消息算 HMAC（RFC 要求）
 	mac := hmac.New(sha1.New, t.key)
-	mac.Write(msg)
+	mac.Write(tmp)
 	sig := mac.Sum(nil)
+
+	// 构造最终消息：原 msg + MI 属性
 	out := make([]byte, len(msg)+24)
 	copy(out, msg)
 	binary.BigEndian.PutUint16(out[len(msg):len(msg)+2], attrMessageIntegrity)
 	binary.BigEndian.PutUint16(out[len(msg)+2:len(msg)+4], 20)
 	copy(out[len(msg)+4:], sig)
-	binary.BigEndian.PutUint16(out[2:4], uint16(len(out)-20))
+
+	// 消息头里的长度字段也要更新为"含 MI"
+	binary.BigEndian.PutUint16(out[2:4], uint16(newBodyLen))
+
 	return out
 }
 
@@ -232,6 +266,8 @@ func randTxID() [12]byte {
 	_, _ = rand.Read(t[:])
 	return t
 }
+
+// ============ 发送 + 等待响应 ============
 
 func (t *TURNLite) sendRequest(msgType uint16, attrs []stunAttr, withAuth bool) (*stunMessage, error) {
 	txid := randTxID()
@@ -249,6 +285,7 @@ func (t *TURNLite) sendRequest(msgType uint16, attrs []stunAttr, withAuth bool) 
 		msg = t.sign(msg)
 	}
 
+	// 清空 respCh（防止残留）
 	for {
 		select {
 		case <-t.respCh:
@@ -278,6 +315,8 @@ func (t *TURNLite) sendRequest(msgType uint16, attrs []stunAttr, withAuth bool) 
 	}
 }
 
+// ============ Allocate ============
+
 func (t *TURNLite) Allocate() error {
 	if t.useTCP {
 		log.Printf("[TURN-Lite] TCP transport → %s", t.serverAddr)
@@ -301,6 +340,8 @@ func (t *TURNLite) Allocate() error {
 
 	go t.readLoop()
 
+	// ---- 第 1 步：无认证 Allocate → 期待 401 ----
+	log.Printf("[TURN-Lite] 发送初始 Allocate（无认证）")
 	resp, err := t.sendRequest(msgAllocateRequest, []stunAttr{
 		{typ: attrRequestedTransID, value: []byte{0, transportUDP, 0, 0}},
 	}, false)
@@ -322,14 +363,16 @@ func (t *TURNLite) Allocate() error {
 		h := md5.Sum([]byte(fmt.Sprintf("%s:%s:%s", t.username, t.realm, t.password)))
 		t.key = h[:]
 
-		log.Printf("[TURN-Lite] 401 realm=%q", realm)
+		log.Printf("[TURN-Lite] 401 realm=%q（username=%s）", realm, t.username)
 	} else if resp.msgType == msgAllocateSuccess {
 		return t.extractAllocateResult(resp)
 	} else {
 		t.Close()
-		return fmt.Errorf("意外响应 0x%04x", resp.msgType)
+		return fmt.Errorf("初始 Allocate 返回意外类型 0x%04x", resp.msgType)
 	}
 
+	// ---- 第 2 步：带认证 Allocate ----
+	log.Printf("[TURN-Lite] 发送 Allocate（带认证）")
 	resp, err = t.sendRequest(msgAllocateRequest, []stunAttr{
 		{typ: attrRequestedTransID, value: []byte{0, transportUDP, 0, 0}},
 		{typ: attrLifetime, value: uint32ToBytes(turnDefaultLifetime)},
@@ -341,7 +384,8 @@ func (t *TURNLite) Allocate() error {
 
 	if resp.msgType != msgAllocateSuccess {
 		t.Close()
-		return fmt.Errorf("Allocate 失败 code=%d", parseErrorCode(resp.attrs[attrErrorCode]))
+		code := parseErrorCode(resp.attrs[attrErrorCode])
+		return fmt.Errorf("Allocate 失败: code=%d", code)
 	}
 
 	return t.extractAllocateResult(resp)
@@ -351,7 +395,7 @@ func (t *TURNLite) extractAllocateResult(resp *stunMessage) error {
 	relayData := resp.attrs[attrXorRelayedAddr]
 	ip, port, err := xorDecodePeer(relayData)
 	if err != nil {
-		return fmt.Errorf("解析 relay: %w", err)
+		return fmt.Errorf("解析 relay 失败: %w", err)
 	}
 	t.relayAddr = &net.UDPAddr{IP: ip, Port: port}
 
@@ -361,10 +405,12 @@ func (t *TURNLite) extractAllocateResult(resp *stunMessage) error {
 		}
 	}
 
-	log.Printf("[TURN-Lite] ✅ Allocation 成功: %s", t.relayAddr)
+	log.Printf("[TURN-Lite] ✅ Allocation 成功: relay=%s", t.relayAddr)
 	go t.refreshLoop()
 	return nil
 }
+
+// ============ CreatePermission ============
 
 func (t *TURNLite) ensurePermission(ip net.IP) error {
 	key := ip.String()
@@ -384,7 +430,8 @@ func (t *TURNLite) ensurePermission(ip net.IP) error {
 		return fmt.Errorf("CreatePermission: %w", err)
 	}
 	if resp.msgType != msgCreatePermissionSuc {
-		return fmt.Errorf("CreatePermission 被拒 code=%d", parseErrorCode(resp.attrs[attrErrorCode]))
+		code := parseErrorCode(resp.attrs[attrErrorCode])
+		return fmt.Errorf("CreatePermission 被拒 code=%d", code)
 	}
 
 	t.permMu.Lock()
@@ -392,6 +439,8 @@ func (t *TURNLite) ensurePermission(ip net.IP) error {
 	t.permMu.Unlock()
 	return nil
 }
+
+// ============ 发送数据 ============
 
 func (t *TURNLite) SendTo(data []byte, peerAddr *net.UDPAddr) error {
 	if t.conn == nil {
@@ -416,6 +465,8 @@ func (t *TURNLite) SendTo(data []byte, peerAddr *net.UDPAddr) error {
 	_, err := t.conn.Write(msg)
 	return err
 }
+
+// ============ 读循环 ============
 
 func (t *TURNLite) readLoop() {
 	if t.useTCP {
@@ -444,6 +495,7 @@ func (t *TURNLite) readLoopUDP() {
 				return
 			default:
 			}
+			log.Printf("[TURN-Lite] UDP 读错误: %v", err)
 			return
 		}
 		t.handleIncoming(buf[:n])
@@ -468,17 +520,23 @@ func (t *TURNLite) readLoopTCP() {
 				return
 			default:
 			}
+			log.Printf("[TURN-Lite] TCP 读错误: %v", err)
 			return
 		}
 		t.handleIncoming(pkt)
 	}
 }
 
+// readTCPPacket 从 TCP 流读取一个完整的 STUN 或 ChannelData 消息
+//
+// ★ 修复：STUN 长度字段在 header[2:4]，之前错用 rest[2:4]
 func readTCPPacket(conn net.Conn) ([]byte, error) {
 	header := make([]byte, 4)
 	if _, err := io.ReadFull(conn, header); err != nil {
 		return nil, err
 	}
+
+	// ChannelData（高 2 位 = 01）
 	if header[0]&0xC0 == 0x40 {
 		length := int(binary.BigEndian.Uint16(header[2:4]))
 		totalAfterHeader := length + ((4 - length%4) & 3)
@@ -491,11 +549,20 @@ func readTCPPacket(conn net.Conn) ([]byte, error) {
 		copy(full[4:], body[:length])
 		return full, nil
 	}
+
+	// STUN：先读 16 字节（magic 4 + txid 12）
 	rest := make([]byte, 16)
 	if _, err := io.ReadFull(conn, rest); err != nil {
 		return nil, err
 	}
-	bodyLen := int(binary.BigEndian.Uint16(rest[2:4]))
+
+	// ★ 长度字段在 header[2:4]，不是 rest[2:4]
+	bodyLen := int(binary.BigEndian.Uint16(header[2:4]))
+
+	if bodyLen > 65535-20 {
+		return nil, fmt.Errorf("非法 STUN bodyLen: %d", bodyLen)
+	}
+
 	body := make([]byte, bodyLen)
 	if bodyLen > 0 {
 		if _, err := io.ReadFull(conn, body); err != nil {
@@ -513,6 +580,7 @@ func (t *TURNLite) handleIncoming(data []byte) {
 	if len(data) < 4 {
 		return
 	}
+	// ChannelData（暂不处理）
 	if data[0]&0xC0 == 0x40 {
 		return
 	}
@@ -542,6 +610,8 @@ func (t *TURNLite) handleIncoming(data []byte) {
 	}
 }
 
+// ============ 定时刷新 ============
+
 func (t *TURNLite) refreshLoop() {
 	ticker := time.NewTicker(turnRefreshInterval)
 	defer ticker.Stop()
@@ -559,6 +629,8 @@ func (t *TURNLite) refreshLoop() {
 		}
 	}
 }
+
+// ============ 查询 / 关闭 ============
 
 func (t *TURNLite) GetRelayAddr() string {
 	if t.relayAddr == nil {
