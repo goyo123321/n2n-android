@@ -22,22 +22,12 @@ type WSTransport struct {
 	onBinary  func([]byte)
 
 	fullURL     string
+	dialer      *websocket.Dialer   // ★ 保存 dialer，重连时复用
 	stopCh      chan struct{}
 	reconnectMu sync.Mutex
 	stopping    bool
 }
 
-// NewWSTransport 建立 WebSocket 连接
-//
-// preferredIP 支持两种格式：
-//   "104.17.217.162"         → 默认端口 443（或 scheme 对应端口）
-//   "104.17.217.162:8443"    → 指定端口
-//
-// 优选 IP 时：
-//   - TCP 连接目标：优选 IP:port
-//   - URL：保持原域名（wss://原域名/ws/xxx）
-//   - SNI：原域名
-//   - HTTP Host header：原域名
 func NewWSTransport(signalingURL, roomId, clientId, connectToken, preferredIP string, preferredPort int) (*WSTransport, error) {
 	base := strings.TrimRight(signalingURL, "/")
 	fullURL := base + "/ws/" + url.PathEscape(roomId) + "?cid=" + url.QueryEscape(clientId)
@@ -62,7 +52,6 @@ func NewWSTransport(signalingURL, roomId, clientId, connectToken, preferredIP st
 
 	// ★ 判断是否用优选 IP
 	if preferredIP != "" {
-		// 解析 ip:port
 		preferredHost := preferredIP
 		preferredPortNum := preferredPort
 
@@ -79,15 +68,14 @@ func NewWSTransport(signalingURL, roomId, clientId, connectToken, preferredIP st
 		targetAddr := net.JoinHostPort(preferredHost, strconv.Itoa(preferredPortNum))
 		log.Printf("[WS] 优选 IP: %s (SNI=%s)", targetAddr, host)
 
-		// ★ SNI 用原域名
 		dialer.TLSClientConfig = &tls.Config{
 			ServerName: host,
 		}
 
-		// ★ 关键：自定义 TCP 拨号，URL 保持原域名
+		// ★ 自定义 TCP 拨号，URL 保持原域名
 		dialer.NetDial = func(network, addr string) (net.Conn, error) {
 			d := net.Dialer{Timeout: 10 * time.Second}
-			// ★ 忽略 addr（原本是 url.jyece.kdns.fr:443），改连优选 IP
+			// 忽略 addr，改连优选 IP
 			return d.Dial(network, targetAddr)
 		}
 	} else {
@@ -103,10 +91,12 @@ func NewWSTransport(signalingURL, roomId, clientId, connectToken, preferredIP st
 	if err != nil {
 		return nil, err
 	}
+
 	ws := &WSTransport{
 		conn:     conn,
 		clientId: clientId,
 		fullURL:  fullURL,
+		dialer:   dialer,   // ★ 保存 dialer
 		stopCh:   make(chan struct{}),
 	}
 	go ws.readLoop()
@@ -172,8 +162,11 @@ func (ws *WSTransport) tryReconnect() {
 		case <-time.After(d * time.Second):
 		}
 		log.Printf("[WS] 重连 (%d/10)...", i+1)
-		conn, _, err := websocket.DefaultDialer.Dial(ws.fullURL, nil)
+
+		// ★ 用保存的 dialer（含优选 IP 配置）
+		conn, _, err := ws.dialer.Dial(ws.fullURL, nil)
 		if err != nil {
+			log.Printf("[WS] 重连失败: %v", err)
 			continue
 		}
 		ws.mu.Lock()
@@ -187,6 +180,8 @@ func (ws *WSTransport) tryReconnect() {
 		}
 		return
 	}
+
+	log.Printf("[WS] 重连 10 次全部失败，放弃")
 }
 
 func (ws *WSTransport) heartbeat(interval time.Duration) {
