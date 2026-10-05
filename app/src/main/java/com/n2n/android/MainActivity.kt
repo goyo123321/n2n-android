@@ -23,17 +23,13 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
 
-    // 每 3 秒刷新节点列表
     private val peersTicker = object : Runnable {
         override fun run() {
-            if (N2nController.isRunning()) {
-                refreshPeers()
-            }
+            if (N2nController.isRunning()) refreshPeers()
             binding.root.postDelayed(this, 3000)
         }
     }
 
-    // 每 1 秒刷新状态（自动切换启动/停止按钮）
     private val statusTicker = object : Runnable {
         override fun run() {
             refreshStatus()
@@ -44,16 +40,13 @@ class MainActivity : AppCompatActivity() {
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
-        if (result.resultCode == Activity.RESULT_OK) {
-            startVpnService()
-        } else {
-            toast("用户拒绝 VPN 权限")
-        }
+        if (result.resultCode == Activity.RESULT_OK) startVpnService()
+        else toast("用户拒绝 VPN 权限")
     }
 
     private val notifPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { /* 忽略 */ }
+    ) { }
 
     private val pickDirLauncher = registerForActivityResult(
         ActivityResultContracts.OpenDocumentTree()
@@ -89,11 +82,11 @@ class MainActivity : AppCompatActivity() {
         showFirstLaunchDialogIfNeeded()
         checkSignalingUrl()
 
-        // ============ Toolbar 菜单 ============
+        // Toolbar 菜单
         binding.toolbar.inflateMenu(R.menu.menu_main)
         binding.toolbar.setOnMenuItemClickListener { item ->
             when (item.itemId) {
-                R.id.action_logs -> {                                   // ★ 新增：打开日志
+                R.id.action_logs -> {
                     startActivity(Intent(this, LogActivity::class.java))
                     true
                 }
@@ -105,7 +98,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // 按钮
         binding.btnStart.setOnClickListener { saveThenRequest() }
         binding.btnStop.setOnClickListener { stopVpnService() }
         binding.btnSave.setOnClickListener {
@@ -130,9 +122,7 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         refreshStatus()
-        if (N2nController.isRunning()) {
-            refreshPeers()
-        }
+        if (N2nController.isRunning()) refreshPeers()
     }
 
     override fun onPause() {
@@ -149,6 +139,7 @@ class MainActivity : AppCompatActivity() {
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         outState.putString("signalingUrl", binding.etSignalingUrl.text.toString())
+        outState.putString("preferredIp", binding.etPreferredIp.text.toString())
         outState.putString("roomId", binding.etRoomId.text.toString())
         outState.putString("clientId", binding.etClientId.text.toString())
         outState.putString("nodeName", binding.etNodeName.text.toString())
@@ -262,6 +253,7 @@ class MainActivity : AppCompatActivity() {
     private fun loadConfig(savedInstanceState: Bundle?) {
         if (savedInstanceState != null) {
             binding.etSignalingUrl.setText(savedInstanceState.getString("signalingUrl", ""))
+            binding.etPreferredIp.setText(savedInstanceState.getString("preferredIp", ""))
             binding.etRoomId.setText(savedInstanceState.getString("roomId", ""))
             binding.etClientId.setText(savedInstanceState.getString("clientId", ""))
             binding.etNodeName.setText(savedInstanceState.getString("nodeName", ""))
@@ -270,6 +262,7 @@ class MainActivity : AppCompatActivity() {
         }
         val cfg = Prefs.load(this)
         binding.etSignalingUrl.setText(cfg.signalingUrl)
+        binding.etPreferredIp.setText(Prefs.loadPreferredIp(this))
         binding.etRoomId.setText(cfg.roomId)
         binding.etClientId.setText(cfg.clientId)
         binding.etNodeName.setText(cfg.nodeName)
@@ -283,6 +276,7 @@ class MainActivity : AppCompatActivity() {
             val data = intent.data!!
             if (data.scheme == "n2n" && data.host == "connect") {
                 data.getQueryParameter("url")?.let { binding.etSignalingUrl.setText(it) }
+                data.getQueryParameter("ip")?.let { binding.etPreferredIp.setText(it) }
                 data.getQueryParameter("room")?.let { binding.etRoomId.setText(it) }
                 data.getQueryParameter("cid")?.let { binding.etClientId.setText(it) }
                 data.getQueryParameter("name")?.let { binding.etNodeName.setText(it) }
@@ -296,6 +290,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val url = intent.getStringExtra(N2nVpnService.EXTRA_SIGNALING_URL)
+        val ip = intent.getStringExtra("preferred_ip")
         val room = intent.getStringExtra(N2nVpnService.EXTRA_ROOM_ID)
         val cid = intent.getStringExtra(N2nVpnService.EXTRA_CLIENT_ID)
         val name = intent.getStringExtra(N2nVpnService.EXTRA_NODE_NAME)
@@ -303,6 +298,7 @@ class MainActivity : AppCompatActivity() {
 
         var changed = false
         if (!url.isNullOrEmpty()) { binding.etSignalingUrl.setText(url); changed = true }
+        if (!ip.isNullOrEmpty()) { binding.etPreferredIp.setText(ip); changed = true }
         if (!room.isNullOrEmpty()) { binding.etRoomId.setText(room); changed = true }
         if (!cid.isNullOrEmpty()) { binding.etClientId.setText(cid); changed = true }
         if (!name.isNullOrEmpty()) { binding.etNodeName.setText(name); changed = true }
@@ -318,12 +314,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun saveCurrentInput() {
-        // Client ID 为空时自动生成一个持久化的
         if (binding.etClientId.text.toString().trim().isEmpty()) {
-            val autoId = Prefs.loadOrCreateClientId(this)
-            binding.etClientId.setText(autoId)
+            binding.etClientId.setText(Prefs.loadOrCreateClientId(this))
         }
-
         Prefs.save(this, Prefs.Config(
             signalingUrl = binding.etSignalingUrl.text.toString().trim(),
             roomId = binding.etRoomId.text.toString().trim(),
@@ -331,10 +324,11 @@ class MainActivity : AppCompatActivity() {
             nodeName = binding.etNodeName.text.toString().trim(),
             connectToken = binding.etConnectToken.text.toString().trim(),
         ))
+        Prefs.savePreferredIp(this, binding.etPreferredIp.text.toString().trim())
     }
 
     // ============================================================
-    // 启动 / 停止 VPN
+    // 启动 / 停止
     // ============================================================
 
     private fun saveThenRequest() {
@@ -350,7 +344,6 @@ class MainActivity : AppCompatActivity() {
             checkSignalingUrl()
             return
         }
-
         if (!url.startsWith("wss://") && !url.startsWith("ws://")) {
             toast("WSS 地址必须以 wss:// 或 ws:// 开头")
             return
@@ -377,10 +370,12 @@ class MainActivity : AppCompatActivity() {
     private fun startVpnService() {
         val safUri = Prefs.loadShareDirUri(this)
         val shareDir = ShareDirManager.getAbsolutePathForGo(this, safUri)
+        val preferredIp = binding.etPreferredIp.text.toString().trim()
 
         val intent = Intent(this, N2nVpnService::class.java).apply {
             action = N2nVpnService.ACTION_START
             putExtra(N2nVpnService.EXTRA_SIGNALING_URL, binding.etSignalingUrl.text.toString().trim())
+            putExtra("preferred_ip", preferredIp)
             putExtra(N2nVpnService.EXTRA_ROOM_ID, binding.etRoomId.text.toString().trim())
             putExtra(N2nVpnService.EXTRA_CLIENT_ID, binding.etClientId.text.toString().trim())
             putExtra(N2nVpnService.EXTRA_NODE_NAME, binding.etNodeName.text.toString().trim())
@@ -451,13 +446,8 @@ class MainActivity : AppCompatActivity() {
             binding.peersContainer.removeAllViews()
             return
         }
-
         val json = N2nController.getPeersJSON()
-        val peers = try {
-            JSONArray(json)
-        } catch (e: Exception) {
-            JSONArray()
-        }
+        val peers = try { JSONArray(json) } catch (e: Exception) { JSONArray() }
 
         binding.tvPeerCount.text = peers.length().toString()
 
@@ -467,7 +457,6 @@ class MainActivity : AppCompatActivity() {
             return
         }
         binding.tvPeersEmpty.visibility = View.GONE
-
         binding.peersContainer.removeAllViews()
         val inflater = LayoutInflater.from(this)
 
@@ -488,7 +477,6 @@ class MainActivity : AppCompatActivity() {
             item.btnOpenShare.setOnClickListener {
                 openShareInBrowser(vip, sharePort)
             }
-
             binding.peersContainer.addView(item.root)
         }
     }
@@ -496,16 +484,11 @@ class MainActivity : AppCompatActivity() {
     private fun openShareInBrowser(vip: String, port: Int) {
         val url = "http://$vip:$port/"
         try {
-            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
-            startActivity(intent)
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
         } catch (e: Exception) {
             toast("无法打开浏览器: ${e.message}")
         }
     }
-
-    // ============================================================
-    // 共享目录
-    // ============================================================
 
     private fun refreshShareDirDisplay(uri: String?) {
         binding.tvShareDir.text = if (uri.isNullOrEmpty()) {
@@ -518,10 +501,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
     }
-
-    // ============================================================
-    // 工具
-    // ============================================================
 
     private fun toast(msg: String) {
         Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
