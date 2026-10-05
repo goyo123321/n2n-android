@@ -3,7 +3,6 @@ package internal
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -12,6 +11,7 @@ import (
 	"time"
 )
 
+// PeerInfo 对端信息
 type PeerInfo struct {
 	ClientID      string
 	VirtualIP     string
@@ -23,6 +23,7 @@ type PeerInfo struct {
 	lastRecvAt    int64
 }
 
+// PeerSnapshot UI 用
 type PeerSnapshot struct {
 	Code      string `json:"code"`
 	ClientID  string `json:"clientId"`
@@ -33,6 +34,7 @@ type PeerSnapshot struct {
 	NATType   string `json:"natType"`
 }
 
+// Edge 主结构
 type Edge struct {
 	cfg       *Config
 	clientId  string
@@ -56,21 +58,18 @@ type Edge struct {
 
 	netstack *NetstackHost
 	progress *ProgressDispatcher
-
 	wsOutbound *WSOutbound
 	httpProxy  *HTTPProxy
-
-	router   *Router
-	dnsCache *DNSCache
-	dnsProxy *DNSProxy
 
 	doneCh  chan struct{}
 	closeMu sync.Mutex
 	closed  bool
+	mu      sync.Mutex
 }
 
 var httpClient = &http.Client{Timeout: 30 * time.Second}
 
+// generateDefaultClientID 生成默认 Client ID
 func generateDefaultClientID() string {
 	hostname, _ := os.Hostname()
 	if hostname == "" {
@@ -79,16 +78,23 @@ func generateDefaultClientID() string {
 	return fmt.Sprintf("%s-android", hostname)
 }
 
+// ============ 提前获取虚拟 IP ============
+
+// FetchVirtualIP 连一次信令拿虚拟 IP，然后断开
 func FetchVirtualIP(cfg *Config) string {
 	if cfg.SignalingURL == "" {
 		return ""
 	}
+
 	clientId := cfg.ClientID
 	if clientId == "" {
 		clientId = generateDefaultClientID()
 	}
 
-	ws, err := NewWSTransport(cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken, cfg.PreferredIP, cfg.PreferredPort)
+	ws, err := NewWSTransport(
+		cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken,
+		cfg.PreferredIP, cfg.PreferredPort,
+	)
 	if err != nil {
 		log.Printf("[FetchVIP] 连接信令失败: %v", err)
 		return ""
@@ -97,7 +103,8 @@ func FetchVirtualIP(cfg *Config) string {
 
 	done := make(chan string, 1)
 	ws.onMessage = func(msg map[string]interface{}) {
-		if t, _ := msg["type"].(string); t == "ready" {
+		t, _ := msg["type"].(string)
+		if t == "ready" {
 			payload, _ := msg["payload"].(map[string]interface{})
 			vip, _ := payload["virtualIp"].(string)
 			select {
@@ -117,6 +124,7 @@ func FetchVirtualIP(cfg *Config) string {
 	}
 }
 
+// Start 启动客户端
 func Start(cfg *Config, tunFd int) (*Edge, error) {
 	if cfg.SignalingURL == "" {
 		return nil, fmt.Errorf("signaling URL 为空")
@@ -145,51 +153,65 @@ func Start(cfg *Config, tunFd int) (*Edge, error) {
 		doneCh:     make(chan struct{}),
 	}
 
+	// 1. 包装 TUN
 	tun, err := setupTUNFromFD(tunFd)
 	if err != nil {
 		return nil, fmt.Errorf("包装 TUN fd 失败: %w", err)
 	}
 	e.tun = tun
 
+	// 2. UDP 监听
 	udpAddr := &net.UDPAddr{IP: net.IPv4zero, Port: e.udpPort}
 	udpConn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
-		return nil, fmt.Errorf("绑定 UDP: %w", err)
+		return nil, fmt.Errorf("绑定 UDP %d 失败: %w", e.udpPort, err)
 	}
 	e.udpConn = udpConn
 
+	// 3. NAT 探测（IPv4-only）
 	e.natMeta = probeNAT(e.udpPort, nil)
 
-	ws, err := NewWSTransport(cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken, cfg.PreferredIP, cfg.PreferredPort)
+	// 4. 连接信令（支持优选 IP）
+	ws, err := NewWSTransport(
+		cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken,
+		cfg.PreferredIP, cfg.PreferredPort,
+	)
 	if err != nil {
 		udpConn.Close()
 		return nil, fmt.Errorf("连接信令失败: %w", err)
 	}
 	e.ws = ws
 
+	// 5. TURN
 	e.turnClient = NewTURNClient(cfg.SignalingURL, cfg.ConnectToken, e)
 	e.turnClient.onMessage = func(data []byte, addr net.Addr) {
 		e.onRemotePacket(data)
 	}
 
+	// 6. 中继
 	e.relayMgr = NewRelayManager(ws, e.turnClient, e)
 	e.relayMgr.Report(10 * time.Second)
 
+	// 7. 回调
 	ws.onMessage = e.handleSignaling
 	ws.onBinary = func(data []byte) {
 		e.onRemotePacket(data)
 	}
 
+	// 8. 后台协程
 	go e.udpReadLoop()
 	go e.tunWriteLoop()
 	go e.tunReadLoop()
 
+	// 9. progress 空初始化
 	e.progress = &ProgressDispatcher{}
 
+	// 10. TURN + WSOutbound 异步初始化
 	go func() {
 		time.Sleep(2 * time.Second)
 		ctx, cancel := contextWithTimeout(30 * time.Second)
 		defer cancel()
+
 		if err := e.turnClient.FetchAndSetup(ctx); err != nil {
 			log.Printf("[TURN] 初始化失败: %v", err)
 		} else {
@@ -201,14 +223,18 @@ func Start(cfg *Config, tunFd int) (*Edge, error) {
 			})
 		}
 
-		wsOut, err := NewWSOutbound(cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken, cfg.PreferredIP, cfg.PreferredPort)
+		// Workers 出口
+		wsOut, err := NewWSOutbound(
+			cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken,
+			cfg.PreferredIP, cfg.PreferredPort,
+		)
 		if err != nil {
 			log.Printf("[WSOut] 初始化失败: %v", err)
 			return
 		}
-		e.closeMu.Lock()
+		e.mu.Lock()
 		e.wsOutbound = wsOut
-		e.closeMu.Unlock()
+		e.mu.Unlock()
 		log.Printf("[WSOut] Workers 出口代理就绪")
 	}()
 
@@ -216,6 +242,7 @@ func Start(cfg *Config, tunFd int) (*Edge, error) {
 	return e, nil
 }
 
+// Stop 停止
 func (e *Edge) Stop() {
 	e.closeMu.Lock()
 	if e.closed {
@@ -226,12 +253,6 @@ func (e *Edge) Stop() {
 	close(e.doneCh)
 	e.closeMu.Unlock()
 
-	if e.httpProxy != nil {
-		e.httpProxy.Close()
-	}
-	if e.wsOutbound != nil {
-		e.wsOutbound.Close()
-	}
 	if e.ws != nil {
 		_ = e.ws.Close()
 	}
@@ -244,23 +265,33 @@ func (e *Edge) Stop() {
 	if e.tun != nil {
 		_ = e.tun.Close()
 	}
+	if e.wsOutbound != nil {
+		e.wsOutbound.Close()
+	}
+	if e.httpProxy != nil {
+		e.httpProxy.Close()
+	}
 	log.Printf("[Edge] 已停止")
 }
 
+// Done 关闭信号
 func (e *Edge) Done() <-chan struct{} {
 	return e.doneCh
 }
 
+// GetVirtualIP 虚拟 IP
 func (e *Edge) GetVirtualIP() string {
 	e.peersMu.RLock()
 	defer e.peersMu.RUnlock()
 	return e.virtualIP
 }
 
+// GetClientID 客户端 ID
 func (e *Edge) GetClientID() string {
 	return e.clientId
 }
 
+// GetPeersJSON 节点列表 JSON
 func (e *Edge) GetPeersJSON() string {
 	e.peersMu.RLock()
 	defer e.peersMu.RUnlock()
@@ -309,12 +340,14 @@ func idxToCode(i int) string {
 	return string(rune('A'+first)) + string(rune('A'+second))
 }
 
+// ============ 信令消息处理 ============
+
 func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	t, _ := msg["type"].(string)
 	from, _ := msg["from"].(string)
 
 	if t == "_reconnected" {
-		log.Printf("[信令] WebSocket 重连成功")
+		log.Printf("[信令] WebSocket 重连成功，重新上报元数据")
 		e.reportMetadata()
 		return
 	}
@@ -328,43 +361,38 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		e.peersMu.Unlock()
 		log.Printf("[信令] 分配虚拟 IP: %s", vip)
 
+		// ★ 兜底：STUN 失败时用服务端看到的公网 IP
+		if e.natMeta.PublicEndpoint == "" {
+			if serverSeenIp, ok := payload["yourPublicIp"].(string); ok && serverSeenIp != "" {
+				endpoint := fmt.Sprintf("%s:%d", serverSeenIp, e.udpPort)
+				e.natMeta.PublicEndpoint = endpoint
+				e.natMeta.P2PEndpoint = endpoint
+				e.natMeta.NATType = "EasyNAT"
+				log.Printf("[NAT] STUN 失败，用服务端 IP 兜底: %s", endpoint)
+			}
+		}
+
+		// 初始化 netstack + 共享盘
 		if e.netstack == nil && vip != "" {
 			ns, err := NewNetstackHost(vip)
 			if err != nil {
 				log.Printf("[Netstack] 初始化失败: %v", err)
 			} else {
 				ns.progress = e.progress
-				if e.dnsCache == nil {
-					e.dnsCache = NewDNSCache()
-				}
-				if e.router == nil {
-					e.router, _ = NewRouter(DefaultRoutingConfig())
-				}
-				ns.SetRouter(e.router, e.dnsCache)
-				if e.dnsProxy == nil {
-					if p, err := NewDNSProxy(e.dnsCache); err == nil {
-						e.dnsProxy = p
-						ns.SetDNSProxy(p)
-					}
-				}
-				ns.SetProxyHandler(func(ip string, port int) (io.ReadWriteCloser, error) {
-					if e.wsOutbound == nil {
-						return nil, fmt.Errorf("wsOutbound 未就绪")
-					}
-					return e.wsOutbound.NewStream(ip, port)
-				})
 				e.netstack = ns
 				go e.netstackReadLoop()
 				if e.cfg != nil && e.cfg.ShareDir != "" {
 					if err := ns.StartShareServer(e.cfg.ShareDir); err != nil {
-						log.Printf("[Netstack] 共享盘失败: %v", err)
+						log.Printf("[Netstack] 共享盘启动失败: %v", err)
 					}
 				}
 			}
 		}
 
+		// 上报元数据
 		e.reportMetadata()
 
+		// ★ 打印已有节点列表（诊断）
 		if peers, ok := payload["peers"].([]interface{}); ok {
 			log.Printf("[信令] ready: 返回 %d 个已有节点", len(peers))
 			for _, p := range peers {
@@ -389,22 +417,29 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 					}
 					e.peersMu.Unlock()
 				}
-				log.Printf("[信令] 已有节点: %s vip=%s", pid, pip)
+				log.Printf("[信令] 已有节点: %s vip=%s pub=%s:%d share=%d",
+					pid, pip, pubIP, pubPort, sharePort)
 			}
+		} else {
+			log.Printf("[信令] ready: 返回 0 个已有节点")
 		}
 
 	case "joined":
 		payload, _ := msg["payload"].(map[string]interface{})
 		if payload == nil {
+			log.Printf("[信令] joined: payload 为空，忽略")
 			return
 		}
 		pip, _ := payload["virtualIp"].(string)
 		pubIP, _ := payload["publicIp"].(string)
 		pubPort := jsonInt(payload["publicPort"])
+		sharePort := jsonInt(payload["sharePort"])
 		relayAddr, _ := payload["turnRelayAddr"].(string)
-		log.Printf("[信令] joined: from=%s vip=%s", from, pip)
+
+		log.Printf("[信令] joined: from=%s vip=%s pub=%s:%d", from, pip, pubIP, pubPort)
+
 		if from != "" && pip != "" {
-			e.registerPeer(from, pip, pubIP, pubPort, 0)
+			e.registerPeer(from, pip, pubIP, pubPort, sharePort)
 			if relayAddr != "" {
 				e.peersMu.Lock()
 				if pi, ok := e.peers[from]; ok {
@@ -412,6 +447,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 				}
 				e.peersMu.Unlock()
 			}
+			log.Printf("[信令] 节点上线: %s vip=%s", from, pip)
 		}
 
 	case "nat_hole_instruction":
@@ -442,9 +478,13 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		e.peersMu.Lock()
 		delete(e.peers, from)
 		e.peersMu.Unlock()
+
+	case "connection_status":
+		return
 	}
 }
 
+// reportMetadata 上报 p2p_metadata 和 share_announce
 func (e *Edge) reportMetadata() {
 	metaPayload := map[string]interface{}{
 		"natType":            e.natMeta.NATType,
@@ -462,6 +502,7 @@ func (e *Edge) reportMetadata() {
 		"type":    "p2p_metadata",
 		"payload": metaPayload,
 	})
+
 	_ = e.ws.Send(map[string]interface{}{
 		"type": "share_announce",
 		"payload": map[string]interface{}{
@@ -542,6 +583,7 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 
 func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	res := e.executeNatHole(instr)
+
 	_ = e.ws.Send(map[string]interface{}{
 		"type": "p2p_state_info",
 		"payload": map[string]interface{}{
@@ -555,12 +597,15 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 			},
 		},
 	})
+
 	if res.State == PunchStateSucceeded {
 		e.relayMgr.MarkP2P(instr.TargetMac)
 	} else {
 		e.relayMgr.MarkFallback(instr.TargetMac)
 	}
 }
+
+// ============ 网络 IO 循环 ============
 
 func (e *Edge) udpReadLoop() {
 	buf := make([]byte, 65535)
@@ -603,6 +648,7 @@ func (e *Edge) tunReadLoop() {
 		if n < 20 || buf[0]>>4 != 4 {
 			continue
 		}
+
 		dstIP := net.IP(buf[16:20]).String()
 		vip := e.GetVirtualIP()
 
@@ -701,8 +747,10 @@ func (e *Edge) onRemotePacket(data []byte) {
 	if len(data) < 20 || data[0]>>4 != 4 {
 		return
 	}
+
 	dstIP := net.IP(data[16:20]).String()
 	vip := e.GetVirtualIP()
+
 	if dstIP == vip && e.netstack != nil {
 		e.netstack.InjectTUNPacket(data)
 		return
