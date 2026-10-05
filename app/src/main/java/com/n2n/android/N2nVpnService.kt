@@ -35,7 +35,6 @@ class N2nVpnService : VpnService() {
 
     private var tunInterface: ParcelFileDescriptor? = null
     private var started = false
-
     private val handler = Handler(Looper.getMainLooper())
 
     private val updateIpRunnable = object : Runnable {
@@ -51,7 +50,6 @@ class N2nVpnService : VpnService() {
                 handler.postDelayed(this, 1000)
             } else {
                 updateNotification("连接超时")
-                Log.w(TAG, "等待虚拟 IP 超时")
             }
         }
     }
@@ -66,16 +64,13 @@ class N2nVpnService : VpnService() {
     }
 
     private fun handleStart(intent: Intent) {
-        if (started) {
-            Log.w(TAG, "already started")
-            return
-        }
+        if (started) return
 
         val signalingUrl = intent.getStringExtra(EXTRA_SIGNALING_URL) ?: run {
-            Log.e(TAG, "missing signaling_url")
             stopSelf()
             return
         }
+        val preferredIp = intent.getStringExtra("preferred_ip") ?: ""
         val roomId = intent.getStringExtra(EXTRA_ROOM_ID) ?: "default-room"
         val clientId = intent.getStringExtra(EXTRA_CLIENT_ID) ?: ""
         val nodeName = intent.getStringExtra(EXTRA_NODE_NAME) ?: "Android"
@@ -83,7 +78,6 @@ class N2nVpnService : VpnService() {
         val shareDir = intent.getStringExtra(EXTRA_SHARE_DIR)
             ?: ShareDirManager.getDefaultShareDir(this).absolutePath
 
-        // 前台通知
         startForeground(NOTIF_ID, buildNotification("正在获取虚拟 IP..."))
 
         val config = Config().apply {
@@ -93,36 +87,27 @@ class N2nVpnService : VpnService() {
             setNodeName(nodeName)
             setConnectToken(connectToken)
             setShareDir(shareDir)
+            setPreferredIP(preferredIp)
+            setPreferredPort(443)
         }
 
-        // ★ 后台线程：先 fetch VIP → 建 TUN → start
         Thread {
-            Log.i(TAG, "正在获取虚拟 IP...")
             val tmpClient = Client()
             val vip = tmpClient.fetchVirtualIP(config)
 
             handler.post {
                 if (vip.isEmpty()) {
-                    Log.e(TAG, "获取虚拟 IP 失败")
                     updateNotification("获取虚拟 IP 失败")
                     handler.postDelayed({ stopVpn() }, 3000)
                     return@post
                 }
-
-                Log.i(TAG, "拿到虚拟 IP: $vip")
-                updateNotification("虚拟 IP: $vip，正在建立 TUN...")
-
-                // 用这个 IP 建 TUN
                 val pfd = buildTunInterface(vip)
                 if (pfd == null) {
-                    Log.e(TAG, "建立 TUN 失败")
                     updateNotification("建立 TUN 失败")
                     handler.postDelayed({ stopVpn() }, 3000)
                     return@post
                 }
                 tunInterface = pfd
-
-                // 启动 Go 客户端
                 val tunFd = pfd.detachFd()
                 N2nController.startAsync(tunFd, config) { err ->
                     handler.post {
@@ -132,7 +117,6 @@ class N2nVpnService : VpnService() {
                             handler.postDelayed({ stopVpn() }, 3000)
                         } else {
                             started = true
-                            Log.i(TAG, "Go 客户端已启动，等待数据就绪...")
                             handler.post(updateIpRunnable)
                         }
                     }
@@ -147,7 +131,6 @@ class N2nVpnService : VpnService() {
 
     private fun handleStop() {
         handler.removeCallbacks(updateIpRunnable)
-
         if (started) {
             N2nController.stop()
             started = false
@@ -167,17 +150,16 @@ class N2nVpnService : VpnService() {
     }
 
     /**
-     * 用服务端分配的虚拟 IP 建 TUN
+     * 只接管 10.64.0.0/24（不影响用户正常上网）
      */
     private fun buildTunInterface(vip: String): ParcelFileDescriptor? {
         return try {
-            Log.i(TAG, "建立 TUN，绑定 IP: $vip")
+            Log.i(TAG, "建立 TUN，绑定 IP: $vip，只接管 10.64.0.0/24")
             Builder()
                 .setSession("n2n-client")
                 .setMtu(1280)
                 .addAddress(vip, 24)
                 .addRoute("10.64.0.0", 24)
-                .addDnsServer("1.1.1.1")
                 .setBlocking(true)
                 .establish()
         } catch (e: Exception) {
