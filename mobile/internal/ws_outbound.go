@@ -1,110 +1,147 @@
 package internal
 
 import (
+	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"strings"
+	"net/url"
+	"strconv"
 	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
 )
 
+// WSOutbound 通过 Workers 出口代理转发数据
+// 每个 TCP 连接建立一个独立的 WebSocket 到 /ws/out/stream/
 type WSOutbound struct {
-	ws            *WSTransport
-	mu            sync.RWMutex
-	stopped       bool
-	onMessage     func([]byte, *net.UDPAddr)
+	mu        sync.RWMutex
+	stopped   bool
+	onMessage func([]byte, *net.UDPAddr)
 
-	streamURL     string
-	roomId        string
-	clientId      string
-	connectToken  string
+	streamURL     string   // wss://host/ws/out/stream/
 	preferredIP   string
 	preferredPort int
+	sniHost       string   // TLS SNI = 原域名
 }
 
-func NewWSOutbound(signalingURL, roomId, clientId, connectToken, preferredIP string, preferredPort int) (*WSOutbound, error) {
-	mainURL := signalingURL
-	if idx := strings.Index(mainURL, "/ws/"); idx >= 0 {
-		mainURL = mainURL[:idx] + "/ws/out/"
-	} else {
-		mainURL = strings.TrimRight(mainURL, "/") + "/ws/out/"
-	}
-
-	streamURL := signalingURL
-	if idx := strings.Index(streamURL, "/ws/"); idx >= 0 {
-		streamURL = streamURL[:idx] + "/ws/out/stream/"
-	} else {
-		streamURL = strings.TrimRight(streamURL, "/") + "/ws/out/stream/"
-	}
-
-	ws, err := NewWSTransport(mainURL, roomId, clientId, connectToken, preferredIP, preferredPort)
+func NewWSOutbound(
+	signalingURL, roomId, clientId, connectToken,
+	preferredIP string, preferredPort int,
+) (*WSOutbound, error) {
+	u, err := url.Parse(signalingURL)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("解析 URL 失败: %w", err)
 	}
+	sniHost := u.Hostname()
 
-	o := &WSOutbound{
-		ws:            ws,
+	// ★ 直接构造 stream 端点（不带 roomId，服务端也不接受）
+	scheme := u.Scheme
+	if scheme == "http" {
+		scheme = "ws"
+	} else if scheme == "https" {
+		scheme = "wss"
+	}
+	streamURL := fmt.Sprintf("%s://%s/ws/out/stream/", scheme, u.Host)
+
+	log.Printf("[WSOut] 出口端点: %s", streamURL)
+
+	return &WSOutbound{
 		streamURL:     streamURL,
-		roomId:        roomId,
-		clientId:      clientId,
-		connectToken:  connectToken,
 		preferredIP:   preferredIP,
 		preferredPort: preferredPort,
-	}
-	ws.onBinary = o.handleBinary
-	ws.onMessage = func(msg map[string]interface{}) {}
-	return o, nil
+		sniHost:       sniHost,
+	}, nil
 }
 
-func (o *WSOutbound) handleBinary(data []byte) {
-	if len(data) < 6 {
-		return
-	}
-	ip := net.IPv4(data[0], data[1], data[2], data[3])
-	port := int(binary.BigEndian.Uint16(data[4:6]))
-	payload := data[6:]
-	if o.onMessage != nil {
-		o.onMessage(payload, &net.UDPAddr{IP: ip, Port: port})
-	}
-}
-
+// NewStream 为一个 TCP 连接建立独立的 WS 流
 func (o *WSOutbound) NewStream(targetIP string, targetPort int) (io.ReadWriteCloser, error) {
-	ws, err := NewWSTransport(o.streamURL, o.roomId, o.clientId, o.connectToken, o.preferredIP, o.preferredPort)
+	o.mu.RLock()
+	if o.stopped {
+		o.mu.RUnlock()
+		return nil, fmt.Errorf("已关闭")
+	}
+	o.mu.RUnlock()
+
+	dialer := &websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
+		TLSClientConfig: &tls.Config{
+			ServerName: o.sniHost, // ★ SNI = 原域名
+		},
+	}
+
+	// ★ 优选 IP：URL 保持原域名，只换 TCP 目标
+	if o.preferredIP != "" {
+		preferredHost := o.preferredIP
+		preferredPortNum := o.preferredPort
+
+		if h, pStr, err := net.SplitHostPort(o.preferredIP); err == nil {
+			preferredHost = h
+			if p, err := strconv.Atoi(pStr); err == nil && p > 0 && p <= 65535 {
+				preferredPortNum = p
+			}
+		}
+		if preferredPortNum <= 0 {
+			preferredPortNum = 443
+		}
+
+		targetAddr := net.JoinHostPort(preferredHost, strconv.Itoa(preferredPortNum))
+		dialer.NetDial = func(network, addr string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 10 * time.Second}
+			return d.Dial(network, targetAddr)
+		}
+	}
+
+	log.Printf("[WSOut] 连接 %s (SNI=%s)", o.streamURL, o.sniHost)
+
+	conn, _, err := dialer.Dial(o.streamURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("建立 stream WS 失败: %w", err)
+		return nil, fmt.Errorf("连接出口失败: %w", err)
 	}
 
 	stream := &WSStream{
-		ws:         ws,
+		ws:         conn,
 		readCh:     make(chan []byte, 64),
 		closed:     make(chan struct{}),
 		remoteIP:   targetIP,
 		remotePort: targetPort,
 	}
 
-	ws.onBinary = func(data []byte) {
-		cp := make([]byte, len(data))
-		copy(cp, data)
-		select {
-		case stream.readCh <- cp:
-		case <-stream.closed:
-		default:
+	go func() {
+		defer close(stream.readCh)
+		for {
+			msgType, data, err := conn.ReadMessage()
+			if err != nil {
+				select {
+				case <-stream.closed:
+					return
+				default:
+				}
+				log.Printf("[WSStream] 读错误: %v", err)
+				stream.Close()
+				return
+			}
+			if msgType == websocket.BinaryMessage {
+				cp := make([]byte, len(data))
+				copy(cp, data)
+				select {
+				case stream.readCh <- cp:
+				case <-stream.closed:
+					return
+				}
+			} else if msgType == websocket.TextMessage {
+				log.Printf("[WSStream] 服务端文本: %s", string(data))
+			}
 		}
-	}
+	}()
 
-	ws.onMessage = func(msg map[string]interface{}) {
-		if msg["type"] == "error" {
-			errMsg, _ := msg["error"].(string)
-			log.Printf("[WSStream] 服务端错误: %s", errMsg)
-			stream.Close()
-		}
-	}
-
+	// 发送握手：[1 proto] [4 IPv4] [2 port]
 	ip4 := net.ParseIP(targetIP).To4()
 	if ip4 == nil {
-		ws.Close()
+		conn.Close()
 		return nil, fmt.Errorf("仅支持 IPv4: %s", targetIP)
 	}
 
@@ -113,8 +150,8 @@ func (o *WSOutbound) NewStream(targetIP string, targetPort int) (io.ReadWriteClo
 	copy(handshake[1:5], ip4)
 	binary.BigEndian.PutUint16(handshake[5:7], uint16(targetPort))
 
-	if err := ws.SendBinary(handshake); err != nil {
-		ws.Close()
+	if err := conn.WriteMessage(websocket.BinaryMessage, handshake); err != nil {
+		conn.Close()
 		return nil, fmt.Errorf("发送握手失败: %w", err)
 	}
 
@@ -124,19 +161,14 @@ func (o *WSOutbound) NewStream(targetIP string, targetPort int) (io.ReadWriteClo
 
 func (o *WSOutbound) Close() {
 	o.mu.Lock()
-	if o.stopped {
-		o.mu.Unlock()
-		return
-	}
+	defer o.mu.Unlock()
 	o.stopped = true
-	o.mu.Unlock()
-	if o.ws != nil {
-		o.ws.Close()
-	}
 }
 
+// ============ WSStream ============
+
 type WSStream struct {
-	ws         *WSTransport
+	ws         *websocket.Conn
 	readCh     chan []byte
 	closed     chan struct{}
 	closeOnce  sync.Once
@@ -162,7 +194,7 @@ func (s *WSStream) Write(p []byte) (int, error) {
 		return 0, io.ErrClosedPipe
 	default:
 	}
-	if err := s.ws.SendBinary(p); err != nil {
+	if err := s.ws.WriteMessage(websocket.BinaryMessage, p); err != nil {
 		return 0, err
 	}
 	return len(p), nil
