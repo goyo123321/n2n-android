@@ -24,6 +24,7 @@ type Client struct {
 	mu        sync.Mutex
 	tunFd     int
 	udpFd     int
+	stunFd    int
 	running   bool
 	virtualIP string
 	clientID  string
@@ -42,6 +43,12 @@ func (c *Client) SetUdpFD(fd int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.udpFd = fd
+}
+
+func (c *Client) SetStunFD(fd int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.stunFd = fd
 }
 
 func (c *Client) FetchVirtualIP(cfg *Config) string {
@@ -66,6 +73,7 @@ func (c *Client) Start(cfg *Config) string {
 	}
 	tunFd := c.tunFd
 	udpFd := c.udpFd
+	stunFd := c.stunFd
 	c.mu.Unlock()
 
 	icfg := &internal.Config{
@@ -75,7 +83,7 @@ func (c *Client) Start(cfg *Config) string {
 		PreferredIP: cfg.PreferredIP, PreferredPort: cfg.PreferredPort,
 	}
 
-	edge, err := internal.Start(icfg, tunFd, udpFd)
+	edge, err := internal.Start(icfg, tunFd, udpFd, stunFd)
 	if err != nil {
 		return err.Error()
 	}
@@ -114,7 +122,7 @@ func (c *Client) Start(cfg *Config) string {
 		}
 	}()
 
-	log.Printf("[mobile] started, room=%s, udpFd=%d", cfg.RoomID, udpFd)
+	log.Printf("[mobile] started, room=%s, udpFd=%d, stunFd=%d", cfg.RoomID, udpFd, stunFd)
 	return ""
 }
 
