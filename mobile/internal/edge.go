@@ -152,7 +152,6 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		peers:      make(map[string]*PeerInfo),
 		tunWriteCh: make(chan []byte, 4096),
 		doneCh:     make(chan struct{}),
-		// 默认 natMeta（异步 STUN 探测前占位）
 		natMeta: &NATMetadata{
 			NATType:  "unknown",
 			Behavior: "BehaviorPortChanged",
@@ -255,7 +254,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 
 	e.progress = &ProgressDispatcher{}
 
-	// ★ 9. NAT 探测（异步，不阻塞启动）
+	// 9. NAT 探测（异步）
 	go func() {
 		log.Printf("[NAT] 开始异步 STUN 探测...")
 		var meta *NATMetadata
@@ -273,7 +272,6 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 
 		log.Printf("[NAT] 探测完成: %s pub=%s", meta.NATType, meta.PublicEndpoint)
 
-		// 探测完成后重新上报（第一次上报时 natType 可能还是 unknown）
 		if wsRef != nil {
 			e.reportMetadata()
 			log.Printf("[NAT] 已重新上报 p2p_metadata")
@@ -297,9 +295,11 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 			})
 		}
 
+		// ★ 传 turnClient 供 TCP 回退
 		wsOut, err := NewWSOutbound(
 			cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken,
 			cfg.PreferredIP, cfg.PreferredPort,
+			e.turnClient,
 		)
 		if err != nil {
 			log.Printf("[WSOut] 初始化失败: %v", err)
@@ -368,7 +368,6 @@ func (e *Edge) GetPeersJSON() string {
 		}
 	}
 
-	// ★ natMeta 加锁读取
 	e.mu.Lock()
 	natType := e.natMeta.NATType
 	e.mu.Unlock()
@@ -426,7 +425,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		e.peersMu.Unlock()
 		log.Printf("[信令] 分配虚拟 IP: %s", vip)
 
-		// ★ 兜底：STUN 未完成时用服务端看到的 IP
 		e.mu.Lock()
 		needFallback := e.natMeta.PublicEndpoint == ""
 		e.mu.Unlock()
@@ -556,7 +554,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 }
 
 func (e *Edge) reportMetadata() {
-	// ★ natMeta 加锁快照
 	e.mu.Lock()
 	nm := e.natMeta
 	e.mu.Unlock()
@@ -708,7 +705,6 @@ func (e *Edge) tunReadLoop() {
 			continue
 		}
 
-		// 出网 → netstack → TCP forwarder → Workers 出口
 		if e.netstack != nil {
 			e.netstack.InjectTUNPacket(buf[:n])
 		}
