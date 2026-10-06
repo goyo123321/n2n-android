@@ -4,16 +4,26 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
+import android.net.IpPrefix
 import android.net.VpnService
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.n2n.mobile.Client
 import com.n2n.mobile.Config
+import java.net.DatagramSocket
+import java.net.HttpURLConnection
+import java.net.InetAddress
+import java.net.URL
+import java.net.URLEncoder
+import org.json.JSONObject
 
 class N2nVpnService : VpnService() {
 
@@ -36,6 +46,10 @@ class N2nVpnService : VpnService() {
     private var tunInterface: ParcelFileDescriptor? = null
     private var started = false
     private val handler = Handler(Looper.getMainLooper())
+
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+    private var protectedUdpSocket: DatagramSocket? = null
 
     private val updateIpRunnable = object : Runnable {
         private var attempts = 0
@@ -79,6 +93,7 @@ class N2nVpnService : VpnService() {
             ?: ShareDirManager.getDefaultShareDir(this).absolutePath
 
         startForeground(NOTIF_ID, buildNotification("正在获取虚拟 IP..."))
+        acquireLocks()
 
         val config = Config().apply {
             setSignalingURL(signalingUrl)
@@ -95,13 +110,17 @@ class N2nVpnService : VpnService() {
             val tmpClient = Client()
             val vip = tmpClient.fetchVirtualIP(config)
 
+            // 查询 TURN 服务器 IP（用于 excludeRoute）
+            val turnIPs = fetchTURNServerIPs(signalingUrl, connectToken)
+            Log.i(TAG, "TURN 服务器 IP 数量: ${turnIPs.size}")
+
             handler.post {
                 if (vip.isEmpty()) {
                     updateNotification("获取虚拟 IP 失败")
                     handler.postDelayed({ stopVpn() }, 3000)
                     return@post
                 }
-                val pfd = buildTunInterface(vip)
+                val pfd = buildTunInterface(vip, turnIPs)
                 if (pfd == null) {
                     updateNotification("建立 TUN 失败")
                     handler.postDelayed({ stopVpn() }, 3000)
@@ -109,7 +128,10 @@ class N2nVpnService : VpnService() {
                 }
                 tunInterface = pfd
                 val tunFd = pfd.detachFd()
-                N2nController.startAsync(tunFd, config) { err ->
+
+                val udpFd = createProtectedUdpSocket()
+
+                N2nController.startAsync(tunFd, udpFd, config) { err ->
                     handler.post {
                         if (err.isNotEmpty()) {
                             Log.e(TAG, "client start failed: $err")
@@ -125,9 +147,120 @@ class N2nVpnService : VpnService() {
         }.start()
     }
 
-    private fun stopVpn() {
-        handleStop()
+    // ============ TURN 服务器 IP 查询 ============
+
+    private fun fetchTURNServerIPs(signalingUrl: String, connectToken: String): List<String> {
+        return try {
+            var httpBase = signalingUrl
+            if (httpBase.startsWith("wss://")) {
+                httpBase = "https://" + httpBase.removePrefix("wss://")
+            } else if (httpBase.startsWith("ws://")) {
+                httpBase = "http://" + httpBase.removePrefix("ws://")
+            }
+            httpBase = httpBase.trimEnd('/')
+
+            var credURL = "$httpBase/api/turn-credentials?ttl=60"
+            if (connectToken.isNotEmpty()) {
+                credURL += "&token=" + URLEncoder.encode(connectToken, "UTF-8")
+            }
+
+            Log.i(TAG, "查询 TURN 凭证: $credURL")
+
+            val conn = URL(credURL).openConnection() as HttpURLConnection
+            conn.connectTimeout = 5000
+            conn.readTimeout = 5000
+            conn.requestMethod = "GET"
+
+            if (conn.responseCode != 200) {
+                Log.w(TAG, "TURN 凭证查询失败: HTTP ${conn.responseCode}")
+                return emptyList()
+            }
+
+            val body = conn.inputStream.bufferedReader().use { it.readText() }
+            val json = JSONObject(body)
+
+            if (!json.optBoolean("success", false)) {
+                Log.w(TAG, "TURN 未配置: ${json.optString("error")}")
+                return emptyList()
+            }
+
+            val servers = json.optJSONArray("servers") ?: return emptyList()
+            val ips = mutableListOf<String>()
+
+            for (i in 0 until servers.length()) {
+                val srv = servers.getJSONObject(i)
+                val url = srv.optString("url", "")
+                val host = parseTurnHost(url)
+                if (host.isEmpty()) continue
+
+                if (isIPv4(host)) {
+                    if (!ips.contains(host)) {
+                        ips.add(host)
+                        Log.i(TAG, "  TURN: $url → $host")
+                    }
+                    continue
+                }
+
+                try {
+                    val addresses = InetAddress.getAllByName(host)
+                    for (addr in addresses) {
+                        val ip = addr.hostAddress ?: continue
+                        if (isIPv4(ip) && !ips.contains(ip)) {
+                            ips.add(ip)
+                            Log.i(TAG, "  TURN: $url → $host → $ip")
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "解析 TURN 域名 $host 失败: ${e.message}")
+                }
+            }
+            ips
+        } catch (e: Exception) {
+            Log.w(TAG, "fetchTURNServerIPs 异常: ${e.message}")
+            emptyList()
+        }
     }
+
+    private fun parseTurnHost(url: String): String {
+        var s = url
+        s = s.removePrefix("turn://").removePrefix("turns://")
+            .removePrefix("turn:").removePrefix("turns:")
+        s = s.removePrefix("//")
+        val q = s.indexOf('?')
+        if (q >= 0) s = s.substring(0, q)
+        val colon = s.lastIndexOf(':')
+        return if (colon > 0) s.substring(0, colon) else s
+    }
+
+    private fun isIPv4(s: String): Boolean {
+        val parts = s.split(".")
+        if (parts.size != 4) return false
+        return parts.all { p ->
+            val n = p.toIntOrNull() ?: return false
+            n in 0..255
+        }
+    }
+
+    // ============ protected UDP socket ============
+
+    private fun createProtectedUdpSocket(): Int {
+        return try {
+            val socket = DatagramSocket()
+            socket.reuseAddress = true
+            val ok = protect(socket)
+            if (!ok) Log.w(TAG, "protect(DatagramSocket) 返回 false")
+            protectedUdpSocket = socket
+            val pfd = ParcelFileDescriptor.fromDatagramSocket(socket)
+            val fd = pfd.detachFd()
+            Log.i(TAG, "protected UDP socket fd=$fd")
+            fd
+        } catch (e: Exception) {
+            Log.e(TAG, "createProtectedUdpSocket failed", e)
+            -1
+        }
+    }
+
+    private fun stopVpn() { handleStop() }
 
     private fun handleStop() {
         handler.removeCallbacks(updateIpRunnable)
@@ -135,10 +268,11 @@ class N2nVpnService : VpnService() {
             N2nController.stop()
             started = false
         }
-        try {
-            tunInterface?.close()
-        } catch (_: Exception) {}
+        try { tunInterface?.close() } catch (_: Exception) {}
         tunInterface = null
+        try { protectedUdpSocket?.close() } catch (_: Exception) {}
+        protectedUdpSocket = null
+        releaseLocks()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -149,19 +283,71 @@ class N2nVpnService : VpnService() {
         stopSelf()
     }
 
-    /**
-     * 只接管 10.64.0.0/24（不影响用户正常上网）
-     */
-    private fun buildTunInterface(vip: String): ParcelFileDescriptor? {
+    private fun acquireLocks() {
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK, "n2n:vpn_wakelock"
+            ).apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        } catch (e: Exception) { Log.w(TAG, "acquire WakeLock failed", e) }
+        try {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            wifiLock = wm.createWifiLock(
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF, "n2n:vpn_wifilock"
+            ).apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        } catch (e: Exception) { Log.w(TAG, "acquire WifiLock failed", e) }
+    }
+
+    private fun releaseLocks() {
+        try { wakeLock?.let { if (it.isHeld) it.release() } } catch (_: Exception) {}
+        wakeLock = null
+        try { wifiLock?.let { if (it.isHeld) it.release() } } catch (_: Exception) {}
+        wifiLock = null
+    }
+
+    // ============ TUN ============
+
+    private fun buildTunInterface(vip: String, turnIPs: List<String>): ParcelFileDescriptor? {
         return try {
-            Log.i(TAG, "建立 TUN，绑定 IP: $vip，只接管 10.64.0.0/24")
-            Builder()
+            Log.i(TAG, "建立 TUN（全流量），绑定 IP: $vip")
+            val builder = Builder()
                 .setSession("n2n-client")
                 .setMtu(1280)
                 .addAddress(vip, 24)
                 .addRoute("10.64.0.0", 24)
-                .setBlocking(true)
-                .establish()
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                builder.addRoute("0.0.0.0", 0)
+
+                val cfSegments = listOf(
+                    "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+                    "104.16.0.0/13", "104.24.0.0/14", "108.162.192.0/18",
+                    "131.0.72.0/22", "141.101.64.0/18", "162.158.0.0/15",
+                    "172.64.0.0/13", "173.245.48.0/20", "188.114.96.0/20",
+                    "190.93.240.0/20", "197.234.240.0/22", "198.41.128.0/17"
+                )
+                for (seg in cfSegments) {
+                    try { builder.excludeRoute(IpPrefix.parse(seg)) }
+                    catch (e: Exception) { Log.w(TAG, "excludeRoute $seg failed: ${e.message}") }
+                }
+
+                for (ip in turnIPs) {
+                    try {
+                        builder.excludeRoute(IpPrefix.parse("$ip/32"))
+                        Log.i(TAG, "  + excludeRoute TURN: $ip/32")
+                    } catch (e: Exception) {
+                        Log.w(TAG, "excludeRoute TURN $ip failed: ${e.message}")
+                    }
+                }
+            }
+
+            builder.setBlocking(true).establish()
         } catch (e: Exception) {
             Log.e(TAG, "establish TUN failed", e)
             null
@@ -197,12 +383,9 @@ class N2nVpnService : VpnService() {
             val nm = getSystemService(NotificationManager::class.java)
             if (nm.getNotificationChannel(NOTIF_CHANNEL_ID) == null) {
                 val ch = NotificationChannel(
-                    NOTIF_CHANNEL_ID,
-                    "n2n VPN",
+                    NOTIF_CHANNEL_ID, "n2n VPN",
                     NotificationManager.IMPORTANCE_LOW
-                ).apply {
-                    description = "n2n 组网运行状态"
-                }
+                ).apply { description = "n2n 组网运行状态" }
                 nm.createNotificationChannel(ch)
             }
         }
