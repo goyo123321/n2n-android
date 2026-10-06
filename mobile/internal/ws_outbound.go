@@ -163,7 +163,8 @@ func (o *WSOutbound) tryWorker(targetIP string, targetPort int) (io.ReadWriteClo
 
 	ip4 := net.ParseIP(targetIP).To4()
 	if ip4 == nil {
-		conn.Close()
+		// ★ 用 stream.Close() 代替 conn.Close()，避免 goroutine 泄漏
+		stream.Close()
 		return nil, fmt.Errorf("仅支持 IPv4: %s", targetIP)
 	}
 
@@ -173,7 +174,8 @@ func (o *WSOutbound) tryWorker(targetIP string, targetPort int) (io.ReadWriteClo
 	binary.BigEndian.PutUint16(handshake[5:7], uint16(targetPort))
 
 	if err := conn.WriteMessage(websocket.BinaryMessage, handshake); err != nil {
-		conn.Close()
+		// ★ 同样用 stream.Close()
+		stream.Close()
 		return nil, fmt.Errorf("发送握手失败: %w", err)
 	}
 
