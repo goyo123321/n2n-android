@@ -49,11 +49,14 @@ type DNSProxy struct {
 	httpClient *http.Client
 }
 
+// NewDNSProxy 创建 DNS 代理
+// ★ DoH 请求通过 protected dialer 走物理网络（不绕 TUN）
 func NewDNSProxy(cache *DNSCache) (*DNSProxy, error) {
+	// ★ protected dialer：DoH HTTPS socket 创建后调 VpnService.protect() 绕过 VPN
+	protectedDialer := newProtectedDialer()
+
 	transport := &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout: 5 * time.Second,
-		}).DialContext,
+		DialContext:       protectedDialer.DialContext,
 		TLSClientConfig:   &tls.Config{},
 		ForceAttemptHTTP2: true,
 	}
