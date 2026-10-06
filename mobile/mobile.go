@@ -22,6 +22,11 @@ type Config struct {
 	PreferredPort int
 }
 
+// Protector 由 Kotlin 侧实现，调用 VpnService.protect(fd)
+type Protector interface {
+	Protect(fd int) bool
+}
+
 type Client struct {
 	mu        sync.Mutex
 	tunFd     int
@@ -31,6 +36,7 @@ type Client struct {
 	virtualIP string
 	clientID  string
 	edge      *internal.Edge
+	protector Protector
 }
 
 func NewClient() *Client { return &Client{} }
@@ -51,6 +57,22 @@ func (c *Client) SetStunFD(fd int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.stunFd = fd
+}
+
+// SetProtector 由 Kotlin 侧调用，传入 VpnService.protect 包装
+func (c *Client) SetProtector(p Protector) {
+	c.mu.Lock()
+	c.protector = p
+	c.mu.Unlock()
+
+	internal.SetProtector(func(fd int) bool {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[protector] panic: %v", r)
+			}
+		}()
+		return p.Protect(fd)
+	})
 }
 
 func (c *Client) FetchVirtualIP(cfg *Config) (result string) {
@@ -191,12 +213,10 @@ func (c *Client) GetPeersJSON() string {
 
 // ============ 日志（package-level 静态方法）============
 
-// GetLogs 返回全部日志
 func GetLogs() string {
 	return internal.GetLogs()
 }
 
-// ClearLogs 清空日志（含文件）
 func ClearLogs() {
 	internal.ClearLogs()
 }
