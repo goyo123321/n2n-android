@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	github.com/gorilla/websocket v1.5.1
 	github.com/pion/stun/v2 v2.0.0
-	gvisor.dev/gvisor v0.0.0-20250304.0 // 修复 Go 1.26 编译兼容性
+	gvisor.dev/gvisor v0.0.0-20251031020517-ecfcdd2f171c
 )
 
 require (
