@@ -27,7 +27,6 @@ type TURNResponse struct {
 	Error   string           `json:"error,omitempty"`
 }
 
-// TURNClient 统一封装：优先用 TURNLite（纯标准库）
 type TURNClient struct {
 	mu           sync.RWMutex
 	lite         *TURNLite
@@ -108,13 +107,19 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 	}
 
 	turnAddr := srv.URL
+
+	// ★ 先剥离 ?transport=xxx（防御：即使服务器未剥离也能用）
+	if i := strings.Index(turnAddr, "?"); i >= 0 {
+		turnAddr = turnAddr[:i]
+	}
+
 	turnAddr = strings.TrimPrefix(turnAddr, "turn://")
 	turnAddr = strings.TrimPrefix(turnAddr, "turns://")
 	turnAddr = strings.TrimPrefix(turnAddr, "turn:")
 	turnAddr = strings.TrimPrefix(turnAddr, "turns:")
 	turnAddr = strings.TrimPrefix(turnAddr, "//")
 
-	// 先试 UDP transport
+	// UDP transport
 	log.Printf("[TURN] 尝试 UDP transport: %s", turnAddr)
 	lite := NewTURNLiteWithTCP(turnAddr, srv.Username, srv.Password, false)
 	lite.onMessage = func(data []byte, addr net.Addr) {
@@ -202,5 +207,4 @@ func redactToken(raw string) string {
 	return u.String()
 }
 
-// 未使用但保留：让编译器知道 time 被用到
 var _ = time.Now
