@@ -11,11 +11,12 @@ object N2nController {
 
     fun isRunning(): Boolean = running.get()
 
-    fun start(tunFd: Int, udpFd: Int, config: Config): String {
+    fun start(tunFd: Int, udpFd: Int, stunFd: Int, config: Config): String {
         if (running.get()) return "already running"
         val c = Client()
         c.setTunFD(tunFd.toLong())
         if (udpFd > 0) c.setUdpFD(udpFd.toLong())
+        if (stunFd > 0) c.setStunFD(stunFd.toLong())
         val err = c.start(config)
         if (err.isNotEmpty()) return "start failed: $err"
         client = c
@@ -23,7 +24,7 @@ object N2nController {
         return ""
     }
 
-    fun startAsync(tunFd: Int, udpFd: Int, config: Config, onResult: (String) -> Unit) {
+    fun startAsync(tunFd: Int, udpFd: Int, stunFd: Int, config: Config, onResult: (String) -> Unit) {
         if (running.get()) {
             onResult("already running")
             return
@@ -32,6 +33,7 @@ object N2nController {
             val c = Client()
             c.setTunFD(tunFd.toLong())
             if (udpFd > 0) c.setUdpFD(udpFd.toLong())
+            if (stunFd > 0) c.setStunFD(stunFd.toLong())
             val err = c.start(config)
             if (err.isNotEmpty()) {
                 onResult("start failed: $err")
