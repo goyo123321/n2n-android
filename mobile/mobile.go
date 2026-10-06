@@ -16,22 +16,21 @@ type Config struct {
 	NodeName      string
 	ConnectToken  string
 	ShareDir      string
-	PreferredIP   string   // ★ 新增：优选 IP（空则 DNS 解析）
-	PreferredPort int      // ★ 新增：优选端口（默认 443）
+	PreferredIP   string
+	PreferredPort int
 }
 
 type Client struct {
 	mu        sync.Mutex
 	tunFd     int
+	udpFd     int
 	running   bool
 	virtualIP string
 	clientID  string
 	edge      *internal.Edge
 }
 
-func NewClient() *Client {
-	return &Client{}
-}
+func NewClient() *Client { return &Client{} }
 
 func (c *Client) SetTunFD(fd int) {
 	c.mu.Lock()
@@ -39,17 +38,18 @@ func (c *Client) SetTunFD(fd int) {
 	c.tunFd = fd
 }
 
-// FetchVirtualIP 独立连一次信令拿虚拟 IP
+func (c *Client) SetUdpFD(fd int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.udpFd = fd
+}
+
 func (c *Client) FetchVirtualIP(cfg *Config) string {
 	icfg := &internal.Config{
-		SignalingURL:  cfg.SignalingURL,
-		RoomID:        cfg.RoomID,
-		ClientID:      cfg.ClientID,
-		NodeName:      cfg.NodeName,
-		ConnectToken:  cfg.ConnectToken,
-		ShareDir:      cfg.ShareDir,
-		PreferredIP:   cfg.PreferredIP,   // ★
-		PreferredPort: cfg.PreferredPort, // ★
+		SignalingURL: cfg.SignalingURL, RoomID: cfg.RoomID,
+		ClientID: cfg.ClientID, NodeName: cfg.NodeName,
+		ConnectToken: cfg.ConnectToken, ShareDir: cfg.ShareDir,
+		PreferredIP: cfg.PreferredIP, PreferredPort: cfg.PreferredPort,
 	}
 	return internal.FetchVirtualIP(icfg)
 }
@@ -65,20 +65,17 @@ func (c *Client) Start(cfg *Config) string {
 		return "tun fd not set"
 	}
 	tunFd := c.tunFd
+	udpFd := c.udpFd
 	c.mu.Unlock()
 
 	icfg := &internal.Config{
-		SignalingURL:  cfg.SignalingURL,
-		RoomID:        cfg.RoomID,
-		ClientID:      cfg.ClientID,
-		NodeName:      cfg.NodeName,
-		ConnectToken:  cfg.ConnectToken,
-		ShareDir:      cfg.ShareDir,
-		PreferredIP:   cfg.PreferredIP,   // ★
-		PreferredPort: cfg.PreferredPort, // ★
+		SignalingURL: cfg.SignalingURL, RoomID: cfg.RoomID,
+		ClientID: cfg.ClientID, NodeName: cfg.NodeName,
+		ConnectToken: cfg.ConnectToken, ShareDir: cfg.ShareDir,
+		PreferredIP: cfg.PreferredIP, PreferredPort: cfg.PreferredPort,
 	}
 
-	edge, err := internal.Start(icfg, tunFd)
+	edge, err := internal.Start(icfg, tunFd, udpFd)
 	if err != nil {
 		return err.Error()
 	}
@@ -117,7 +114,7 @@ func (c *Client) Start(cfg *Config) string {
 		}
 	}()
 
-	log.Printf("[mobile] started, room=%s", cfg.RoomID)
+	log.Printf("[mobile] started, room=%s, udpFd=%d", cfg.RoomID, udpFd)
 	return ""
 }
 
@@ -128,7 +125,6 @@ func (c *Client) Stop() {
 	c.running = false
 	c.virtualIP = ""
 	c.mu.Unlock()
-
 	if edge != nil {
 		edge.Stop()
 	}
@@ -169,14 +165,5 @@ func (c *Client) GetPeersJSON() string {
 	return edge.GetPeersJSON()
 }
 
-// ============ 日志查看（package-level 静态方法）============
-
-// GetLogs 返回全部日志
-func GetLogs() string {
-	return internal.GetLogs()
-}
-
-// ClearLogs 清空日志
-func ClearLogs() {
-	internal.ClearLogs()
-}
+func GetLogs() string { return internal.GetLogs() }
+func ClearLogs()      { internal.ClearLogs() }
