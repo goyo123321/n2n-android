@@ -19,6 +19,7 @@ import com.n2n.mobile.Client
 import com.n2n.mobile.Config
 import java.net.DatagramSocket
 import java.net.HttpURLConnection
+import java.net.Inet6Address
 import java.net.InetAddress
 import java.net.URL
 import java.net.URLEncoder
@@ -152,32 +153,47 @@ class N2nVpnService : VpnService() {
     }
 
     // ============================================================
-    // 优选 IP 解析
+    // 优选 IP 解析（支持 IPv4 / IPv6 / 域名）
     // ============================================================
 
     private fun resolvePreferredIPs(preferredIP: String): List<String> {
         if (preferredIP.isBlank()) return emptyList()
 
         var s = preferredIP.trim()
-        val colon = s.lastIndexOf(':')
-        if (colon > 0 && s.substring(colon + 1).all { it.isDigit() }) {
-            s = s.substring(0, colon)
+
+        // 1. IPv6 带方括号 [xxxx]:port 或 [xxxx]
+        if (s.startsWith("[")) {
+            val end = s.indexOf(']')
+            if (end > 0) {
+                s = s.substring(1, end)
+            }
+        } else if (s.count { it == ':' } == 1) {
+            // 2. IPv4:port（只有 1 个冒号）
+            val colon = s.lastIndexOf(':')
+            val portStr = s.substring(colon + 1)
+            if (portStr.isNotEmpty() && portStr.all { it.isDigit() }) {
+                s = s.substring(0, colon)
+            }
         }
+        // 3. 纯 IPv6 不带方括号（多个冒号）→ 不剥离
+
         if (s.isEmpty()) return emptyList()
 
         val ips = mutableListOf<String>()
 
-        if (isIPv4(s)) {
+        // 直接是 IPv4 或 IPv6
+        if (isIPv4(s) || isIPv6(s)) {
             ips.add(s)
             Log.i(TAG, "优选 IP: $s")
             return ips
         }
 
+        // 域名 DNS 解析
         try {
             val addresses = InetAddress.getAllByName(s)
             for (addr in addresses) {
                 val ip = addr.hostAddress ?: continue
-                if (isIPv4(ip) && !ips.contains(ip)) {
+                if (!ips.contains(ip)) {
                     ips.add(ip)
                     Log.i(TAG, "优选 IP: $s → $ip")
                 }
@@ -186,6 +202,24 @@ class N2nVpnService : VpnService() {
             Log.w(TAG, "解析优选 IP $s 失败: ${e.message}")
         }
         return ips
+    }
+
+    private fun isIPv4(s: String): Boolean {
+        val parts = s.split(".")
+        if (parts.size != 4) return false
+        return parts.all { p ->
+            val n = p.toIntOrNull() ?: return false
+            n in 0..255
+        }
+    }
+
+    private fun isIPv6(s: String): Boolean {
+        if (!s.contains(":")) return false
+        return try {
+            InetAddress.getByName(s) is Inet6Address
+        } catch (e: Exception) {
+            false
+        }
     }
 
     // ============================================================
@@ -248,6 +282,7 @@ class N2nVpnService : VpnService() {
                     val addresses = InetAddress.getAllByName(host)
                     for (addr in addresses) {
                         val ip = addr.hostAddress ?: continue
+                        // ★ 只取 IPv4（TURN 不支持 IPv6）
                         if (isIPv4(ip) && !ips.contains(ip)) {
                             ips.add(ip)
                             Log.i(TAG, "  TURN: $url → $host → $ip")
@@ -273,15 +308,6 @@ class N2nVpnService : VpnService() {
         if (q >= 0) s = s.substring(0, q)
         val colon = s.lastIndexOf(':')
         return if (colon > 0) s.substring(0, colon) else s
-    }
-
-    private fun isIPv4(s: String): Boolean {
-        val parts = s.split(".")
-        if (parts.size != 4) return false
-        return parts.all { p ->
-            val n = p.toIntOrNull() ?: return false
-            n in 0..255
-        }
     }
 
     // ============================================================
@@ -410,7 +436,12 @@ class N2nVpnService : VpnService() {
                 }
 
                 for (ip in preferredIPs) {
-                    excludeIpPrefix(builder, "$ip/32", "preferred")
+                    // ★ IPv6 不接管，无需 excludeRoute
+                    if (isIPv4(ip)) {
+                        excludeIpPrefix(builder, "$ip/32", "preferred")
+                    } else {
+                        Log.i(TAG, "优选 IP (IPv6, 无需排除): $ip")
+                    }
                 }
             }
 
