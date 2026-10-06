@@ -19,15 +19,9 @@ import com.n2n.mobile.Client
 import com.n2n.mobile.Config
 import com.n2n.mobile.Protector
 import java.net.DatagramSocket
-import java.net.HttpURLConnection
-import java.net.Inet6Address
-import java.net.InetAddress
-import java.net.URL
-import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import org.json.JSONObject
 
 class N2nVpnService : VpnService() {
 
@@ -57,6 +51,7 @@ class N2nVpnService : VpnService() {
     private var protectedUdpSocket: DatagramSocket? = null
     private var protectedStunSocket: DatagramSocket? = null
 
+    // ★ Protector 是 gomobile 生成的 Kotlin interface，无构造函数
     inner class ServiceProtector : Protector {
         override fun protect(fd: Long): Boolean {
             return try {
@@ -177,13 +172,6 @@ class N2nVpnService : VpnService() {
                 val vip = tmpClient.fetchVirtualIP(config)
                 ktLog("FetchVIP 返回: '$vip'")
 
-                ktLog("开始查 TURN 凭证")
-                val turnIPs = fetchTURNServerIPs(signalingUrl, connectToken)
-                ktLog("TURN IP 数量: ${turnIPs.size}")
-
-                val preferredIPs = resolvePreferredIPs(preferredIp)
-                ktLog("优选 IP 数量: ${preferredIPs.size}")
-
                 handler.post {
                     try {
                         if (vip.isEmpty()) {
@@ -194,7 +182,7 @@ class N2nVpnService : VpnService() {
                         }
 
                         ktLog("开始建立 TUN")
-                        val pfd = buildTunInterface(vip, turnIPs, preferredIPs)
+                        val pfd = buildTunInterface(vip)
                         if (pfd == null) {
                             ktLog("TUN 建立失败")
                             updateNotification("建立 TUN 失败")
@@ -245,148 +233,6 @@ class N2nVpnService : VpnService() {
                 }
             }
         }.start()
-    }
-
-    private fun resolvePreferredIPs(preferredIP: String): List<String> {
-        if (preferredIP.isBlank()) return emptyList()
-
-        var s = preferredIP.trim()
-
-        if (s.startsWith("[")) {
-            val end = s.indexOf(']')
-            if (end > 0) s = s.substring(1, end)
-        } else if (s.count { it == ':' } == 1) {
-            val colon = s.lastIndexOf(':')
-            val portStr = s.substring(colon + 1)
-            if (portStr.isNotEmpty() && portStr.all { it.isDigit() }) {
-                s = s.substring(0, colon)
-            }
-        }
-
-        if (s.isEmpty()) return emptyList()
-
-        val ips = mutableListOf<String>()
-
-        if (isIPv4(s) || isIPv6(s)) {
-            ips.add(s)
-            ktLog("优选 IP: $s")
-            return ips
-        }
-
-        try {
-            val addresses = InetAddress.getAllByName(s)
-            for (addr in addresses) {
-                val ip = addr.hostAddress ?: continue
-                if (!ips.contains(ip)) {
-                    ips.add(ip)
-                    ktLog("优选 IP: $s → $ip")
-                }
-            }
-        } catch (e: Exception) {
-            ktLog("解析优选 IP $s 失败: ${e.message}")
-        }
-        return ips
-    }
-
-    private fun isIPv4(s: String): Boolean {
-        val parts = s.split(".")
-        if (parts.size != 4) return false
-        return parts.all { p ->
-            val n = p.toIntOrNull() ?: return false
-            n in 0..255
-        }
-    }
-
-    private fun isIPv6(s: String): Boolean {
-        if (!s.contains(":")) return false
-        return try {
-            InetAddress.getByName(s) is Inet6Address
-        } catch (e: Exception) {
-            false
-        }
-    }
-
-    private fun fetchTURNServerIPs(signalingUrl: String, connectToken: String): List<String> {
-        return try {
-            var httpBase = signalingUrl
-            if (httpBase.startsWith("wss://")) {
-                httpBase = "https://" + httpBase.removePrefix("wss://")
-            } else if (httpBase.startsWith("ws://")) {
-                httpBase = "http://" + httpBase.removePrefix("ws://")
-            }
-            httpBase = httpBase.trimEnd('/')
-
-            var credURL = "$httpBase/api/turn-credentials?ttl=60"
-            if (connectToken.isNotEmpty()) {
-                credURL += "&token=" + URLEncoder.encode(connectToken, "UTF-8")
-            }
-
-            ktLog("查询 TURN 凭证: $credURL")
-
-            val conn = URL(credURL).openConnection() as HttpURLConnection
-            conn.connectTimeout = 5000
-            conn.readTimeout = 5000
-            conn.requestMethod = "GET"
-
-            if (conn.responseCode != 200) {
-                ktLog("TURN 凭证查询失败: HTTP ${conn.responseCode}")
-                return emptyList()
-            }
-
-            val body = conn.inputStream.bufferedReader().use { it.readText() }
-            val json = JSONObject(body)
-
-            if (!json.optBoolean("success", false)) {
-                ktLog("TURN 未配置: ${json.optString("error")}")
-                return emptyList()
-            }
-
-            val servers = json.optJSONArray("servers") ?: return emptyList()
-            val ips = mutableListOf<String>()
-
-            for (i in 0 until servers.length()) {
-                val srv = servers.getJSONObject(i)
-                val url = srv.optString("url", "")
-                val host = parseTurnHost(url)
-                if (host.isEmpty()) continue
-
-                if (isIPv4(host)) {
-                    if (!ips.contains(host)) {
-                        ips.add(host)
-                        ktLog("  TURN: $url → $host")
-                    }
-                    continue
-                }
-
-                try {
-                    val addresses = InetAddress.getAllByName(host)
-                    for (addr in addresses) {
-                        val ip = addr.hostAddress ?: continue
-                        if (isIPv4(ip) && !ips.contains(ip)) {
-                            ips.add(ip)
-                            ktLog("  TURN: $url → $host → $ip")
-                        }
-                    }
-                } catch (e: Exception) {
-                    ktLog("解析 TURN 域名 $host 失败: ${e.message}")
-                }
-            }
-            ips
-        } catch (e: Exception) {
-            ktLog("fetchTURNServerIPs 异常: ${e.message}")
-            emptyList()
-        }
-    }
-
-    private fun parseTurnHost(url: String): String {
-        var s = url
-        s = s.removePrefix("turn://").removePrefix("turns://")
-            .removePrefix("turn:").removePrefix("turns:")
-        s = s.removePrefix("//")
-        val q = s.indexOf('?')
-        if (q >= 0) s = s.substring(0, q)
-        val colon = s.lastIndexOf(':')
-        return if (colon > 0) s.substring(0, colon) else s
     }
 
     private fun createProtectedUdpSocket(): Int {
@@ -478,14 +324,11 @@ class N2nVpnService : VpnService() {
     }
 
     // ============================================================
-    // TUN：接管 0.0.0.0/0，完全靠 socket protect 保证信令/TURN 不绕圈
+    // TUN：接管 0.0.0.0/0
+    // 完全靠 socket protect 保证信令 / TURN / WSOut 不绕 TUN
     // 不用 excludeRoute（设备兼容性差，各种 ROM 差异大）
     // ============================================================
-    private fun buildTunInterface(
-        vip: String,
-        turnIPs: List<String>,
-        preferredIPs: List<String>
-    ): ParcelFileDescriptor? {
+    private fun buildTunInterface(vip: String): ParcelFileDescriptor? {
         return try {
             ktLog("建立 TUN（全流量 + protect socket），绑定 IP: $vip")
 
@@ -496,9 +339,6 @@ class N2nVpnService : VpnService() {
                 .addRoute("10.64.0.0", 24)
                 .addRoute("0.0.0.0", 0)
 
-            // ★ 完全依赖 socket protect：
-            //   WSS 信令 / TURN / WSOut / P2P / STUN 都走物理网络（不绕 TUN）
-            //   其他 App 流量走 TUN → netstack → Worker/TURN
             ktLog("TUN 接管 0.0.0.0/0，信令/TURN/WSOut 靠 socket protect 走物理网络")
 
             val pfd = builder.setBlocking(true).establish()
