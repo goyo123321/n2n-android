@@ -1,30 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- ============ 基础权限 ============ -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-
-    <!-- ============ 前台服务 ============ -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
-
-    <!-- ============ 通知（Android 13+）============ -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-
-    <!-- ============ ★ 保活：WakeLock + WifiLock ============ -->
-    <!-- 防止 Android 后台冻结 VPN 进程 -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
-
-    <!-- ============ ★ 忽略电池优化（用户授权）============ -->
-    <!-- 让系统不要限制 n2n 后台运行 -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
-
-    <!-- ============ ★ 网络状态监听（可选）============ -->
-    <!-- 用于网络切换时重连 -->
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
         android:allowBackup="true"
@@ -35,7 +20,6 @@
         android:theme="@style/Theme.N2n"
         android:usesCleartextTraffic="true">
 
-        <!-- ============ 主界面 ============ -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -44,12 +28,10 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-
             <intent-filter>
                 <action android:name="com.n2n.android.CONNECT" />
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
-
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
@@ -58,21 +40,23 @@
             </intent-filter>
         </activity>
 
-        <!-- ============ 文件管理 ============ -->
         <activity
             android:name=".FileManagerActivity"
             android:exported="false"
-            android:label="文件管理"
+            android:label="@string/file_manager_title"
             android:parentActivityName=".MainActivity" />
 
-        <!-- ============ 运行日志 ============ -->
         <activity
             android:name=".LogActivity"
             android:exported="false"
-            android:label="运行日志"
+            android:label="@string/log_title"
             android:parentActivityName=".MainActivity" />
 
-        <!-- ============ VPN 服务 ============ -->
+        <activity
+            android:name=".ShareWebActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+
         <service
             android:name=".N2nVpnService"
             android:exported="false"
@@ -83,10 +67,9 @@
             </intent-filter>
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="n2n P2P VPN tunnel + Workers outbound proxy" />
+                android:value="n2n P2P VPN tunnel" />
         </service>
 
-        <!-- ============ FileProvider（分享/预览/导出）============ -->
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="com.n2n.android.fileprovider"
@@ -96,7 +79,5 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
         </provider>
-
     </application>
-
 </manifest>
