@@ -89,6 +89,18 @@ func NewNetstackHost(virtualIP string) (*NetstackHost, error) {
 	}, nil
 }
 
+// Close 释放 gVisor stack 资源
+func (n *NetstackHost) Close() error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.stack != nil {
+		n.stack.Close()
+		n.stack.Wait()
+		n.stack = nil
+	}
+	return nil
+}
+
 // ============ 出站集成 ============
 
 func (n *NetstackHost) SetRouter(r *Router, dns *DNSCache) {
@@ -169,8 +181,6 @@ func (n *NetstackHost) startTCPForwarder() {
 }
 
 // ============ UDP Forwarder ============
-//
-// ★ 注意：udp.ForwarderRequest 没有 Complete() 方法
 
 func (n *NetstackHost) startUDPForwarder() {
 	forwarder := udp.NewForwarder(n.stack, func(r *udp.ForwarderRequest) {
@@ -180,20 +190,15 @@ func (n *NetstackHost) startUDPForwarder() {
 
 		log.Printf("[Netstack-UDP] %s:%d", targetIP, targetPort)
 
-		// DNS 查询：UDP 53
 		if targetPort == 53 {
 			n.handleDNSUDP(r)
 			return
 		}
-
-		// 其他 UDP 直接忽略（不建立 endpoint，客户端超时）
-		// ★ 不调用 r.Complete()（UDP 没有这个方法）
 	})
 	n.stack.SetTransportProtocolHandler(udp.ProtocolNumber, forwarder.HandlePacket)
 }
 
 func (n *NetstackHost) handleDNSUDP(r *udp.ForwarderRequest) {
-	// ★ UDP 只需 CreateEndpoint，不需要 Complete
 	var wq waiter.Queue
 	ep, epErr := r.CreateEndpoint(&wq)
 	if epErr != nil {
@@ -262,7 +267,7 @@ func (n *NetstackHost) ListenTCP(port uint16) (net.Listener, error) {
 	return gonet.ListenTCP(n.stack, addr, ipv4.ProtocolNumber)
 }
 
-// ============ 共享盘 HTTP 服务 ============
+// ============ 共享盘 HTTP ============
 
 func (n *NetstackHost) StartShareServer(rootDir string) error {
 	n.mu.Lock()
