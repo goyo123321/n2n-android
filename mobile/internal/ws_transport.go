@@ -22,7 +22,7 @@ type WSTransport struct {
 	onBinary  func([]byte)
 
 	fullURL     string
-	dialer      *websocket.Dialer   // ★ 保存 dialer，重连时复用
+	dialer      *websocket.Dialer
 	stopCh      chan struct{}
 	reconnectMu sync.Mutex
 	stopping    bool
@@ -50,7 +50,9 @@ func NewWSTransport(signalingURL, roomId, clientId, connectToken, preferredIP st
 		HandshakeTimeout: 10 * time.Second,
 	}
 
-	// ★ 判断是否用优选 IP
+	// ★ protected dialer：socket 创建后调 protect() 绕过 TUN
+	protectedDialer := newProtectedDialer()
+
 	if preferredIP != "" {
 		preferredHost := preferredIP
 		preferredPortNum := preferredPort
@@ -68,21 +70,14 @@ func NewWSTransport(signalingURL, roomId, clientId, connectToken, preferredIP st
 		targetAddr := net.JoinHostPort(preferredHost, strconv.Itoa(preferredPortNum))
 		log.Printf("[WS] 优选 IP: %s (SNI=%s)", targetAddr, host)
 
-		dialer.TLSClientConfig = &tls.Config{
-			ServerName: host,
-		}
-
-		// ★ 自定义 TCP 拨号，URL 保持原域名
+		dialer.TLSClientConfig = &tls.Config{ServerName: host}
 		dialer.NetDial = func(network, addr string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 10 * time.Second}
-			// 忽略 addr，改连优选 IP
-			return d.Dial(network, targetAddr)
+			return protectedDialer.Dial(network, targetAddr)
 		}
 	} else {
 		log.Printf("[WS] DNS 模式: %s", host)
-		dialer.TLSClientConfig = &tls.Config{
-			ServerName: host,
-		}
+		dialer.TLSClientConfig = &tls.Config{ServerName: host}
+		dialer.NetDial = protectedDialer.Dial
 	}
 
 	log.Printf("[WS] 连接 %s", maskToken(fullURL))
@@ -96,7 +91,7 @@ func NewWSTransport(signalingURL, roomId, clientId, connectToken, preferredIP st
 		conn:     conn,
 		clientId: clientId,
 		fullURL:  fullURL,
-		dialer:   dialer,   // ★ 保存 dialer
+		dialer:   dialer,
 		stopCh:   make(chan struct{}),
 	}
 	go ws.readLoop()
@@ -163,7 +158,6 @@ func (ws *WSTransport) tryReconnect() {
 		}
 		log.Printf("[WS] 重连 (%d/10)...", i+1)
 
-		// ★ 用保存的 dialer（含优选 IP 配置）
 		conn, _, err := ws.dialer.Dial(ws.fullURL, nil)
 		if err != nil {
 			log.Printf("[WS] 重连失败: %v", err)
