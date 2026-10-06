@@ -57,7 +57,6 @@ class N2nVpnService : VpnService() {
     private var protectedUdpSocket: DatagramSocket? = null
     private var protectedStunSocket: DatagramSocket? = null
 
-    // ★ Protector 是 gomobile 生成的 Kotlin interface，无构造函数
     inner class ServiceProtector : Protector {
         override fun protect(fd: Long): Boolean {
             return try {
@@ -479,9 +478,9 @@ class N2nVpnService : VpnService() {
     }
 
     // ============================================================
-    // TUN
+    // TUN：接管 0.0.0.0/0，完全靠 socket protect 保证信令/TURN 不绕圈
+    // 不用 excludeRoute（设备兼容性差，各种 ROM 差异大）
     // ============================================================
-
     private fun buildTunInterface(
         vip: String,
         turnIPs: List<String>,
@@ -497,46 +496,10 @@ class N2nVpnService : VpnService() {
                 .addRoute("10.64.0.0", 24)
                 .addRoute("0.0.0.0", 0)
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                ktLog("Android 10+：调用 VpnExcludeHelper 加 excludeRoute")
-
-                val cfSegments = listOf(
-                    "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
-                    "104.16.0.0/13", "104.24.0.0/14", "108.162.192.0/18",
-                    "131.0.72.0/22", "141.101.64.0/18", "162.158.0.0/15",
-                    "172.64.0.0/13", "173.245.48.0/20", "188.114.96.0/20",
-                    "190.93.240.0/20", "197.234.240.0/22", "198.41.128.0/17"
-                )
-                // ★ 通过 VpnExcludeHelper 隔离 excludeRoute 引用
-                for (seg in cfSegments) {
-                    try {
-                        VpnExcludeHelper.exclude(builder, seg)
-                        ktLog("  + excludeRoute: $seg")
-                    } catch (e: Exception) {
-                        ktLog("excludeRoute $seg 失败: ${e.message}")
-                    }
-                }
-                for (ip in turnIPs) {
-                    try {
-                        VpnExcludeHelper.exclude(builder, "$ip/32")
-                        ktLog("  + excludeRoute: [TURN] $ip/32")
-                    } catch (e: Exception) {
-                        ktLog("excludeRoute TURN $ip 失败: ${e.message}")
-                    }
-                }
-                for (ip in preferredIPs) {
-                    if (isIPv4(ip)) {
-                        try {
-                            VpnExcludeHelper.exclude(builder, "$ip/32")
-                            ktLog("  + excludeRoute: [preferred] $ip/32")
-                        } catch (e: Exception) {
-                            ktLog("excludeRoute preferred $ip 失败: ${e.message}")
-                        }
-                    }
-                }
-            } else {
-                ktLog("Android ${Build.VERSION.SDK_INT}：靠 socket protect 保证信令/TURN 不绕圈，不加 excludeRoute")
-            }
+            // ★ 完全依赖 socket protect：
+            //   WSS 信令 / TURN / WSOut / P2P / STUN 都走物理网络（不绕 TUN）
+            //   其他 App 流量走 TUN → netstack → Worker/TURN
+            ktLog("TUN 接管 0.0.0.0/0，信令/TURN/WSOut 靠 socket protect 走物理网络")
 
             val pfd = builder.setBlocking(true).establish()
             ktLog("TUN establish 成功")
