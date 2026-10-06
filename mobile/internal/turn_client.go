@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -30,6 +31,7 @@ type TURNResponse struct {
 type TURNClient struct {
 	mu           sync.RWMutex
 	lite         *TURNLite
+	tcpAlloc     *TURNTCPAllocation
 	relayAddr    net.Addr
 	server       *TURNServerInfo
 	signalingURL string
@@ -107,19 +109,16 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 	}
 
 	turnAddr := srv.URL
-
-	// ★ 先剥离 ?transport=xxx（防御：即使服务器未剥离也能用）
 	if i := strings.Index(turnAddr, "?"); i >= 0 {
 		turnAddr = turnAddr[:i]
 	}
-
 	turnAddr = strings.TrimPrefix(turnAddr, "turn://")
 	turnAddr = strings.TrimPrefix(turnAddr, "turns://")
 	turnAddr = strings.TrimPrefix(turnAddr, "turn:")
 	turnAddr = strings.TrimPrefix(turnAddr, "turns:")
 	turnAddr = strings.TrimPrefix(turnAddr, "//")
 
-	// UDP transport
+	// ============ 1. UDP allocation（P2P 打洞中继用） ============
 	log.Printf("[TURN] 尝试 UDP transport: %s", turnAddr)
 	lite := NewTURNLiteWithTCP(turnAddr, srv.Username, srv.Password, false)
 	lite.onMessage = func(data []byte, addr net.Addr) {
@@ -137,17 +136,36 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 			}
 		}
 		if err2 := lite2.Allocate(); err2 != nil {
-			return fmt.Errorf("TURN 全部失败: UDP=%v TCP=%v", err, err2)
+			log.Printf("[TURN] UDP+TCP allocation 都失败: %v", err2)
+			lite = nil
+		} else {
+			lite = lite2
 		}
-		lite = lite2
 	}
 
-	tc.mu.Lock()
-	tc.lite = lite
-	tc.relayAddr = lite.relayAddr
-	tc.mu.Unlock()
+	if lite != nil && lite.relayAddr != nil {
+		tc.mu.Lock()
+		tc.lite = lite
+		tc.relayAddr = lite.relayAddr
+		tc.mu.Unlock()
+		log.Printf("[TURN] ✅ UDP 就绪: %s", tc.relayAddr)
+	}
 
-	log.Printf("[TURN] ✅ 就绪: %s", tc.relayAddr)
+	// ============ 2. RFC 6062 TCP allocation（出站代理用） ============
+	log.Printf("[TURN] 尝试 RFC 6062 TCP allocation: %s", turnAddr)
+	tcpAlloc := NewTURNTCPAllocation(turnAddr, srv.Username, srv.Password)
+	if err := tcpAlloc.Allocate(); err != nil {
+		log.Printf("[TURN] RFC 6062 不可用: %v（不影响 P2P 中继）", err)
+	} else {
+		tc.mu.Lock()
+		tc.tcpAlloc = tcpAlloc
+		tc.mu.Unlock()
+		log.Printf("[TURN] ✅ RFC 6062 TCP allocation 就绪: %s", tcpAlloc.GetRelayAddr())
+	}
+
+	if tc.lite == nil && tc.tcpAlloc == nil {
+		return fmt.Errorf("TURN 完全不可用")
+	}
 	return nil
 }
 
@@ -156,13 +174,30 @@ func (tc *TURNClient) Send(data []byte, remoteAddr net.Addr) error {
 	lite := tc.lite
 	tc.mu.RUnlock()
 	if lite == nil {
-		return fmt.Errorf("TURN 未就绪")
+		return fmt.Errorf("TURN UDP 未就绪")
 	}
 	udp, ok := remoteAddr.(*net.UDPAddr)
 	if !ok {
 		return fmt.Errorf("TURN 只支持 UDP 地址")
 	}
 	return lite.SendTo(data, udp)
+}
+
+// DialTCP 通过 RFC 6062 建立到目标的 TCP 隧道
+func (tc *TURNClient) DialTCP(targetIP string, targetPort int) (io.ReadWriteCloser, error) {
+	tc.mu.RLock()
+	tcpAlloc := tc.tcpAlloc
+	tc.mu.RUnlock()
+	if tcpAlloc == nil {
+		return nil, fmt.Errorf("TURN RFC 6062 未就绪")
+	}
+	return tcpAlloc.Dial(targetIP, targetPort)
+}
+
+func (tc *TURNClient) HasTCPAlloc() bool {
+	tc.mu.RLock()
+	defer tc.mu.RUnlock()
+	return tc.tcpAlloc != nil
 }
 
 func (tc *TURNClient) GetRelayAddr() string {
@@ -191,6 +226,10 @@ func (tc *TURNClient) Close() {
 	if tc.lite != nil {
 		tc.lite.Close()
 		tc.lite = nil
+	}
+	if tc.tcpAlloc != nil {
+		tc.tcpAlloc.Close()
+		tc.tcpAlloc = nil
 	}
 }
 
