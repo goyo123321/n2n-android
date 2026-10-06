@@ -6,7 +6,6 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
-import android.net.IpPrefix
 import android.net.VpnService
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -41,6 +40,7 @@ class N2nVpnService : VpnService() {
         const val EXTRA_NODE_NAME = "node_name"
         const val EXTRA_CONNECT_TOKEN = "connect_token"
         const val EXTRA_SHARE_DIR = "share_dir"
+        const val EXTRA_PREFERRED_IP = "preferred_ip"
     }
 
     private var tunInterface: ParcelFileDescriptor? = null
@@ -50,6 +50,7 @@ class N2nVpnService : VpnService() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var protectedUdpSocket: DatagramSocket? = null
+    private var protectedStunSocket: DatagramSocket? = null
 
     private val updateIpRunnable = object : Runnable {
         private var attempts = 0
@@ -84,7 +85,7 @@ class N2nVpnService : VpnService() {
             stopSelf()
             return
         }
-        val preferredIp = intent.getStringExtra("preferred_ip") ?: ""
+        val preferredIp = intent.getStringExtra(EXTRA_PREFERRED_IP) ?: ""
         val roomId = intent.getStringExtra(EXTRA_ROOM_ID) ?: "default-room"
         val clientId = intent.getStringExtra(EXTRA_CLIENT_ID) ?: ""
         val nodeName = intent.getStringExtra(EXTRA_NODE_NAME) ?: "Android"
@@ -110,9 +111,11 @@ class N2nVpnService : VpnService() {
             val tmpClient = Client()
             val vip = tmpClient.fetchVirtualIP(config)
 
-            // 查询 TURN 服务器 IP（用于 excludeRoute）
             val turnIPs = fetchTURNServerIPs(signalingUrl, connectToken)
             Log.i(TAG, "TURN 服务器 IP 数量: ${turnIPs.size}")
+
+            val preferredIPs = resolvePreferredIPs(preferredIp)
+            Log.i(TAG, "优选 IP 数量: ${preferredIPs.size}")
 
             handler.post {
                 if (vip.isEmpty()) {
@@ -120,7 +123,7 @@ class N2nVpnService : VpnService() {
                     handler.postDelayed({ stopVpn() }, 3000)
                     return@post
                 }
-                val pfd = buildTunInterface(vip, turnIPs)
+                val pfd = buildTunInterface(vip, turnIPs, preferredIPs)
                 if (pfd == null) {
                     updateNotification("建立 TUN 失败")
                     handler.postDelayed({ stopVpn() }, 3000)
@@ -130,8 +133,9 @@ class N2nVpnService : VpnService() {
                 val tunFd = pfd.detachFd()
 
                 val udpFd = createProtectedUdpSocket()
+                val stunFd = createProtectedStunSocket()
 
-                N2nController.startAsync(tunFd, udpFd, config) { err ->
+                N2nController.startAsync(tunFd, udpFd, stunFd, config) { err ->
                     handler.post {
                         if (err.isNotEmpty()) {
                             Log.e(TAG, "client start failed: $err")
@@ -145,6 +149,43 @@ class N2nVpnService : VpnService() {
                 }
             }
         }.start()
+    }
+
+    // ============================================================
+    // 优选 IP 解析
+    // ============================================================
+
+    private fun resolvePreferredIPs(preferredIP: String): List<String> {
+        if (preferredIP.isBlank()) return emptyList()
+
+        var s = preferredIP.trim()
+        val colon = s.lastIndexOf(':')
+        if (colon > 0 && s.substring(colon + 1).all { it.isDigit() }) {
+            s = s.substring(0, colon)
+        }
+        if (s.isEmpty()) return emptyList()
+
+        val ips = mutableListOf<String>()
+
+        if (isIPv4(s)) {
+            ips.add(s)
+            Log.i(TAG, "优选 IP: $s")
+            return ips
+        }
+
+        try {
+            val addresses = InetAddress.getAllByName(s)
+            for (addr in addresses) {
+                val ip = addr.hostAddress ?: continue
+                if (isIPv4(ip) && !ips.contains(ip)) {
+                    ips.add(ip)
+                    Log.i(TAG, "优选 IP: $s → $ip")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "解析优选 IP $s 失败: ${e.message}")
+        }
+        return ips
     }
 
     // ============================================================
@@ -244,7 +285,7 @@ class N2nVpnService : VpnService() {
     }
 
     // ============================================================
-    // protected UDP socket
+    // protected sockets
     // ============================================================
 
     private fun createProtectedUdpSocket(): Int {
@@ -264,6 +305,22 @@ class N2nVpnService : VpnService() {
         }
     }
 
+    private fun createProtectedStunSocket(): Int {
+        return try {
+            val socket = DatagramSocket()
+            socket.reuseAddress = true
+            protect(socket)
+            protectedStunSocket = socket
+            val pfd = ParcelFileDescriptor.fromDatagramSocket(socket)
+            val fd = pfd.detachFd()
+            Log.i(TAG, "protected STUN socket fd=$fd")
+            fd
+        } catch (e: Exception) {
+            Log.e(TAG, "createProtectedStunSocket failed", e)
+            -1
+        }
+    }
+
     private fun stopVpn() { handleStop() }
 
     private fun handleStop() {
@@ -276,6 +333,8 @@ class N2nVpnService : VpnService() {
         tunInterface = null
         try { protectedUdpSocket?.close() } catch (_: Exception) {}
         protectedUdpSocket = null
+        try { protectedStunSocket?.close() } catch (_: Exception) {}
+        protectedStunSocket = null
         releaseLocks()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -319,7 +378,11 @@ class N2nVpnService : VpnService() {
     // TUN
     // ============================================================
 
-    private fun buildTunInterface(vip: String, turnIPs: List<String>): ParcelFileDescriptor? {
+    private fun buildTunInterface(
+        vip: String,
+        turnIPs: List<String>,
+        preferredIPs: List<String>
+    ): ParcelFileDescriptor? {
         return try {
             Log.i(TAG, "建立 TUN（全流量），绑定 IP: $vip")
             val builder = Builder()
@@ -339,22 +402,15 @@ class N2nVpnService : VpnService() {
                     "190.93.240.0/20", "197.234.240.0/22", "198.41.128.0/17"
                 )
                 for (seg in cfSegments) {
-                    val prefix = parseIpPrefix(seg) ?: continue
-                    try {
-                        builder.excludeRoute(prefix)
-                    } catch (e: Exception) {
-                        Log.w(TAG, "excludeRoute $seg failed: ${e.message}")
-                    }
+                    excludeIpPrefix(builder, seg)
                 }
 
                 for (ip in turnIPs) {
-                    val prefix = parseIpPrefix("$ip/32") ?: continue
-                    try {
-                        builder.excludeRoute(prefix)
-                        Log.i(TAG, "  + excludeRoute TURN: $ip/32")
-                    } catch (e: Exception) {
-                        Log.w(TAG, "excludeRoute TURN $ip failed: ${e.message}")
-                    }
+                    excludeIpPrefix(builder, "$ip/32", "TURN")
+                }
+
+                for (ip in preferredIPs) {
+                    excludeIpPrefix(builder, "$ip/32", "preferred")
                 }
             }
 
@@ -365,16 +421,14 @@ class N2nVpnService : VpnService() {
         }
     }
 
-    // ★ 用反射构造 IpPrefix，避免 Kotlin 编译器解析静态方法失败
-    //   直接写 IpPrefix.parse(seg) 在某些 AGP/Kotlin 组合下报 Unresolved reference
-    private fun parseIpPrefix(cidr: String): IpPrefix? {
-        return try {
-            val cls = Class.forName("android.net.IpPrefix")
-            val m = cls.getMethod("parse", String::class.java)
-            m.invoke(null, cidr) as? IpPrefix
+    private fun excludeIpPrefix(builder: Builder, cidr: String, label: String = "") {
+        try {
+            val prefix = IpPrefixHelper.parse(cidr)
+            builder.excludeRoute(prefix)
+            val tag = if (label.isEmpty()) "" else "[$label] "
+            Log.i(TAG, "  + excludeRoute: $tag$cidr")
         } catch (e: Exception) {
-            Log.w(TAG, "parseIpPrefix($cidr) failed: ${e.message}")
-            null
+            Log.w(TAG, "excludeRoute $cidr failed: ${e.message}")
         }
     }
 
