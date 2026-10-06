@@ -18,6 +18,7 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.n2n.mobile.Client
 import com.n2n.mobile.Config
+import com.n2n.mobile.Protector
 import java.net.DatagramSocket
 import java.net.HttpURLConnection
 import java.net.Inet6Address
@@ -57,14 +58,22 @@ class N2nVpnService : VpnService() {
     private var protectedUdpSocket: DatagramSocket? = null
     private var protectedStunSocket: DatagramSocket? = null
 
-    // ★ Kotlin 日志直接 append 到 Go 用的同一个文件
-    //   路径和 Go 侧 init() 候选列表一致
-    //   App 重开时 Go init() 读回该文件 → 日志页能显示 Kotlin 日志
+    // ★ 把 VpnService.protect() 包装成 gomobile 可用的 Protector
+    inner class ServiceProtector : Protector() {
+        override fun protect(fd: Long): Boolean {
+            return try {
+                this@N2nVpnService.protect(fd.toInt())
+            } catch (e: Exception) {
+                Log.w(TAG, "protect($fd) 失败: ${e.message}")
+                false
+            }
+        }
+    }
+
     private fun ktLog(msg: String) {
         val ts = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
         val line = "[$ts] [K] $msg"
 
-        // 尝试两个路径，与 Go 侧候选列表一致
         val paths = listOf(
             "/data/user/0/com.n2n.android/files/n2n.log",
             "/data/data/com.n2n.android/files/n2n.log"
@@ -82,12 +91,9 @@ class N2nVpnService : VpnService() {
                 Log.w(TAG, "ktLog 写 $p 失败: ${e.message}")
             }
         }
-
         if (!written) {
             Log.e(TAG, "ktLog 全部路径写入失败")
         }
-
-        // 同时输出到 logcat
         Log.i(TAG, msg)
     }
 
@@ -210,7 +216,8 @@ class N2nVpnService : VpnService() {
                         ktLog("STUN fd=$stunFd")
 
                         ktLog("调用 startAsync")
-                        N2nController.startAsync(tunFd, udpFd, stunFd, config) { err ->
+                        // ★ 传入 ServiceProtector
+                        N2nController.startAsync(tunFd, udpFd, stunFd, config, ServiceProtector()) { err ->
                             handler.post {
                                 if (err.isNotEmpty()) {
                                     ktLog("startAsync 失败: $err")
@@ -242,7 +249,7 @@ class N2nVpnService : VpnService() {
     }
 
     // ============================================================
-    // 优选 IP 解析（IPv4 / IPv6 / 域名）
+    // 优选 IP 解析
     // ============================================================
 
     private fun resolvePreferredIPs(preferredIP: String): List<String> {
@@ -394,7 +401,7 @@ class N2nVpnService : VpnService() {
     }
 
     // ============================================================
-    // protected sockets
+    // protected sockets（P2P / STUN）
     // ============================================================
 
     private fun createProtectedUdpSocket(): Int {
@@ -486,7 +493,7 @@ class N2nVpnService : VpnService() {
     }
 
     // ============================================================
-    // TUN
+    // TUN — 所有 API 都接管 0.0.0.0/0，靠 socket protect 保证信令/TURN 不绕圈
     // ============================================================
 
     private fun buildTunInterface(
@@ -495,16 +502,18 @@ class N2nVpnService : VpnService() {
         preferredIPs: List<String>
     ): ParcelFileDescriptor? {
         return try {
-            ktLog("建立 TUN（全流量），绑定 IP: $vip")
+            ktLog("建立 TUN（全流量 + protect socket），绑定 IP: $vip")
+
             val builder = Builder()
                 .setSession("n2n-client")
                 .setMtu(1280)
                 .addAddress(vip, 24)
                 .addRoute("10.64.0.0", 24)
+                .addRoute("0.0.0.0", 0)   // ★ 所有 API 都接管全网
 
+            // ★ 只有 Android 10+ 才用 excludeRoute 优化
+            //   Android 9 靠 socket protect 保证信令/TURN 不绕圈
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                builder.addRoute("0.0.0.0", 0)
-
                 val cfSegments = listOf(
                     "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
                     "104.16.0.0/13", "104.24.0.0/14", "108.162.192.0/18",
@@ -515,18 +524,17 @@ class N2nVpnService : VpnService() {
                 for (seg in cfSegments) {
                     excludeIpPrefix(builder, seg)
                 }
-
                 for (ip in turnIPs) {
                     excludeIpPrefix(builder, "$ip/32", "TURN")
                 }
-
                 for (ip in preferredIPs) {
                     if (isIPv4(ip)) {
                         excludeIpPrefix(builder, "$ip/32", "preferred")
-                    } else {
-                        ktLog("优选 IP (IPv6, 无需排除): $ip")
                     }
                 }
+                ktLog("Android 10+：+ excludeRoute 优化")
+            } else {
+                ktLog("Android ${Build.VERSION.SDK_INT}：靠 socket protect 保证信令不绕圈")
             }
 
             val pfd = builder.setBlocking(true).establish()
@@ -538,16 +546,11 @@ class N2nVpnService : VpnService() {
         }
     }
 
-    // ★ 自己解析 CIDR → InetAddress → IpPrefix(InetAddress, prefixLength)
-    //   IpPrefix 的 public 构造是 IpPrefix(InetAddress, int)
-    //   LinkAddress(String) 是 package-private，应用层不可用
     private fun excludeIpPrefix(builder: Builder, cidr: String, label: String = "") {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
         try {
             val slashIdx = cidr.indexOf('/')
-            if (slashIdx < 0) {
-                ktLog("excludeRoute $cidr 失败: 无 /")
-                return
-            }
+            if (slashIdx < 0) return
             val ipStr = cidr.substring(0, slashIdx)
             val prefixLen = cidr.substring(slashIdx + 1).toInt()
             val addr = InetAddress.getByName(ipStr)
@@ -559,10 +562,6 @@ class N2nVpnService : VpnService() {
             ktLog("excludeRoute $cidr 失败: ${e.message}")
         }
     }
-
-    // ============================================================
-    // 通知
-    // ============================================================
 
     private fun buildNotification(text: String): Notification {
         createChannelIfNeeded()
