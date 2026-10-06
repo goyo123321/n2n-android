@@ -50,17 +50,23 @@ const (
 
 func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 	startAt := time.Now().UnixMilli()
-	res := &PunchResult{State: PunchStateInProgress, BehaviorIndex: instr.BehaviorIndex}
+
+	res := &PunchResult{
+		State:         PunchStateInProgress,
+		BehaviorIndex: instr.BehaviorIndex,
+	}
 
 	targetAddr := e.resolveTarget(instr)
 	if targetAddr == nil {
 		res.State = PunchStateFailed
 		res.Detail = "无法解析目标地址"
+		log.Printf("[NAT-HOLE] 目标地址解析失败 target=%s", instr.TargetPubSocket)
 		return res
 	}
 
-	log.Printf("[NAT-HOLE] 开始 role=%d target=%s:%d rung=%d mode=%d",
-		instr.Role, targetAddr.IP, targetAddr.Port, instr.BehaviorIndex, instr.Mode)
+	log.Printf("[NAT-HOLE] 开始打洞 role=%d target=%s:%d rung=%d mode=%d assisted=%d",
+		instr.Role, targetAddr.IP, targetAddr.Port, instr.BehaviorIndex, instr.Mode,
+		len(instr.TargetAssistedEndpoints))
 
 	var targets []*net.UDPAddr
 	var candidateIPs []net.IP
@@ -108,7 +114,8 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 
 	for round := 0; round < rounds; round++ {
 		for _, t := range targets {
-			if _, err := e.udpConn.WriteToUDP(probe, t); err == nil {
+			// ★ P3：WriteTo 替代 WriteToUDP（udpConn 类型是 net.PacketConn）
+			if _, err := e.udpConn.WriteTo(probe, t); err == nil {
 				attempts++
 			}
 		}
@@ -116,13 +123,22 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 			res.State = PunchStateSucceeded
 			res.Attempts = attempts
 			res.Detail = "收到对端流量"
+
 			e.peersMu.Lock()
 			if p, ok := e.peers[instr.TargetMac]; ok {
 				p.UDPAddr = targetAddr
 				p.lastRecvAt = time.Now().UnixMilli()
+			} else {
+				e.peers[instr.TargetMac] = &PeerInfo{
+					ClientID:   instr.TargetMac,
+					VirtualIP:  instr.TargetVirtualIp,
+					UDPAddr:    targetAddr,
+					lastRecvAt: time.Now().UnixMilli(),
+				}
 			}
 			e.peersMu.Unlock()
-			log.Printf("[NAT-HOLE] ✅ 成功 attempts=%d", attempts)
+
+			log.Printf("[NAT-HOLE] ✅ 成功 role=%d target=%s attempts=%d", instr.Role, targetAddr.IP, attempts)
 			return res
 		}
 		time.Sleep(200 * time.Millisecond)
@@ -131,7 +147,7 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 	res.State = PunchStateFailed
 	res.Attempts = attempts
 	res.Detail = "无响应"
-	log.Printf("[NAT-HOLE] ❌ 失败 attempts=%d", attempts)
+	log.Printf("[NAT-HOLE] ❌ 失败 role=%d target=%s attempts=%d", instr.Role, targetAddr.IP, attempts)
 	return res
 }
 
