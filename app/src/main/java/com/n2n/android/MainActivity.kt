@@ -79,6 +79,7 @@ class MainActivity : AppCompatActivity() {
         refreshShareDirDisplay(Prefs.loadShareDirUri(this))
 
         requestNotifPermissionIfNeeded()
+        requestIgnoreBatteryOptimizationIfNeeded()
         showFirstLaunchDialogIfNeeded()
         checkSignalingUrl()
 
@@ -108,6 +109,8 @@ class MainActivity : AppCompatActivity() {
         binding.btnManageFiles.setOnClickListener {
             startActivity(Intent(this, FileManagerActivity::class.java))
         }
+        // ★ 打开本机共享盘
+        binding.btnOpenMyShare.setOnClickListener { openMyShare() }
 
         refreshStatus()
         binding.root.postDelayed(peersTicker, 3000)
@@ -179,6 +182,28 @@ class MainActivity : AppCompatActivity() {
     private fun requestNotifPermissionIfNeeded() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    @android.annotation.SuppressLint("BatteryLife")
+    private fun requestIgnoreBatteryOptimizationIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+        val pm = getSystemService(android.content.Context.POWER_SERVICE)
+            as android.os.PowerManager
+        val pkg = packageName
+        if (pm.isIgnoringBatteryOptimizations(pkg)) return
+
+        try {
+            val intent = Intent(
+                android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
+            ).apply {
+                data = android.net.Uri.parse("package:$pkg")
+            }
+            startActivity(intent)
+        } catch (e: Exception) {
+            try {
+                startActivity(Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            } catch (_: Exception) {}
         }
     }
 
@@ -416,8 +441,18 @@ class MainActivity : AppCompatActivity() {
             if (vip.isNotEmpty()) {
                 binding.tvShareUrl.text = "共享盘: http://$vip:9090/"
                 binding.tvShareUrl.visibility = View.VISIBLE
+
+                // ★ 更新共享盘入口
+                binding.tvShareVip.text = "http://$vip:9090/"
+                binding.tvShareVip.visibility = View.VISIBLE
+                binding.btnOpenMyShare.isEnabled = true
+                binding.btnOpenMyShare.alpha = 1.0f
             } else {
                 binding.tvShareUrl.visibility = View.GONE
+
+                binding.tvShareVip.visibility = View.GONE
+                binding.btnOpenMyShare.isEnabled = false
+                binding.btnOpenMyShare.alpha = 0.5f
             }
 
             binding.btnStart.visibility = View.GONE
@@ -428,6 +463,12 @@ class MainActivity : AppCompatActivity() {
             binding.tvVirtualIp.visibility = View.GONE
             binding.tvClientId.visibility = View.GONE
             binding.tvShareUrl.visibility = View.GONE
+
+            // ★ 禁用共享盘入口
+            binding.tvShareVip.visibility = View.GONE
+            binding.btnOpenMyShare.isEnabled = false
+            binding.btnOpenMyShare.alpha = 0.5f
+
             binding.cardStatus.setStrokeColor(getColor(R.color.brand_border))
 
             binding.btnStart.visibility = View.VISIBLE
@@ -481,13 +522,32 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun openShareInBrowser(vip: String, port: Int) {
-        val url = "http://$vip:$port/"
-        try {
-            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-        } catch (e: Exception) {
-            toast("无法打开浏览器: ${e.message}")
+    // ★ 共享盘入口
+    private fun openMyShare() {
+        if (!N2nController.isRunning()) {
+            toast("请先启动 VPN")
+            return
         }
+        val vip = N2nController.getVirtualIP()
+        if (vip.isEmpty()) {
+            toast("虚拟 IP 未分配，稍后再试")
+            return
+        }
+        val intent = Intent(this, ShareWebActivity::class.java).apply {
+            putExtra(ShareWebActivity.EXTRA_VIP, vip)
+            putExtra(ShareWebActivity.EXTRA_PORT, 9090)
+            putExtra(ShareWebActivity.EXTRA_TITLE, "本机共享盘")
+        }
+        startActivity(intent)
+    }
+
+    private fun openShareInBrowser(vip: String, port: Int) {
+        val intent = Intent(this, ShareWebActivity::class.java).apply {
+            putExtra(ShareWebActivity.EXTRA_VIP, vip)
+            putExtra(ShareWebActivity.EXTRA_PORT, port)
+            putExtra(ShareWebActivity.EXTRA_TITLE, "共享盘 · $vip")
+        }
+        startActivity(intent)
     }
 
     private fun refreshShareDirDisplay(uri: String?) {
