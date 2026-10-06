@@ -4,6 +4,7 @@ import android.util.Log
 import com.n2n.mobile.Client
 import com.n2n.mobile.Config
 import com.n2n.mobile.Mobile
+import com.n2n.mobile.Protector
 import java.util.concurrent.atomic.AtomicBoolean
 
 object N2nController {
@@ -15,12 +16,13 @@ object N2nController {
 
     fun isRunning(): Boolean = running.get()
 
-    fun start(tunFd: Int, udpFd: Int, stunFd: Int, config: Config): String {
+    fun start(tunFd: Int, udpFd: Int, stunFd: Int, protector: Protector, config: Config): String {
         if (running.get()) return "already running"
         val c = Client()
         c.setTunFD(tunFd.toLong())
         if (udpFd > 0) c.setUdpFD(udpFd.toLong())
         if (stunFd > 0) c.setStunFD(stunFd.toLong())
+        c.setProtector(protector)
         val err = c.start(config)
         if (err.isNotEmpty()) return "start failed: $err"
         client = c
@@ -33,6 +35,7 @@ object N2nController {
         udpFd: Int,
         stunFd: Int,
         config: Config,
+        protector: Protector,
         onResult: (String) -> Unit
     ) {
         if (running.get()) {
@@ -45,6 +48,7 @@ object N2nController {
                 c.setTunFD(tunFd.toLong())
                 if (udpFd > 0) c.setUdpFD(udpFd.toLong())
                 if (stunFd > 0) c.setStunFD(stunFd.toLong())
+                c.setProtector(protector)
                 val err = c.start(config)
                 if (err.isNotEmpty()) {
                     onResult("start failed: $err")
