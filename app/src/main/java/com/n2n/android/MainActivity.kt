@@ -71,14 +71,6 @@ class MainActivity : AppCompatActivity() {
         applyThemeMode(Prefs.loadThemeMode(this))
         super.onCreate(savedInstanceState)
 
-        // ★ 设置日志文件（App 每次启动调一次，读回历史）
-        try {
-            val logFile = java.io.File(filesDir, "n2n.log").absolutePath
-            N2nController.setLogFile(logFile)
-        } catch (e: Exception) {
-            android.util.Log.w("MainActivity", "setLogFile failed", e)
-        }
-
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
@@ -155,20 +147,12 @@ class MainActivity : AppCompatActivity() {
         outState.putString("connectToken", binding.etConnectToken.text.toString())
     }
 
-    // ============================================================
-    // 工具
-    // ============================================================
-
     private fun formatHost(host: String): String {
         if (host.contains(":") && !host.startsWith("[")) {
             return "[$host]"
         }
         return host
     }
-
-    // ============================================================
-    // 主题
-    // ============================================================
 
     private fun applyThemeMode(mode: Int) {
         val nightMode = when (mode) {
@@ -191,10 +175,6 @@ class MainActivity : AppCompatActivity() {
             }
             .show()
     }
-
-    // ============================================================
-    // 权限
-    // ============================================================
 
     private fun requestNotifPermissionIfNeeded() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -223,10 +203,6 @@ class MainActivity : AppCompatActivity() {
             } catch (_: Exception) {}
         }
     }
-
-    // ============================================================
-    // 首次启动
-    // ============================================================
 
     private fun showFirstLaunchDialogIfNeeded() {
         if (!Prefs.isFirstLaunch(this)) return
@@ -287,10 +263,6 @@ class MainActivity : AppCompatActivity() {
             .setCancelable(false)
             .show()
     }
-
-    // ============================================================
-    // 配置加载 / 保存
-    // ============================================================
 
     private fun loadConfig(savedInstanceState: Bundle?) {
         if (savedInstanceState != null) {
@@ -369,10 +341,6 @@ class MainActivity : AppCompatActivity() {
         Prefs.savePreferredIp(this, binding.etPreferredIp.text.toString().trim())
     }
 
-    // ============================================================
-    // 启动 / 停止
-    // ============================================================
-
     private fun saveThenRequest() {
         saveCurrentInput()
         requestVpnPermission()
@@ -438,10 +406,6 @@ class MainActivity : AppCompatActivity() {
         binding.root.postDelayed({ refreshStatus() }, 500)
     }
 
-    // ============================================================
-    // 状态刷新
-    // ============================================================
-
     private fun refreshStatus() {
         val running = N2nController.isRunning()
 
@@ -490,10 +454,6 @@ class MainActivity : AppCompatActivity() {
             binding.btnStop.visibility = View.GONE
         }
     }
-
-    // ============================================================
-    // 节点列表
-    // ============================================================
 
     private fun refreshPeers() {
         if (!N2nController.isRunning()) {
