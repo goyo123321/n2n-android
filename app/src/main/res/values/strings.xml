@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">n2n</string>
+    <string name="app_name">n2n 组网</string>
     <string name="title_app">n2n 组网</string>
 
     <string name="status_stopped">○ 未运行</string>
@@ -27,8 +27,11 @@
     <string name="btn_new_folder">新建文件夹</string>
     <string name="btn_upload">上传文件</string>
     <string name="btn_share_open">共享盘</string>
+    <string name="btn_open_my_share">打开本机共享盘</string>
 
     <string name="file_manager_title">文件管理</string>
+    <string name="log_title">运行日志</string>
+    <string name="share_browser_title">共享盘</string>
     <string name="empty_peers">暂无其他节点</string>
     <string name="empty_folder">此目录为空</string>
 </resources>
