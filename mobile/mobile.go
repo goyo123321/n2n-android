@@ -2,7 +2,9 @@
 package mobile
 
 import (
+	"fmt"
 	"log"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -51,7 +53,14 @@ func (c *Client) SetStunFD(fd int) {
 	c.stunFd = fd
 }
 
-func (c *Client) FetchVirtualIP(cfg *Config) string {
+func (c *Client) FetchVirtualIP(cfg *Config) (result string) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[mobile] FetchVirtualIP panic: %v\n%s", r, debug.Stack())
+			result = ""
+		}
+	}()
+
 	icfg := &internal.Config{
 		SignalingURL: cfg.SignalingURL, RoomID: cfg.RoomID,
 		ClientID: cfg.ClientID, NodeName: cfg.NodeName,
@@ -61,7 +70,14 @@ func (c *Client) FetchVirtualIP(cfg *Config) string {
 	return internal.FetchVirtualIP(icfg)
 }
 
-func (c *Client) Start(cfg *Config) string {
+func (c *Client) Start(cfg *Config) (errMsg string) {
+	defer func() {
+		if r := recover(); r != nil {
+			errMsg = fmt.Sprintf("panic: %v", r)
+			log.Printf("[mobile] Start panic: %v\n%s", r, debug.Stack())
+		}
+	}()
+
 	c.mu.Lock()
 	if c.running {
 		c.mu.Unlock()
@@ -173,5 +189,24 @@ func (c *Client) GetPeersJSON() string {
 	return edge.GetPeersJSON()
 }
 
-func GetLogs() string { return internal.GetLogs() }
-func ClearLogs()      { internal.ClearLogs() }
+// ============ 日志（package-level 静态方法）============
+
+// GetLogs 返回全部日志
+func GetLogs() string {
+	return internal.GetLogs()
+}
+
+// ClearLogs 清空日志（含文件）
+func ClearLogs() {
+	internal.ClearLogs()
+}
+
+// SetLogFile 设置日志文件路径（App 启动时调一次，读回历史）
+func SetLogFile(path string) {
+	internal.SetLogFile(path)
+}
+
+// AppendLog 供 Kotlin 侧调用，把消息写进日志（含文件）
+func AppendLog(msg string) {
+	internal.AppendLog(msg)
+}
