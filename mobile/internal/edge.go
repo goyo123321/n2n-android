@@ -123,7 +123,11 @@ func FetchVirtualIP(cfg *Config) string {
 	}
 }
 
-func Start(cfg *Config, tunFd int, udpFd int) (*Edge, error) {
+// Start 启动客户端
+//
+// udpFd > 0：P2P 打洞 socket（protected）
+// stunFd > 0：STUN 探测 socket（protected）
+func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	if cfg.SignalingURL == "" {
 		return nil, fmt.Errorf("signaling URL 为空")
 	}
@@ -148,14 +152,21 @@ func Start(cfg *Config, tunFd int, udpFd int) (*Edge, error) {
 		peers:      make(map[string]*PeerInfo),
 		tunWriteCh: make(chan []byte, 4096),
 		doneCh:     make(chan struct{}),
+		// 默认 natMeta（异步 STUN 探测前占位）
+		natMeta: &NATMetadata{
+			NATType:  "unknown",
+			Behavior: "BehaviorPortChanged",
+		},
 	}
 
+	// 1. TUN
 	tun, err := setupTUNFromFD(tunFd)
 	if err != nil {
 		return nil, fmt.Errorf("包装 TUN fd 失败: %w", err)
 	}
 	e.tun = tun
 
+	// 2. UDP（P2P 打洞，protected）
 	var udpConn net.PacketConn
 	if udpFd > 0 {
 		file := os.NewFile(uintptr(udpFd), "protected-udp")
@@ -188,37 +199,88 @@ func Start(cfg *Config, tunFd int, udpFd int) (*Edge, error) {
 	}
 	log.Printf("[P2P] UDP 监听端口 %d", e.udpPort)
 
-	e.natMeta = probeNAT(e.udpPort, nil)
+	// 3. STUN socket（protected）
+	var stunConn net.PacketConn
+	if stunFd > 0 {
+		file := os.NewFile(uintptr(stunFd), "protected-stun")
+		if file != nil {
+			pc, err := net.FilePacketConn(file)
+			if err == nil {
+				stunConn = pc
+				log.Printf("[NAT] 使用 protected STUN socket fd=%d", stunFd)
+			} else {
+				log.Printf("[NAT] STUN FilePacketConn 失败: %v", err)
+				file.Close()
+			}
+		}
+	}
+	if stunConn == nil {
+		log.Printf("[NAT] 无 protected STUN socket，STUN 探测可能失败")
+	}
 
+	// 4. 信令
 	ws, err := NewWSTransport(
 		cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken,
 		cfg.PreferredIP, cfg.PreferredPort,
 	)
 	if err != nil {
 		udpConn.Close()
+		if stunConn != nil {
+			stunConn.Close()
+		}
 		return nil, fmt.Errorf("连接信令失败: %w", err)
 	}
 	e.ws = ws
 
+	// 5. TURN
 	e.turnClient = NewTURNClient(cfg.SignalingURL, cfg.ConnectToken, e)
 	e.turnClient.onMessage = func(data []byte, addr net.Addr) {
 		e.onRemotePacket(data)
 	}
 
+	// 6. 中继
 	e.relayMgr = NewRelayManager(ws, e.turnClient, e)
 	e.relayMgr.Report(10 * time.Second)
 
+	// 7. 回调
 	ws.onMessage = e.handleSignaling
 	ws.onBinary = func(data []byte) {
 		e.onRemotePacket(data)
 	}
 
+	// 8. 后台协程
 	go e.udpReadLoop()
 	go e.tunWriteLoop()
 	go e.tunReadLoop()
 
 	e.progress = &ProgressDispatcher{}
 
+	// ★ 9. NAT 探测（异步，不阻塞启动）
+	go func() {
+		log.Printf("[NAT] 开始异步 STUN 探测...")
+		var meta *NATMetadata
+		if stunConn != nil {
+			meta = probeNATWithConn(stunConn, nil)
+			_ = stunConn.Close()
+		} else {
+			meta = probeNAT(e.udpPort, nil)
+		}
+
+		e.mu.Lock()
+		e.natMeta = meta
+		wsRef := e.ws
+		e.mu.Unlock()
+
+		log.Printf("[NAT] 探测完成: %s pub=%s", meta.NATType, meta.PublicEndpoint)
+
+		// 探测完成后重新上报（第一次上报时 natType 可能还是 unknown）
+		if wsRef != nil {
+			e.reportMetadata()
+			log.Printf("[NAT] 已重新上报 p2p_metadata")
+		}
+	}()
+
+	// 10. TURN + WSOutbound 异步初始化
 	go func() {
 		time.Sleep(2 * time.Second)
 		ctx, cancel := contextWithTimeout(30 * time.Second)
@@ -306,6 +368,11 @@ func (e *Edge) GetPeersJSON() string {
 		}
 	}
 
+	// ★ natMeta 加锁读取
+	e.mu.Lock()
+	natType := e.natMeta.NATType
+	e.mu.Unlock()
+
 	var snapshots []PeerSnapshot
 	for i, item := range list {
 		code := idxToCode(i)
@@ -321,7 +388,7 @@ func (e *Edge) GetPeersJSON() string {
 			Online:    item.p.UDPAddr != nil || item.p.TurnRelayAddr != "",
 			SharePort: sharePort,
 			ConnType:  connType,
-			NATType:   e.natMeta.NATType,
+			NATType:   natType,
 		})
 	}
 
@@ -359,13 +426,20 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		e.peersMu.Unlock()
 		log.Printf("[信令] 分配虚拟 IP: %s", vip)
 
-		if e.natMeta.PublicEndpoint == "" {
+		// ★ 兜底：STUN 未完成时用服务端看到的 IP
+		e.mu.Lock()
+		needFallback := e.natMeta.PublicEndpoint == ""
+		e.mu.Unlock()
+
+		if needFallback {
 			if serverSeenIp, ok := payload["yourPublicIp"].(string); ok && serverSeenIp != "" {
 				endpoint := fmt.Sprintf("%s:%d", serverSeenIp, e.udpPort)
+				e.mu.Lock()
 				e.natMeta.PublicEndpoint = endpoint
 				e.natMeta.P2PEndpoint = endpoint
 				e.natMeta.NATType = "EasyNAT"
-				log.Printf("[NAT] STUN 失败，用服务端 IP 兜底: %s", endpoint)
+				e.mu.Unlock()
+				log.Printf("[NAT] STUN 未完成，用服务端 IP 兜底: %s", endpoint)
 			}
 		}
 
@@ -482,18 +556,26 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 }
 
 func (e *Edge) reportMetadata() {
+	// ★ natMeta 加锁快照
+	e.mu.Lock()
+	nm := e.natMeta
+	e.mu.Unlock()
+
 	metaPayload := map[string]interface{}{
-		"natType": e.natMeta.NATType, "portsDifference": e.natMeta.PortsDifference,
-		"regularPortsChange": e.natMeta.RegularPortsChange, "behavior": e.natMeta.Behavior,
-		"assistedSockets": e.natMeta.AssistedSockets, "sharePort": 9090,
-		"p2pEndpoint": e.natMeta.P2PEndpoint,
+		"natType":            nm.NATType,
+		"portsDifference":    nm.PortsDifference,
+		"regularPortsChange": nm.RegularPortsChange,
+		"behavior":           nm.Behavior,
+		"assistedSockets":    nm.AssistedSockets,
+		"sharePort":          9090,
+		"p2pEndpoint":        nm.P2PEndpoint,
 	}
-	if e.natMeta.PublicEndpoint != "" {
-		metaPayload["publicEndpoint"] = e.natMeta.PublicEndpoint
+	if nm.PublicEndpoint != "" {
+		metaPayload["publicEndpoint"] = nm.PublicEndpoint
 	}
 
 	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%s p2pEndpoint=%s sharePort=9090",
-		e.natMeta.NATType, e.natMeta.PublicEndpoint, e.natMeta.P2PEndpoint)
+		nm.NATType, nm.PublicEndpoint, nm.P2PEndpoint)
 
 	_ = e.ws.Send(map[string]interface{}{"type": "p2p_metadata", "payload": metaPayload})
 	_ = e.ws.Send(map[string]interface{}{
