@@ -324,13 +324,13 @@ class N2nVpnService : VpnService() {
     }
 
     // ============================================================
-    // TUN：接管 0.0.0.0/0
+    // TUN：接管 0.0.0.0/0 + 下发 DNS 指向虚拟 IP
     // 完全靠 socket protect 保证信令 / TURN / WSOut 不绕 TUN
-    // 不用 excludeRoute（设备兼容性差，各种 ROM 差异大）
+    // 不用 excludeRoute（设备兼容性差）
     // ============================================================
     private fun buildTunInterface(vip: String): ParcelFileDescriptor? {
         return try {
-            ktLog("建立 TUN（全流量 + protect socket），绑定 IP: $vip")
+            ktLog("建立 TUN（全流量 + protect socket + 双 DNS），绑定 IP: $vip")
 
             val builder = Builder()
                 .setSession("n2n-client")
@@ -338,8 +338,9 @@ class N2nVpnService : VpnService() {
                 .addAddress(vip, 24)
                 .addRoute("10.64.0.0", 24)
                 .addRoute("0.0.0.0", 0)
+                .addDnsServer(vip)   // ★ 系统 DNS 查询发到虚拟 IP → netstack 处理
 
-            ktLog("TUN 接管 0.0.0.0/0，信令/TURN/WSOut 靠 socket protect 走物理网络")
+            ktLog("TUN 接管 0.0.0.0/0，DNS 指向 $vip，信令/TURN/WSOut 靠 socket protect 走物理网络")
 
             val pfd = builder.setBlocking(true).establish()
             ktLog("TUN establish 成功")
