@@ -19,9 +19,8 @@ var (
 	logFileMu   sync.Mutex
 )
 
-// SetLogFile 设置日志文件路径
-// 如果文件已存在，读回最近 maxLogLines 行到内存
-func SetLogFile(path string) {
+// setLogFilePath 内部使用，不导出
+func setLogFilePath(path string) {
 	logFileMu.Lock()
 	logFilePath = path
 	logFileMu.Unlock()
@@ -30,7 +29,7 @@ func SetLogFile(path string) {
 		return
 	}
 
-	// 从文件读回历史
+	// 读回历史日志
 	if data, err := os.ReadFile(path); err == nil {
 		content := strings.TrimRight(string(data), "\n")
 		if content == "" {
@@ -46,7 +45,7 @@ func SetLogFile(path string) {
 	}
 }
 
-// AppendLog 追加一行日志（带时间戳），同时写文件
+// AppendLog 追加一行日志（带时间戳），同步写文件
 func AppendLog(msg string) {
 	logBufferMu.Lock()
 	line := fmt.Sprintf("[%s] %s", time.Now().Format("15:04:05"), msg)
@@ -56,7 +55,6 @@ func AppendLog(msg string) {
 	}
 	logBufferMu.Unlock()
 
-	// ★ 同步写文件（崩溃时能保住）
 	logFileMu.Lock()
 	path := logFilePath
 	logFileMu.Unlock()
@@ -70,7 +68,7 @@ func AppendLog(msg string) {
 	}
 }
 
-// GetLogs 返回全部日志（换行拼接）
+// GetLogs 返回全部日志
 func GetLogs() string {
 	logBufferMu.RLock()
 	defer logBufferMu.RUnlock()
@@ -80,7 +78,7 @@ func GetLogs() string {
 	return strings.Join(logBuffer, "\n")
 }
 
-// ClearLogs 清空日志（内存 + 文件）
+// ClearLogs 清空日志（含文件）
 func ClearLogs() {
 	logBufferMu.Lock()
 	logBuffer = nil
@@ -95,7 +93,7 @@ func ClearLogs() {
 	}
 }
 
-// logWriter 实现 io.Writer，把所有 log 包输出重定向到缓冲区
+// logWriter 实现 io.Writer
 type logWriter struct{}
 
 func (w logWriter) Write(p []byte) (int, error) {
@@ -110,6 +108,14 @@ func initLogRedirection() {
 	log.SetFlags(0)
 }
 
+// ★ init 里自动设置 Android 日志路径（App 私有目录）
+//   不通过 Kotlin 传路径，避免 gomobile 导出问题
 func init() {
 	initLogRedirection()
+
+	// Android 固定路径（App 私有 files 目录）
+	const androidLogPath = "/data/data/com.n2n.android/files/n2n.log"
+	if _, err := os.Stat("/data/data/com.n2n.android/files"); err == nil {
+		setLogFilePath(androidLogPath)
+	}
 }
