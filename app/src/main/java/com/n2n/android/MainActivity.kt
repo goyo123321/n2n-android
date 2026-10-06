@@ -83,7 +83,6 @@ class MainActivity : AppCompatActivity() {
         showFirstLaunchDialogIfNeeded()
         checkSignalingUrl()
 
-        // Toolbar 菜单
         binding.toolbar.inflateMenu(R.menu.menu_main)
         binding.toolbar.setOnMenuItemClickListener { item ->
             when (item.itemId) {
@@ -109,7 +108,6 @@ class MainActivity : AppCompatActivity() {
         binding.btnManageFiles.setOnClickListener {
             startActivity(Intent(this, FileManagerActivity::class.java))
         }
-        // ★ 打开本机共享盘
         binding.btnOpenMyShare.setOnClickListener { openMyShare() }
 
         refreshStatus()
@@ -147,6 +145,17 @@ class MainActivity : AppCompatActivity() {
         outState.putString("clientId", binding.etClientId.text.toString())
         outState.putString("nodeName", binding.etNodeName.text.toString())
         outState.putString("connectToken", binding.etConnectToken.text.toString())
+    }
+
+    // ============================================================
+    // 工具：URL host 格式化（IPv6 加方括号）
+    // ============================================================
+
+    private fun formatHost(host: String): String {
+        if (host.contains(":") && !host.startsWith("[")) {
+            return "[$host]"
+        }
+        return host
     }
 
     // ============================================================
@@ -400,7 +409,7 @@ class MainActivity : AppCompatActivity() {
         val intent = Intent(this, N2nVpnService::class.java).apply {
             action = N2nVpnService.ACTION_START
             putExtra(N2nVpnService.EXTRA_SIGNALING_URL, binding.etSignalingUrl.text.toString().trim())
-            putExtra("preferred_ip", preferredIp)
+            putExtra(N2nVpnService.EXTRA_PREFERRED_IP, preferredIp)
             putExtra(N2nVpnService.EXTRA_ROOM_ID, binding.etRoomId.text.toString().trim())
             putExtra(N2nVpnService.EXTRA_CLIENT_ID, binding.etClientId.text.toString().trim())
             putExtra(N2nVpnService.EXTRA_NODE_NAME, binding.etNodeName.text.toString().trim())
@@ -439,17 +448,16 @@ class MainActivity : AppCompatActivity() {
 
             val vip = N2nController.getVirtualIP()
             if (vip.isNotEmpty()) {
-                binding.tvShareUrl.text = "共享盘: http://$vip:9090/"
+                val host = formatHost(vip)   // ★ IPv6 加方括号
+                binding.tvShareUrl.text = "共享盘: http://$host:9090/"
                 binding.tvShareUrl.visibility = View.VISIBLE
 
-                // ★ 更新共享盘入口
-                binding.tvShareVip.text = "http://$vip:9090/"
+                binding.tvShareVip.text = "http://$host:9090/"
                 binding.tvShareVip.visibility = View.VISIBLE
                 binding.btnOpenMyShare.isEnabled = true
                 binding.btnOpenMyShare.alpha = 1.0f
             } else {
                 binding.tvShareUrl.visibility = View.GONE
-
                 binding.tvShareVip.visibility = View.GONE
                 binding.btnOpenMyShare.isEnabled = false
                 binding.btnOpenMyShare.alpha = 0.5f
@@ -464,7 +472,6 @@ class MainActivity : AppCompatActivity() {
             binding.tvClientId.visibility = View.GONE
             binding.tvShareUrl.visibility = View.GONE
 
-            // ★ 禁用共享盘入口
             binding.tvShareVip.visibility = View.GONE
             binding.btnOpenMyShare.isEnabled = false
             binding.btnOpenMyShare.alpha = 0.5f
@@ -522,7 +529,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ★ 共享盘入口
     private fun openMyShare() {
         if (!N2nController.isRunning()) {
             toast("请先启动 VPN")
