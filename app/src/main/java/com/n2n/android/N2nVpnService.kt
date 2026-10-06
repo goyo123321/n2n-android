@@ -6,7 +6,6 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
-import android.net.IpPrefix
 import android.net.VpnService
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -58,9 +57,7 @@ class N2nVpnService : VpnService() {
     private var protectedUdpSocket: DatagramSocket? = null
     private var protectedStunSocket: DatagramSocket? = null
 
-    // ★ 把 VpnService.protect() 包装成 gomobile 的 Protector
-    //   Protector 是 gomobile 生成的 Kotlin interface，没有构造函数
-    //   所以是 ": Protector"，不是 ": Protector()"
+    // ★ Protector 是 gomobile 生成的 Kotlin interface，无构造函数
     inner class ServiceProtector : Protector {
         override fun protect(fd: Long): Boolean {
             return try {
@@ -251,10 +248,6 @@ class N2nVpnService : VpnService() {
         }.start()
     }
 
-    // ============================================================
-    // 优选 IP 解析
-    // ============================================================
-
     private fun resolvePreferredIPs(preferredIP: String): List<String> {
         if (preferredIP.isBlank()) return emptyList()
 
@@ -262,9 +255,7 @@ class N2nVpnService : VpnService() {
 
         if (s.startsWith("[")) {
             val end = s.indexOf(']')
-            if (end > 0) {
-                s = s.substring(1, end)
-            }
+            if (end > 0) s = s.substring(1, end)
         } else if (s.count { it == ':' } == 1) {
             val colon = s.lastIndexOf(':')
             val portStr = s.substring(colon + 1)
@@ -315,10 +306,6 @@ class N2nVpnService : VpnService() {
             false
         }
     }
-
-    // ============================================================
-    // TURN 服务器 IP 查询
-    // ============================================================
 
     private fun fetchTURNServerIPs(signalingUrl: String, connectToken: String): List<String> {
         return try {
@@ -402,10 +389,6 @@ class N2nVpnService : VpnService() {
         val colon = s.lastIndexOf(':')
         return if (colon > 0) s.substring(0, colon) else s
     }
-
-    // ============================================================
-    // protected sockets（P2P / STUN）
-    // ============================================================
 
     private fun createProtectedUdpSocket(): Int {
         return try {
@@ -496,7 +479,7 @@ class N2nVpnService : VpnService() {
     }
 
     // ============================================================
-    // TUN：所有 API 都接管 0.0.0.0/0，靠 socket protect 保证信令/TURN 不绕圈
+    // TUN
     // ============================================================
 
     private fun buildTunInterface(
@@ -515,6 +498,8 @@ class N2nVpnService : VpnService() {
                 .addRoute("0.0.0.0", 0)
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ktLog("Android 10+：调用 VpnExcludeHelper 加 excludeRoute")
+
                 val cfSegments = listOf(
                     "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
                     "104.16.0.0/13", "104.24.0.0/14", "108.162.192.0/18",
@@ -522,20 +507,35 @@ class N2nVpnService : VpnService() {
                     "172.64.0.0/13", "173.245.48.0/20", "188.114.96.0/20",
                     "190.93.240.0/20", "197.234.240.0/22", "198.41.128.0/17"
                 )
+                // ★ 通过 VpnExcludeHelper 隔离 excludeRoute 引用
                 for (seg in cfSegments) {
-                    excludeIpPrefix(builder, seg)
+                    try {
+                        VpnExcludeHelper.exclude(builder, seg)
+                        ktLog("  + excludeRoute: $seg")
+                    } catch (e: Exception) {
+                        ktLog("excludeRoute $seg 失败: ${e.message}")
+                    }
                 }
                 for (ip in turnIPs) {
-                    excludeIpPrefix(builder, "$ip/32", "TURN")
+                    try {
+                        VpnExcludeHelper.exclude(builder, "$ip/32")
+                        ktLog("  + excludeRoute: [TURN] $ip/32")
+                    } catch (e: Exception) {
+                        ktLog("excludeRoute TURN $ip 失败: ${e.message}")
+                    }
                 }
                 for (ip in preferredIPs) {
                     if (isIPv4(ip)) {
-                        excludeIpPrefix(builder, "$ip/32", "preferred")
+                        try {
+                            VpnExcludeHelper.exclude(builder, "$ip/32")
+                            ktLog("  + excludeRoute: [preferred] $ip/32")
+                        } catch (e: Exception) {
+                            ktLog("excludeRoute preferred $ip 失败: ${e.message}")
+                        }
                     }
                 }
-                ktLog("Android 10+：+ excludeRoute 优化")
             } else {
-                ktLog("Android ${Build.VERSION.SDK_INT}：靠 socket protect 保证信令不绕圈")
+                ktLog("Android ${Build.VERSION.SDK_INT}：靠 socket protect 保证信令/TURN 不绕圈，不加 excludeRoute")
             }
 
             val pfd = builder.setBlocking(true).establish()
@@ -544,23 +544,6 @@ class N2nVpnService : VpnService() {
         } catch (e: Exception) {
             ktLog("establish TUN 失败: ${e.message}")
             null
-        }
-    }
-
-    private fun excludeIpPrefix(builder: Builder, cidr: String, label: String = "") {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
-        try {
-            val slashIdx = cidr.indexOf('/')
-            if (slashIdx < 0) return
-            val ipStr = cidr.substring(0, slashIdx)
-            val prefixLen = cidr.substring(slashIdx + 1).toInt()
-            val addr = InetAddress.getByName(ipStr)
-            val prefix = IpPrefix(addr, prefixLen)
-            builder.excludeRoute(prefix)
-            val tag = if (label.isEmpty()) "" else "[$label] "
-            ktLog("  + excludeRoute: $tag$cidr")
-        } catch (e: Exception) {
-            ktLog("excludeRoute $cidr 失败: ${e.message}")
         }
     }
 
