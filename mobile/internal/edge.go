@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"encoding/binary" // ★ P0 新增：解析 TCP 目标端口
 	"encoding/json"
 	"fmt"
 	"log"
@@ -715,11 +716,22 @@ func (e *Edge) netstackReadLoop() {
 	}
 }
 
+// forwardPacketToPeer netstack 出站包转发
+//
+// ★ P0 修复：dst=本机 VIP 时回注 VpnService TUN，让 App 系统 socket 收到响应
+//   场景：本机 App 请求本机共享盘，netstack HTTP server 的响应
+//   原逻辑会走到 target==nil 分支，通过 WS 发出去（错误）
 func (e *Edge) forwardPacketToPeer(data []byte) {
 	if len(data) < 20 || data[0]>>4 != 4 {
 		return
 	}
 	dstIP := net.IP(data[16:20]).String()
+
+	// ★ P0 修复：dst=本机 VIP → 回注 VpnService TUN
+	if dstIP == e.GetVirtualIP() {
+		e.enqueueTUN(data)
+		return
+	}
 
 	e.peersMu.RLock()
 	var target *PeerInfo
@@ -749,6 +761,13 @@ func (e *Edge) enqueueTUN(data []byte) {
 	}
 }
 
+// onRemotePacket 处理来自对端（UDP / TURN / WS 中继）的 IP 包
+//
+// ★ P0 修复：根据协议 + 目标端口决定走向
+//   - TCP dst=9090（共享盘端口）：对端访问本机共享盘 → 注入 netstack 给 HTTP server
+//   - 其他端口：本机 App 请求对端的响应 → 回注系统 TUN
+//
+//   原逻辑一律注入 netstack，导致本机 App 的 HTTP 响应丢在 netstack 里出不来
 func (e *Edge) onRemotePacket(data []byte) {
 	if len(data) < 20 || data[0]>>4 != 4 {
 		return
@@ -757,13 +776,24 @@ func (e *Edge) onRemotePacket(data []byte) {
 	dstIP := net.IP(data[16:20]).String()
 	vip := e.GetVirtualIP()
 
-	if dstIP == vip && e.netstack != nil {
-		e.netstack.InjectTUNPacket(data)
-		return
-	}
 	if dstIP != vip {
 		return
 	}
+
+	// ★ P0 修复：TCP 且目标端口 = 共享盘端口 → 注入 netstack
+	const sharePort = 9090
+	proto := data[9]
+	if proto == 6 && len(data) >= 24 { // TCP
+		dstPort := int(binary.BigEndian.Uint16(data[22:24]))
+		if dstPort == sharePort {
+			if e.netstack != nil {
+				e.netstack.InjectTUNPacket(data)
+			}
+			return
+		}
+	}
+
+	// 其他（本机 App 主动请求对端后的响应）→ 回注系统 TUN
 	e.enqueueTUN(data)
 }
 
