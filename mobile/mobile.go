@@ -200,13 +200,3 @@ func GetLogs() string {
 func ClearLogs() {
 	internal.ClearLogs()
 }
-
-// SetLogFile 设置日志文件路径（App 启动时调一次，读回历史）
-func SetLogFile(path string) {
-	internal.SetLogFile(path)
-}
-
-// AppendLog 供 Kotlin 侧调用，把消息写进日志（含文件）
-func AppendLog(msg string) {
-	internal.AppendLog(msg)
-}
