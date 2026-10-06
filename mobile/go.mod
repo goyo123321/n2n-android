@@ -11,10 +11,7 @@ require (
 require (
 	github.com/google/btree v1.1.2 // indirect
 	github.com/pion/dtls/v2 v2.2.7 // indirect
-	github.com/pion/dtls/v3 v3.0.1 // indirect
 	github.com/pion/logging v0.2.2 // indirect
-	github.com/pion/randutil v0.1.0 // indirect
-	github.com/pion/stun/v3 v3.0.0 // indirect
 	github.com/pion/transport/v2 v2.2.1 // indirect
 	github.com/pion/transport/v3 v3.0.7 // indirect
 	github.com/wlynxg/anet v0.0.3 // indirect
@@ -24,7 +21,7 @@ require (
 	golang.org/x/net v0.59.0 // indirect
 	golang.org/x/sync v0.23.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
-	golang.org/x/time v0.5.0 // indirect
+	golang.org/x/time v0.12.0 // indirect
 	golang.org/x/tools v0.50.0 // indirect
 )
 
