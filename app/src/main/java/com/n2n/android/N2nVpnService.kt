@@ -147,7 +147,9 @@ class N2nVpnService : VpnService() {
         }.start()
     }
 
-    // ============ TURN 服务器 IP 查询 ============
+    // ============================================================
+    // TURN 服务器 IP 查询
+    // ============================================================
 
     private fun fetchTURNServerIPs(signalingUrl: String, connectToken: String): List<String> {
         return try {
@@ -241,7 +243,9 @@ class N2nVpnService : VpnService() {
         }
     }
 
-    // ============ protected UDP socket ============
+    // ============================================================
+    // protected UDP socket
+    // ============================================================
 
     private fun createProtectedUdpSocket(): Int {
         return try {
@@ -311,7 +315,9 @@ class N2nVpnService : VpnService() {
         wifiLock = null
     }
 
-    // ============ TUN ============
+    // ============================================================
+    // TUN
+    // ============================================================
 
     private fun buildTunInterface(vip: String, turnIPs: List<String>): ParcelFileDescriptor? {
         return try {
@@ -333,13 +339,18 @@ class N2nVpnService : VpnService() {
                     "190.93.240.0/20", "197.234.240.0/22", "198.41.128.0/17"
                 )
                 for (seg in cfSegments) {
-                    try { builder.excludeRoute(IpPrefix.parse(seg)) }
-                    catch (e: Exception) { Log.w(TAG, "excludeRoute $seg failed: ${e.message}") }
+                    val prefix = parseIpPrefix(seg) ?: continue
+                    try {
+                        builder.excludeRoute(prefix)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "excludeRoute $seg failed: ${e.message}")
+                    }
                 }
 
                 for (ip in turnIPs) {
+                    val prefix = parseIpPrefix("$ip/32") ?: continue
                     try {
-                        builder.excludeRoute(IpPrefix.parse("$ip/32"))
+                        builder.excludeRoute(prefix)
                         Log.i(TAG, "  + excludeRoute TURN: $ip/32")
                     } catch (e: Exception) {
                         Log.w(TAG, "excludeRoute TURN $ip failed: ${e.message}")
@@ -353,6 +364,23 @@ class N2nVpnService : VpnService() {
             null
         }
     }
+
+    // ★ 用反射构造 IpPrefix，避免 Kotlin 编译器解析静态方法失败
+    //   直接写 IpPrefix.parse(seg) 在某些 AGP/Kotlin 组合下报 Unresolved reference
+    private fun parseIpPrefix(cidr: String): IpPrefix? {
+        return try {
+            val cls = Class.forName("android.net.IpPrefix")
+            val m = cls.getMethod("parse", String::class.java)
+            m.invoke(null, cidr) as? IpPrefix
+        } catch (e: Exception) {
+            Log.w(TAG, "parseIpPrefix($cidr) failed: ${e.message}")
+            null
+        }
+    }
+
+    // ============================================================
+    // 通知
+    // ============================================================
 
     private fun buildNotification(text: String): Notification {
         createChannelIfNeeded()
