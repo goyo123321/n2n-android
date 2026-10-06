@@ -58,13 +58,36 @@ class N2nVpnService : VpnService() {
     private var protectedStunSocket: DatagramSocket? = null
 
     // ★ Kotlin 日志直接 append 到 Go 用的同一个文件
+    //   路径和 Go 侧 init() 候选列表一致
     //   App 重开时 Go init() 读回该文件 → 日志页能显示 Kotlin 日志
     private fun ktLog(msg: String) {
-        try {
-            val f = java.io.File(filesDir, "n2n.log")
-            val ts = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
-            f.appendText("[$ts] [K] $msg\n")
-        } catch (_: Exception) {}
+        val ts = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+        val line = "[$ts] [K] $msg"
+
+        // 尝试两个路径，与 Go 侧候选列表一致
+        val paths = listOf(
+            "/data/user/0/com.n2n.android/files/n2n.log",
+            "/data/data/com.n2n.android/files/n2n.log"
+        )
+
+        var written = false
+        for (p in paths) {
+            try {
+                val f = java.io.File(p)
+                f.parentFile?.mkdirs()
+                f.appendText("$line\n")
+                written = true
+                break
+            } catch (e: Exception) {
+                Log.w(TAG, "ktLog 写 $p 失败: ${e.message}")
+            }
+        }
+
+        if (!written) {
+            Log.e(TAG, "ktLog 全部路径写入失败")
+        }
+
+        // 同时输出到 logcat
         Log.i(TAG, msg)
     }
 
@@ -218,6 +241,10 @@ class N2nVpnService : VpnService() {
         }.start()
     }
 
+    // ============================================================
+    // 优选 IP 解析（IPv4 / IPv6 / 域名）
+    // ============================================================
+
     private fun resolvePreferredIPs(preferredIP: String): List<String> {
         if (preferredIP.isBlank()) return emptyList()
 
@@ -278,6 +305,10 @@ class N2nVpnService : VpnService() {
             false
         }
     }
+
+    // ============================================================
+    // TURN 服务器 IP 查询
+    // ============================================================
 
     private fun fetchTURNServerIPs(signalingUrl: String, connectToken: String): List<String> {
         return try {
@@ -361,6 +392,10 @@ class N2nVpnService : VpnService() {
         val colon = s.lastIndexOf(':')
         return if (colon > 0) s.substring(0, colon) else s
     }
+
+    // ============================================================
+    // protected sockets
+    // ============================================================
 
     private fun createProtectedUdpSocket(): Int {
         return try {
@@ -450,6 +485,10 @@ class N2nVpnService : VpnService() {
         wifiLock = null
     }
 
+    // ============================================================
+    // TUN
+    // ============================================================
+
     private fun buildTunInterface(
         vip: String,
         turnIPs: List<String>,
@@ -499,6 +538,9 @@ class N2nVpnService : VpnService() {
         }
     }
 
+    // ★ 自己解析 CIDR → InetAddress → IpPrefix(InetAddress, prefixLength)
+    //   IpPrefix 的 public 构造是 IpPrefix(InetAddress, int)
+    //   LinkAddress(String) 是 package-private，应用层不可用
     private fun excludeIpPrefix(builder: Builder, cidr: String, label: String = "") {
         try {
             val slashIdx = cidr.indexOf('/')
@@ -517,6 +559,10 @@ class N2nVpnService : VpnService() {
             ktLog("excludeRoute $cidr 失败: ${e.message}")
         }
     }
+
+    // ============================================================
+    // 通知
+    // ============================================================
 
     private fun buildNotification(text: String): Notification {
         createChannelIfNeeded()
