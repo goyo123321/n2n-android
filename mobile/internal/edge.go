@@ -123,10 +123,6 @@ func FetchVirtualIP(cfg *Config) string {
 	}
 }
 
-// Start 启动客户端
-//
-// udpFd > 0：P2P 打洞 socket（protected）
-// stunFd > 0：STUN 探测 socket（protected）
 func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	if cfg.SignalingURL == "" {
 		return nil, fmt.Errorf("signaling URL 为空")
@@ -295,7 +291,6 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 			})
 		}
 
-		// ★ 传 turnClient 供 TCP 回退
 		wsOut, err := NewWSOutbound(
 			cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken,
 			cfg.PreferredIP, cfg.PreferredPort,
@@ -404,8 +399,6 @@ func idxToCode(i int) string {
 	return string(rune('A'+first)) + string(rune('A'+second))
 }
 
-// ============ 信令 ============
-
 func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	t, _ := msg["type"].(string)
 	from, _ := msg["from"].(string)
@@ -449,10 +442,15 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 				ns.progress = e.progress
 				e.netstack = ns
 
+				// ★ 双 DNS：国内直连 + 国外走 Worker
 				dnsCache := NewDNSCache()
-				if dp, err := NewDNSProxy(dnsCache); err == nil {
+				if dp, err := NewDNSProxy(dnsCache, func() *WSOutbound {
+					e.mu.Lock()
+					defer e.mu.Unlock()
+					return e.wsOutbound
+				}); err == nil {
 					ns.SetDNSProxy(dp)
-					log.Printf("[Netstack] DNS Proxy 已挂载")
+					log.Printf("[Netstack] DNS Proxy 已挂载（双 DNS）")
 				}
 
 				ns.SetProxyHandler(func(ip string, port int) (io.ReadWriteCloser, error) {
@@ -642,8 +640,6 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 		e.relayMgr.MarkFallback(instr.TargetMac)
 	}
 }
-
-// ============ IO ============
 
 func (e *Edge) udpReadLoop() {
 	buf := make([]byte, 65535)
