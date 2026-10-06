@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -45,30 +47,105 @@ func (c *DNSCache) Store(ip, domain string, ttl time.Duration) {
 }
 
 type DNSProxy struct {
-	cache      *DNSCache
-	httpClient *http.Client
+	cache         *DNSCache
+	httpClientCN  *http.Client // 国内 DoH（物理网络）
+	httpClientOut *http.Client // 国外 DoH（走 Worker 出口）
 }
 
-// NewDNSProxy 创建 DNS 代理
-// ★ DoH 请求通过 protected dialer 走物理网络（不绕 TUN）
-func NewDNSProxy(cache *DNSCache) (*DNSProxy, error) {
-	// ★ protected dialer：DoH HTTPS socket 创建后调 VpnService.protect() 绕过 VPN
-	protectedDialer := newProtectedDialer()
+// 国内 DoH
+var dohServersCN = []string{
+	"https://dns.alidns.com/dns-query",
+	"https://doh.pub/dns-query",
+	"https://dns.360.cn/dns-query",
+}
 
-	transport := &http.Transport{
+// 国外 DoH（用域名做 URL，DialContext 强制连 CF IP）
+var dohServersOut = []string{
+	"https://cloudflare-dns.com/dns-query",
+}
+
+// Cloudflare DNS 的 Anycast IP
+var dohCloudflareIPs = []string{
+	"1.1.1.1",
+	"1.0.0.1",
+}
+
+// NewDNSProxy 创建双 DNS 代理
+//
+//   - 国内域名 → 国内 DoH（走物理网络）
+//   - 国外域名 → 远程 DoH（走 Worker 出口代理）
+//
+// getWSOutbound 延迟获取 wsOutbound（它是异步初始化的）
+func NewDNSProxy(cache *DNSCache, getWSOutbound func() *WSOutbound) (*DNSProxy, error) {
+	// 国内 DoH：protectedDialer 走物理网络
+	protectedDialer := newProtectedDialer()
+	transportCN := &http.Transport{
 		DialContext:       protectedDialer.DialContext,
 		TLSClientConfig:   &tls.Config{},
 		ForceAttemptHTTP2: true,
 	}
 
+	// 国外 DoH：走 Worker 出口代理
+	transportOut := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			wsOut := getWSOutbound()
+			if wsOut == nil {
+				return nil, fmt.Errorf("wsOutbound 未就绪")
+			}
+			// addr 形如 "cloudflare-dns.com:443"，强制连 CF Anycast IP
+			_, portStr, err := net.SplitHostPort(addr)
+			if err != nil {
+				portStr = "443"
+			}
+			port, _ := strconv.Atoi(portStr)
+
+			// 依次尝试多个 CF IP
+			for _, ip := range dohCloudflareIPs {
+				stream, err := wsOut.NewStream(ip, port)
+				if err == nil {
+					return newStreamConn(stream, addr), nil
+				}
+			}
+			return nil, fmt.Errorf("DoH 出站连接失败")
+		},
+		TLSClientConfig:   &tls.Config{},
+		ForceAttemptHTTP2: true,
+	}
+
 	return &DNSProxy{
-		cache:      cache,
-		httpClient: &http.Client{Timeout: 5 * time.Second, Transport: transport},
+		cache:         cache,
+		httpClientCN:  &http.Client{Timeout: 5 * time.Second, Transport: transportCN},
+		httpClientOut: &http.Client{Timeout: 8 * time.Second, Transport: transportOut},
 	}, nil
 }
 
-func (p *DNSProxy) ResolveViaDoH(domain string) ([]string, error) {
-	url := fmt.Sprintf("https://1.1.1.1/dns-query?name=%s&type=A", domain)
+// isChinaDomain 简化版国内域名判断
+func isChinaDomain(domain string) bool {
+	d := strings.ToLower(domain)
+	if strings.HasSuffix(d, ".cn") {
+		return true
+	}
+	cnSuffixes := []string{
+		".baidu.com", ".qq.com", ".taobao.com", ".tmall.com", ".jd.com",
+		".alipay.com", ".bilibili.com", ".weibo.com", ".163.com",
+		".zhihu.com", ".csdn.net", ".aliyun.com", ".tencent.com",
+		".cnblogs.com", ".sohu.com", ".sina.com.cn", ".toutiao.com",
+		".douyin.com", ".kuaishou.com", ".meituan.com", ".dianping.com",
+		".iqiyi.com", ".youku.com", ".mi.com", ".huawei.com",
+		".netease.com", ".126.com", ".188.com", ".xunlei.com",
+		".zol.com.cn", ".it168.com", ".pconline.com.cn", ".ithome.com",
+	}
+	for _, suf := range cnSuffixes {
+		if strings.HasSuffix(d, suf) {
+			return true
+		}
+	}
+	return false
+}
+
+// dohQuery 向单个 DoH 服务器查询
+func (p *DNSProxy) dohQuery(client *http.Client, base, domain string) ([]string, error) {
+	url := fmt.Sprintf("%s?name=%s&type=A", base, domain)
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -76,7 +153,7 @@ func (p *DNSProxy) ResolveViaDoH(domain string) ([]string, error) {
 	}
 	req.Header.Set("Accept", "application/dns-json")
 
-	resp, err := p.httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -102,6 +179,55 @@ func (p *DNSProxy) ResolveViaDoH(domain string) ([]string, error) {
 		}
 	}
 	return ips, nil
+}
+
+func (p *DNSProxy) ResolveViaDoH(domain string) ([]string, error) {
+	isCN := isChinaDomain(domain)
+
+	var primaryServers, fallbackServers []string
+	var primaryClient, fallbackClient *http.Client
+
+	if isCN {
+		primaryServers = dohServersCN
+		primaryClient = p.httpClientCN
+		fallbackServers = dohServersOut
+		fallbackClient = p.httpClientOut
+	} else {
+		primaryServers = dohServersOut
+		primaryClient = p.httpClientOut
+		fallbackServers = dohServersCN
+		fallbackClient = p.httpClientCN
+	}
+
+	var lastErr error
+
+	// 主服务器组
+	for _, base := range primaryServers {
+		ips, err := p.dohQuery(primaryClient, base, domain)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if len(ips) > 0 {
+			log.Printf("[DNS] %s → %v (via %s)", domain, ips, base)
+			return ips, nil
+		}
+	}
+
+	// Fallback 组
+	for _, base := range fallbackServers {
+		ips, err := p.dohQuery(fallbackClient, base, domain)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if len(ips) > 0 {
+			log.Printf("[DNS] %s → %v (fallback via %s)", domain, ips, base)
+			return ips, nil
+		}
+	}
+
+	return nil, fmt.Errorf("all DoH failed: %v", lastErr)
 }
 
 func (p *DNSProxy) HandleDNSQuery(query []byte) ([]byte, error) {
