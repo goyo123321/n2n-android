@@ -15,17 +15,15 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// WSOutbound 通过 Workers 出口代理转发数据
-// 每个 TCP 连接建立一个独立的 WebSocket 到 /ws/out/stream/
 type WSOutbound struct {
 	mu        sync.RWMutex
 	stopped   bool
 	onMessage func([]byte, *net.UDPAddr)
 
-	streamURL     string   // wss://host/ws/out/stream/
+	streamURL     string
 	preferredIP   string
 	preferredPort int
-	sniHost       string   // TLS SNI = 原域名
+	sniHost       string
 }
 
 func NewWSOutbound(
@@ -38,7 +36,6 @@ func NewWSOutbound(
 	}
 	sniHost := u.Hostname()
 
-	// ★ 直接构造 stream 端点（不带 roomId，服务端也不接受）
 	scheme := u.Scheme
 	if scheme == "http" {
 		scheme = "ws"
@@ -57,7 +54,6 @@ func NewWSOutbound(
 	}, nil
 }
 
-// NewStream 为一个 TCP 连接建立独立的 WS 流
 func (o *WSOutbound) NewStream(targetIP string, targetPort int) (io.ReadWriteCloser, error) {
 	o.mu.RLock()
 	if o.stopped {
@@ -68,12 +64,12 @@ func (o *WSOutbound) NewStream(targetIP string, targetPort int) (io.ReadWriteClo
 
 	dialer := &websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
-		TLSClientConfig: &tls.Config{
-			ServerName: o.sniHost, // ★ SNI = 原域名
-		},
+		TLSClientConfig:  &tls.Config{ServerName: o.sniHost},
 	}
 
-	// ★ 优选 IP：URL 保持原域名，只换 TCP 目标
+	// ★ protected dialer
+	protectedDialer := newProtectedDialer()
+
 	if o.preferredIP != "" {
 		preferredHost := o.preferredIP
 		preferredPortNum := o.preferredPort
@@ -90,9 +86,10 @@ func (o *WSOutbound) NewStream(targetIP string, targetPort int) (io.ReadWriteClo
 
 		targetAddr := net.JoinHostPort(preferredHost, strconv.Itoa(preferredPortNum))
 		dialer.NetDial = func(network, addr string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 10 * time.Second}
-			return d.Dial(network, targetAddr)
+			return protectedDialer.Dial(network, targetAddr)
 		}
+	} else {
+		dialer.NetDial = protectedDialer.Dial
 	}
 
 	log.Printf("[WSOut] 连接 %s (SNI=%s)", o.streamURL, o.sniHost)
@@ -138,7 +135,6 @@ func (o *WSOutbound) NewStream(targetIP string, targetPort int) (io.ReadWriteClo
 		}
 	}()
 
-	// 发送握手：[1 proto] [4 IPv4] [2 port]
 	ip4 := net.ParseIP(targetIP).To4()
 	if ip4 == nil {
 		conn.Close()
@@ -164,8 +160,6 @@ func (o *WSOutbound) Close() {
 	defer o.mu.Unlock()
 	o.stopped = true
 }
-
-// ============ WSStream ============
 
 type WSStream struct {
 	ws         *websocket.Conn
