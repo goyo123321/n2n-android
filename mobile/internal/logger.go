@@ -19,7 +19,6 @@ var (
 	logFileMu   sync.Mutex
 )
 
-// setLogFilePath 内部使用，不导出
 func setLogFilePath(path string) {
 	logFileMu.Lock()
 	logFilePath = path
@@ -68,8 +67,29 @@ func AppendLog(msg string) {
 	}
 }
 
-// GetLogs 返回全部日志
+// ★ GetLogs 每次从文件重读，这样 Kotlin ktLog 写的内容也能被看到
 func GetLogs() string {
+	// 1. 从文件重新读一次（同步 Kotlin 写入的新内容）
+	logFileMu.Lock()
+	path := logFilePath
+	logFileMu.Unlock()
+
+	if path != "" {
+		if data, err := os.ReadFile(path); err == nil {
+			content := strings.TrimRight(string(data), "\n")
+			if content != "" {
+				lines := strings.Split(content, "\n")
+				if len(lines) > maxLogLines {
+					lines = lines[len(lines)-maxLogLines:]
+				}
+				logBufferMu.Lock()
+				logBuffer = lines
+				logBufferMu.Unlock()
+			}
+		}
+	}
+
+	// 2. 返回
 	logBufferMu.RLock()
 	defer logBufferMu.RUnlock()
 	if len(logBuffer) == 0 {
@@ -93,7 +113,6 @@ func ClearLogs() {
 	}
 }
 
-// logWriter 实现 io.Writer
 type logWriter struct{}
 
 func (w logWriter) Write(p []byte) (int, error) {
@@ -108,12 +127,9 @@ func initLogRedirection() {
 	log.SetFlags(0)
 }
 
-// ★ init 里自动设置 Android 日志路径（App 私有目录）
-//   不通过 Kotlin 传路径，避免 gomobile 导出问题
 func init() {
 	initLogRedirection()
 
-	// Android 固定路径（App 私有 files 目录）
 	const androidLogPath = "/data/data/com.n2n.android/files/n2n.log"
 	if _, err := os.Stat("/data/data/com.n2n.android/files"); err == nil {
 		setLogFilePath(androidLogPath)
