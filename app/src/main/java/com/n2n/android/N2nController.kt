@@ -11,10 +11,11 @@ object N2nController {
 
     fun isRunning(): Boolean = running.get()
 
-    fun start(tunFd: Int, config: Config): String {
+    fun start(tunFd: Int, udpFd: Int, config: Config): String {
         if (running.get()) return "already running"
         val c = Client()
         c.setTunFD(tunFd.toLong())
+        if (udpFd > 0) c.setUdpFD(udpFd.toLong())
         val err = c.start(config)
         if (err.isNotEmpty()) return "start failed: $err"
         client = c
@@ -22,7 +23,7 @@ object N2nController {
         return ""
     }
 
-    fun startAsync(tunFd: Int, config: Config, onResult: (String) -> Unit) {
+    fun startAsync(tunFd: Int, udpFd: Int, config: Config, onResult: (String) -> Unit) {
         if (running.get()) {
             onResult("already running")
             return
@@ -30,6 +31,7 @@ object N2nController {
         Thread {
             val c = Client()
             c.setTunFD(tunFd.toLong())
+            if (udpFd > 0) c.setUdpFD(udpFd.toLong())
             val err = c.start(config)
             if (err.isNotEmpty()) {
                 onResult("start failed: $err")
@@ -52,20 +54,11 @@ object N2nController {
     fun getClientID(): String = client?.clientID ?: ""
     fun getPeersJSON(): String = client?.peersJSON ?: "[]"
 
-    // 日志转发（静态方法，不依赖 client 实例）
     fun getLogs(): String {
-        return try {
-            com.n2n.mobile.Mobile.getLogs() ?: ""
-        } catch (e: Exception) {
-            ""
-        }
+        return try { com.n2n.mobile.Mobile.getLogs() ?: "" } catch (e: Exception) { "" }
     }
 
     fun clearLogs() {
-        try {
-            com.n2n.mobile.Mobile.clearLogs()
-        } catch (e: Exception) {
-            // ignore
-        }
+        try { com.n2n.mobile.Mobile.clearLogs() } catch (e: Exception) {}
     }
 }
