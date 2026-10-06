@@ -6,6 +6,8 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.net.IpPrefix
+import android.net.LinkAddress
 import android.net.VpnService
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -153,7 +155,7 @@ class N2nVpnService : VpnService() {
     }
 
     // ============================================================
-    // 优选 IP 解析（支持 IPv4 / IPv6 / 域名）
+    // 优选 IP 解析（IPv4 / IPv6 / 域名）
     // ============================================================
 
     private fun resolvePreferredIPs(preferredIP: String): List<String> {
@@ -161,34 +163,29 @@ class N2nVpnService : VpnService() {
 
         var s = preferredIP.trim()
 
-        // 1. IPv6 带方括号 [xxxx]:port 或 [xxxx]
         if (s.startsWith("[")) {
             val end = s.indexOf(']')
             if (end > 0) {
                 s = s.substring(1, end)
             }
         } else if (s.count { it == ':' } == 1) {
-            // 2. IPv4:port（只有 1 个冒号）
             val colon = s.lastIndexOf(':')
             val portStr = s.substring(colon + 1)
             if (portStr.isNotEmpty() && portStr.all { it.isDigit() }) {
                 s = s.substring(0, colon)
             }
         }
-        // 3. 纯 IPv6 不带方括号（多个冒号）→ 不剥离
 
         if (s.isEmpty()) return emptyList()
 
         val ips = mutableListOf<String>()
 
-        // 直接是 IPv4 或 IPv6
         if (isIPv4(s) || isIPv6(s)) {
             ips.add(s)
             Log.i(TAG, "优选 IP: $s")
             return ips
         }
 
-        // 域名 DNS 解析
         try {
             val addresses = InetAddress.getAllByName(s)
             for (addr in addresses) {
@@ -282,7 +279,7 @@ class N2nVpnService : VpnService() {
                     val addresses = InetAddress.getAllByName(host)
                     for (addr in addresses) {
                         val ip = addr.hostAddress ?: continue
-                        // ★ 只取 IPv4（TURN 不支持 IPv6）
+                        // TURN 只支持 IPv4
                         if (isIPv4(ip) && !ips.contains(ip)) {
                             ips.add(ip)
                             Log.i(TAG, "  TURN: $url → $host → $ip")
@@ -436,10 +433,10 @@ class N2nVpnService : VpnService() {
                 }
 
                 for (ip in preferredIPs) {
-                    // ★ IPv6 不接管，无需 excludeRoute
                     if (isIPv4(ip)) {
                         excludeIpPrefix(builder, "$ip/32", "preferred")
                     } else {
+                        // IPv6 不接管，无需 excludeRoute
                         Log.i(TAG, "优选 IP (IPv6, 无需排除): $ip")
                     }
                 }
@@ -452,9 +449,15 @@ class N2nVpnService : VpnService() {
         }
     }
 
+    // ★ 正确做法：LinkAddress 解析 CIDR → IpPrefix 构造
+    //   IpPrefix 没有 parse() 静态方法，必须用构造函数
     private fun excludeIpPrefix(builder: Builder, cidr: String, label: String = "") {
         try {
-            val prefix = IpPrefixHelper.parse(cidr)
+            val linkAddr = LinkAddress(cidr)
+            val prefix = IpPrefix(
+                linkAddr.address.address,
+                linkAddr.prefixLength
+            )
             builder.excludeRoute(prefix)
             val tag = if (label.isEmpty()) "" else "[$label] "
             Log.i(TAG, "  + excludeRoute: $tag$cidr")
