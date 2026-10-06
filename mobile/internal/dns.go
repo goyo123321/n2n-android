@@ -48,34 +48,28 @@ func (c *DNSCache) Store(ip, domain string, ttl time.Duration) {
 
 type DNSProxy struct {
 	cache         *DNSCache
-	httpClientCN  *http.Client // 国内 DoH（物理网络）
-	httpClientOut *http.Client // 国外 DoH（走 Worker 出口）
+	httpClientCN  *http.Client
+	httpClientOut *http.Client
 }
 
-// 国内 DoH
 var dohServersCN = []string{
 	"https://dns.alidns.com/dns-query",
 	"https://doh.pub/dns-query",
 	"https://dns.360.cn/dns-query",
 }
 
-// 国外 DoH（用域名做 URL，DialContext 强制连 CF IP）
 var dohServersOut = []string{
 	"https://cloudflare-dns.com/dns-query",
 }
 
-// Cloudflare DNS 的 Anycast IP
 var dohCloudflareIPs = []string{
 	"1.1.1.1",
 	"1.0.0.1",
 }
 
 // NewDNSProxy 创建双 DNS 代理
-//
 //   - 国内域名 → 国内 DoH（走物理网络）
 //   - 国外域名 → 远程 DoH（走 Worker 出口代理）
-//
-// getWSOutbound 延迟获取 wsOutbound（它是异步初始化的）
 func NewDNSProxy(cache *DNSCache, getWSOutbound func() *WSOutbound) (*DNSProxy, error) {
 	// 国内 DoH：protectedDialer 走物理网络
 	protectedDialer := newProtectedDialer()
@@ -92,14 +86,12 @@ func NewDNSProxy(cache *DNSCache, getWSOutbound func() *WSOutbound) (*DNSProxy, 
 			if wsOut == nil {
 				return nil, fmt.Errorf("wsOutbound 未就绪")
 			}
-			// addr 形如 "cloudflare-dns.com:443"，强制连 CF Anycast IP
 			_, portStr, err := net.SplitHostPort(addr)
 			if err != nil {
 				portStr = "443"
 			}
 			port, _ := strconv.Atoi(portStr)
 
-			// 依次尝试多个 CF IP
 			for _, ip := range dohCloudflareIPs {
 				stream, err := wsOut.NewStream(ip, port)
 				if err == nil {
@@ -119,7 +111,6 @@ func NewDNSProxy(cache *DNSCache, getWSOutbound func() *WSOutbound) (*DNSProxy, 
 	}, nil
 }
 
-// isChinaDomain 简化版国内域名判断
 func isChinaDomain(domain string) bool {
 	d := strings.ToLower(domain)
 	if strings.HasSuffix(d, ".cn") {
@@ -143,7 +134,6 @@ func isChinaDomain(domain string) bool {
 	return false
 }
 
-// dohQuery 向单个 DoH 服务器查询
 func (p *DNSProxy) dohQuery(client *http.Client, base, domain string) ([]string, error) {
 	url := fmt.Sprintf("%s?name=%s&type=A", base, domain)
 
@@ -201,7 +191,6 @@ func (p *DNSProxy) ResolveViaDoH(domain string) ([]string, error) {
 
 	var lastErr error
 
-	// 主服务器组
 	for _, base := range primaryServers {
 		ips, err := p.dohQuery(primaryClient, base, domain)
 		if err != nil {
@@ -214,7 +203,6 @@ func (p *DNSProxy) ResolveViaDoH(domain string) ([]string, error) {
 		}
 	}
 
-	// Fallback 组
 	for _, base := range fallbackServers {
 		ips, err := p.dohQuery(fallbackClient, base, domain)
 		if err != nil {
