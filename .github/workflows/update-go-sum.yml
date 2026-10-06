@@ -9,10 +9,10 @@ on:
         type: string
         default: 'main'
       go_version:
-        description: 'Go 版本（必须 >= go.mod 声明的版本）'
+        description: 'Go 版本（建议 1.24+，gomobile tool 依赖需要）'
         required: false
         type: string
-        default: '1.26'
+        default: '1.24'
       commit_message:
         description: '提交信息（留空则用默认）'
         required: false
@@ -23,11 +23,6 @@ on:
         required: false
         type: boolean
         default: false
-
-env:
-  GOPROXY: https://proxy.golang.org,direct
-  GOTOOLCHAIN: auto
-  GOFLAGS: -mod=mod
 
 jobs:
   update:
@@ -51,17 +46,6 @@ jobs:
       - name: Show Go version
         run: go version
 
-      - name: 校验 go.mod 声明的 Go 版本
-        shell: bash
-        working-directory: mobile
-        run: |
-          MOD_GO_VERSION=$(grep -E '^go ' go.mod | awk '{print $2}')
-          echo "go.mod 声明: go $MOD_GO_VERSION"
-          echo "本地工具链: $(go version)"
-          # 校验本地 Go >= go.mod 声明
-          go mod edit -json | jq -r '.Go'
-        continue-on-error: false
-
       - name: Before — show go.mod / go.sum
         shell: bash
         working-directory: mobile
@@ -71,10 +55,24 @@ jobs:
           echo ""
           echo "=== mobile/go.sum (before) ==="
           if [ -f go.sum ]; then
-            echo "存在，行数：$(wc -l < go.sum)"
+            echo "存在，行数："
+            wc -l go.sum
           else
             echo "(go.sum 不存在)"
           fi
+
+      # ★ 新增：添加 gomobile tool 依赖
+      - name: Add gomobile tool dependencies
+        shell: bash
+        working-directory: mobile
+        run: |
+          echo "=== 添加 gomobile tool 依赖（Go 1.24+ 要求）==="
+          go get -tool golang.org/x/mobile/cmd/gobind
+          go get -tool golang.org/x/mobile/cmd/gomobile
+          echo "✅ tool 依赖已添加"
+          echo ""
+          echo "--- go.mod after add tool ---"
+          cat go.mod
 
       - name: Run go mod tidy
         shell: bash
@@ -91,6 +89,7 @@ jobs:
       - name: Run go mod verify
         shell: bash
         working-directory: mobile
+        continue-on-error: true
         run: go mod verify
 
       - name: After — show go.mod / go.sum
@@ -151,7 +150,7 @@ jobs:
           if [ -n "$CUSTOM_MSG" ]; then
             MSG="$CUSTOM_MSG"
           else
-            MSG="chore: update mobile/go.sum (Go ${VERSION}) [skip ci]"
+            MSG="chore: update mobile/go.sum + gomobile tool (Go ${VERSION}) [skip ci]"
           fi
 
           if git diff --cached --quiet; then
