@@ -58,8 +58,10 @@ class N2nVpnService : VpnService() {
     private var protectedUdpSocket: DatagramSocket? = null
     private var protectedStunSocket: DatagramSocket? = null
 
-    // ★ 把 VpnService.protect() 包装成 gomobile 可用的 Protector
-    inner class ServiceProtector : Protector() {
+    // ★ 把 VpnService.protect() 包装成 gomobile 的 Protector
+    //   Protector 是 gomobile 生成的 Kotlin interface，没有构造函数
+    //   所以是 ": Protector"，不是 ": Protector()"
+    inner class ServiceProtector : Protector {
         override fun protect(fd: Long): Boolean {
             return try {
                 this@N2nVpnService.protect(fd.toInt())
@@ -216,8 +218,9 @@ class N2nVpnService : VpnService() {
                         ktLog("STUN fd=$stunFd")
 
                         ktLog("调用 startAsync")
-                        // ★ 传入 ServiceProtector
-                        N2nController.startAsync(tunFd, udpFd, stunFd, config, ServiceProtector()) { err ->
+                        N2nController.startAsync(
+                            tunFd, udpFd, stunFd, config, ServiceProtector()
+                        ) { err ->
                             handler.post {
                                 if (err.isNotEmpty()) {
                                     ktLog("startAsync 失败: $err")
@@ -493,7 +496,7 @@ class N2nVpnService : VpnService() {
     }
 
     // ============================================================
-    // TUN — 所有 API 都接管 0.0.0.0/0，靠 socket protect 保证信令/TURN 不绕圈
+    // TUN：所有 API 都接管 0.0.0.0/0，靠 socket protect 保证信令/TURN 不绕圈
     // ============================================================
 
     private fun buildTunInterface(
@@ -509,10 +512,8 @@ class N2nVpnService : VpnService() {
                 .setMtu(1280)
                 .addAddress(vip, 24)
                 .addRoute("10.64.0.0", 24)
-                .addRoute("0.0.0.0", 0)   // ★ 所有 API 都接管全网
+                .addRoute("0.0.0.0", 0)
 
-            // ★ 只有 Android 10+ 才用 excludeRoute 优化
-            //   Android 9 靠 socket protect 保证信令/TURN 不绕圈
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val cfSegments = listOf(
                     "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
