@@ -105,9 +105,8 @@ func (rm *RelayManager) GetState(peerId string) ConnType {
 
 // SendToPeer 三级降级：P2P → TURN → WS
 //
-// ★ P2P 模式采用 UDP + WS 双发机制：
-//   因为对称 NAT 场景下，一方"假成功"P2P，UDP 包会被对端 NAT 丢弃。
-//   双发保证对端一定能收到。代价是流量翻倍，但保证可用性。
+// ★ P3：P2P 用 net.PacketConn.WriteTo（udpConn 类型变了）
+//   修复后 UDP 失败时立即 WS 兜底，避免对称 NAT 首包丢失
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
 	state := rm.GetState(peerId)
 
@@ -115,9 +114,9 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 	case ConnP2P:
 		sent := false
 
-		// 主通道：UDP 直发
 		if target != nil && target.UDPAddr != nil {
-			_, err := rm.edge.udpConn.WriteToUDP(data, target.UDPAddr)
+			// ★ WriteTo 替代 WriteToUDP
+			_, err := rm.edge.udpConn.WriteTo(data, target.UDPAddr)
 			if err == nil {
 				sent = true
 			} else {
@@ -125,8 +124,6 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 			}
 		}
 
-		// ★ 保险通道：同时走 WS 中继
-		// 因为对端可能因 NAT 对称而收不到 UDP，走 WS 一定到
 		if err := rm.ws.SendBinary(data); err == nil {
 			sent = true
 		}
@@ -143,7 +140,6 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 				log.Printf("[TURN] 发送到 %s 失败: %v", peerId, err)
 			}
 		}
-		// TURN 失败 → 降级 WS
 		rm.DowngradeToWS(peerId, "send failed")
 		return rm.ws.SendBinary(data) == nil
 
