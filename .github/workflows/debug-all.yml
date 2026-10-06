@@ -7,7 +7,9 @@ env:
   GOPROXY: https://proxy.golang.org,direct
   GOTOOLCHAIN: auto
   GOFLAGS: -mod=mod
-  GVISOR_VERSION: v0.0.0-20251031020517-ecfcdd2f171c
+  # ★ gvisor 必须用兼容 Go 1.26 的版本（修复 WaitReason* redeclared）
+  GVISOR_VERSION: v0.0.0-20260617234043-9307ff8f53c4
+  # ★ x/mobile 与 go.mod 对齐，不用 @latest
   X_MOBILE_VERSION: v0.0.0-20260908204917-8b95e45f8d3e
   NDK_VERSION: 26.1.10909125
 
@@ -64,28 +66,25 @@ jobs:
           echo "✅ NDK ready"
 
       # ============================================================
-      # ★ 核心修复：强制修正 go.mod 里的 gvisor 版本
+      # Step 0: 强制修正 go.mod 里的 gvisor / x/mobile 版本
       # ============================================================
-      - name: "Step 0: 修正 go.mod 里的 gvisor 版本"
+      - name: "Step 0: 修正 go.mod"
         id: step0
         shell: bash
         working-directory: mobile
         run: |
           echo "=== Before ==="
-          grep gvisor go.mod
+          grep -E "gvisor|x/mobile" go.mod || true
 
-          # 用 go mod edit 修改（比 sed 稳）
           go mod edit -require="gvisor.dev/gvisor@${GVISOR_VERSION}"
-
-          # 同步 x/mobile 版本（避免 @latest 漂移）
           go mod edit -require="golang.org/x/mobile@${X_MOBILE_VERSION}"
 
           echo ""
           echo "=== After ==="
-          grep -E "gvisor|x/mobile" go.mod
+          grep -E "gvisor|x/mobile" go.mod || true
           echo "step0_exit=0" >> $GITHUB_OUTPUT
 
-      - name: "Step 0: go mod tidy"
+      - name: "Step 0b: go mod tidy"
         id: step0b
         shell: bash
         continue-on-error: true
@@ -99,10 +98,10 @@ jobs:
           echo "=== tidy 退出码: $EXIT ==="
 
       # ============================================================
-      # ★ 关键：先验证 `go build ./...` 能过（不涉及 gomobile）
+      # ★ 关键分水岭：不涉及 gomobile，直接 go build
       #   这一步过了，gomobile bind 才可能过
       # ============================================================
-      - name: "Step 0c: go build ./... （不涉及 gomobile）"
+      - name: "Step 0c: go build ./..."
         id: step0c
         shell: bash
         continue-on-error: true
@@ -116,7 +115,7 @@ jobs:
           echo "=== go build 退出码: $EXIT ==="
 
           if [ "$EXIT" != "0" ]; then
-            echo "❌ go build 失败，gomobile bind 必然失败。先修编译错误。"
+            echo "❌ go build 失败，gomobile bind 必然失败。"
             echo "--- 错误详情 ---"
             cat /tmp/step0c.log
             exit $EXIT
@@ -129,7 +128,6 @@ jobs:
       - name: Install gomobile（固定版本）
         shell: bash
         run: |
-          # ★ 不用 @latest，与 go.mod 对齐
           GOBIN="$(go env GOPATH)/bin"
           go install "golang.org/x/mobile/cmd/gomobile@${X_MOBILE_VERSION}"
           go install "golang.org/x/mobile/cmd/gobind@${X_MOBILE_VERSION}"
@@ -138,7 +136,7 @@ jobs:
           ls -la "$GOBIN" | grep -E "gomobile|gobind"
 
       # ============================================================
-      # Step 1 - gomobile bind
+      # Step 1: gomobile bind
       # ============================================================
       - name: "Step 1: gomobile bind"
         id: step1
@@ -148,7 +146,6 @@ jobs:
         run: |
           export PATH="$PATH:$(go env GOPATH)/bin"
 
-          # 确认环境变量
           echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
           echo "GOPATH=$(go env GOPATH)"
           echo "GOTOOLCHAIN=$GOTOOLCHAIN"
@@ -160,7 +157,7 @@ jobs:
 
           mkdir -p ../app/libs
           set +e
-          # ★ -ldflags 用等号，不用空格
+          # ★ -ldflags 用等号（不用空格）
           gomobile bind \
             -target=android \
             -androidapi 26 \
@@ -203,12 +200,12 @@ jobs:
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "### gomobile 错误" >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
-            grep -E "error|Error|failed|cannot|invalid|undefined" /tmp/step1.log | head -30 >> $GITHUB_STEP_SUMMARY || echo "(无错误关键字)" >> $GITHUB_STEP_SUMMARY
+            grep -E "error|Error|failed|cannot|invalid|undefined|redeclared" /tmp/step1.log | head -30 >> $GITHUB_STEP_SUMMARY || echo "(无错误关键字)" >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
           fi
 
       # ============================================================
-      # Step 2 - Kotlin compile
+      # Step 2: Kotlin compile
       # ============================================================
       - name: "Step 2: Kotlin compile"
         id: step2
@@ -246,7 +243,7 @@ jobs:
           fi
 
       # ============================================================
-      # Step 3 - APK build
+      # Step 3: APK build
       # ============================================================
       - name: "Step 3: APK build"
         id: step3
