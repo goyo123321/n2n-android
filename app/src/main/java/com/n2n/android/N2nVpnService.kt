@@ -86,10 +86,8 @@ class N2nVpnService : VpnService() {
 
     private fun handleStart(intent: Intent) {
         if (started) return
-        N2nController.appendLog("[K] handleStart 开始")
 
         val signalingUrl = intent.getStringExtra(EXTRA_SIGNALING_URL) ?: run {
-            N2nController.appendLog("[K] 无 signalingUrl，退出")
             stopSelf()
             return
         }
@@ -101,16 +99,8 @@ class N2nVpnService : VpnService() {
         val shareDir = intent.getStringExtra(EXTRA_SHARE_DIR)
             ?: ShareDirManager.getDefaultShareDir(this).absolutePath
 
-        try {
-            startForeground(NOTIF_ID, buildNotification("正在获取虚拟 IP..."))
-            acquireLocks()
-            N2nController.appendLog("[K] 前台服务+WakeLock 完成")
-        } catch (t: Throwable) {
-            N2nController.appendLog("[K] startForeground 崩溃: ${t.message}")
-            Log.e(TAG, "startForeground failed", t)
-            stopVpn()
-            return
-        }
+        startForeground(NOTIF_ID, buildNotification("正在获取虚拟 IP..."))
+        acquireLocks()
 
         val config = Config().apply {
             setSignalingURL(signalingUrl)
@@ -125,70 +115,43 @@ class N2nVpnService : VpnService() {
 
         Thread {
             try {
-                N2nController.appendLog("[K] 开始 FetchVIP")
                 val tmpClient = Client()
                 val vip = tmpClient.fetchVirtualIP(config)
-                N2nController.appendLog("[K] FetchVIP 返回: '$vip'")
-
-                N2nController.appendLog("[K] 开始查 TURN 凭证")
                 val turnIPs = fetchTURNServerIPs(signalingUrl, connectToken)
-                N2nController.appendLog("[K] TURN IP 数量: ${turnIPs.size}")
-
                 val preferredIPs = resolvePreferredIPs(preferredIp)
-                N2nController.appendLog("[K] 优选 IP 数量: ${preferredIPs.size}")
 
                 handler.post {
-                    try {
-                        if (vip.isEmpty()) {
-                            N2nController.appendLog("[K] VIP 为空，退出")
-                            updateNotification("获取虚拟 IP 失败")
-                            handler.postDelayed({ stopVpn() }, 3000)
-                            return@post
-                        }
+                    if (vip.isEmpty()) {
+                        updateNotification("获取虚拟 IP 失败")
+                        handler.postDelayed({ stopVpn() }, 3000)
+                        return@post
+                    }
+                    val pfd = buildTunInterface(vip, turnIPs, preferredIPs)
+                    if (pfd == null) {
+                        updateNotification("建立 TUN 失败")
+                        handler.postDelayed({ stopVpn() }, 3000)
+                        return@post
+                    }
+                    tunInterface = pfd
+                    val tunFd = pfd.detachFd()
 
-                        N2nController.appendLog("[K] 开始建立 TUN")
-                        val pfd = buildTunInterface(vip, turnIPs, preferredIPs)
-                        if (pfd == null) {
-                            N2nController.appendLog("[K] TUN 建立失败")
-                            updateNotification("建立 TUN 失败")
-                            handler.postDelayed({ stopVpn() }, 3000)
-                            return@post
-                        }
-                        tunInterface = pfd
-                        val tunFd = pfd.detachFd()
-                        N2nController.appendLog("[K] TUN fd=$tunFd")
+                    val udpFd = createProtectedUdpSocket()
+                    val stunFd = createProtectedStunSocket()
 
-                        N2nController.appendLog("[K] 创建 protected UDP socket")
-                        val udpFd = createProtectedUdpSocket()
-                        N2nController.appendLog("[K] UDP fd=$udpFd")
-
-                        N2nController.appendLog("[K] 创建 protected STUN socket")
-                        val stunFd = createProtectedStunSocket()
-                        N2nController.appendLog("[K] STUN fd=$stunFd")
-
-                        N2nController.appendLog("[K] 调用 startAsync")
-                        N2nController.startAsync(tunFd, udpFd, stunFd, config) { err ->
-                            handler.post {
-                                if (err.isNotEmpty()) {
-                                    N2nController.appendLog("[K] startAsync 失败: $err")
-                                    updateNotification("启动失败: $err")
-                                    handler.postDelayed({ stopVpn() }, 3000)
-                                } else {
-                                    N2nController.appendLog("[K] startAsync 成功")
-                                    started = true
-                                    handler.post(updateIpRunnable)
-                                }
+                    N2nController.startAsync(tunFd, udpFd, stunFd, config) { err ->
+                        handler.post {
+                            if (err.isNotEmpty()) {
+                                Log.e(TAG, "client start failed: $err")
+                                updateNotification("启动失败: $err")
+                                handler.postDelayed({ stopVpn() }, 3000)
+                            } else {
+                                started = true
+                                handler.post(updateIpRunnable)
                             }
                         }
-                    } catch (t: Throwable) {
-                        N2nController.appendLog("[K] handler.post 崩溃: ${t.message}")
-                        Log.e(TAG, "handler.post failed", t)
-                        updateNotification("启动失败: ${t.message}")
-                        handler.postDelayed({ stopVpn() }, 3000)
                     }
                 }
             } catch (t: Throwable) {
-                N2nController.appendLog("[K] handleStart Thread 崩溃: ${t.message}")
                 Log.e(TAG, "handleStart thread failed", t)
                 handler.post {
                     updateNotification("启动失败: ${t.message}")
@@ -197,10 +160,6 @@ class N2nVpnService : VpnService() {
             }
         }.start()
     }
-
-    // ============================================================
-    // 优选 IP 解析
-    // ============================================================
 
     private fun resolvePreferredIPs(preferredIP: String): List<String> {
         if (preferredIP.isBlank()) return emptyList()
@@ -262,10 +221,6 @@ class N2nVpnService : VpnService() {
             false
         }
     }
-
-    // ============================================================
-    // TURN 服务器 IP 查询
-    // ============================================================
 
     private fun fetchTURNServerIPs(signalingUrl: String, connectToken: String): List<String> {
         return try {
@@ -349,10 +304,6 @@ class N2nVpnService : VpnService() {
         val colon = s.lastIndexOf(':')
         return if (colon > 0) s.substring(0, colon) else s
     }
-
-    // ============================================================
-    // protected sockets
-    // ============================================================
 
     private fun createProtectedUdpSocket(): Int {
         return try {
@@ -440,10 +391,6 @@ class N2nVpnService : VpnService() {
         wifiLock = null
     }
 
-    // ============================================================
-    // TUN
-    // ============================================================
-
     private fun buildTunInterface(
         vip: String,
         turnIPs: List<String>,
@@ -509,10 +456,6 @@ class N2nVpnService : VpnService() {
             Log.w(TAG, "excludeRoute $cidr failed: ${e.message}")
         }
     }
-
-    // ============================================================
-    // 通知
-    // ============================================================
 
     private fun buildNotification(text: String): Notification {
         createChannelIfNeeded()
