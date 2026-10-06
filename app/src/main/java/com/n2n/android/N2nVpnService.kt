@@ -24,6 +24,9 @@ import java.net.Inet6Address
 import java.net.InetAddress
 import java.net.URL
 import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import org.json.JSONObject
 
 class N2nVpnService : VpnService() {
@@ -54,6 +57,17 @@ class N2nVpnService : VpnService() {
     private var protectedUdpSocket: DatagramSocket? = null
     private var protectedStunSocket: DatagramSocket? = null
 
+    // ★ Kotlin 日志直接 append 到 Go 用的同一个文件
+    //   App 重开时 Go init() 读回该文件 → 日志页能显示 Kotlin 日志
+    private fun ktLog(msg: String) {
+        try {
+            val f = java.io.File(filesDir, "n2n.log")
+            val ts = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+            f.appendText("[$ts] [K] $msg\n")
+        } catch (_: Exception) {}
+        Log.i(TAG, msg)
+    }
+
     private val updateIpRunnable = object : Runnable {
         private var attempts = 0
         override fun run() {
@@ -72,11 +86,12 @@ class N2nVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        ktLog("onStartCommand action=${intent?.action}")
         when (intent?.action) {
             ACTION_START -> handleStart(intent)
             ACTION_STOP -> handleStop()
             else -> {
-                Log.w(TAG, "unknown action or null intent")
+                ktLog("unknown action or null intent, stopSelf")
                 stopSelf()
                 return START_NOT_STICKY
             }
@@ -85,9 +100,14 @@ class N2nVpnService : VpnService() {
     }
 
     private fun handleStart(intent: Intent) {
-        if (started) return
+        if (started) {
+            ktLog("handleStart: 已启动，跳过")
+            return
+        }
+        ktLog("handleStart 开始")
 
         val signalingUrl = intent.getStringExtra(EXTRA_SIGNALING_URL) ?: run {
+            ktLog("handleStart: 无 signalingUrl，退出")
             stopSelf()
             return
         }
@@ -98,9 +118,18 @@ class N2nVpnService : VpnService() {
         val connectToken = intent.getStringExtra(EXTRA_CONNECT_TOKEN) ?: ""
         val shareDir = intent.getStringExtra(EXTRA_SHARE_DIR)
             ?: ShareDirManager.getDefaultShareDir(this).absolutePath
+        ktLog("参数读取完成 room=$roomId")
 
-        startForeground(NOTIF_ID, buildNotification("正在获取虚拟 IP..."))
-        acquireLocks()
+        try {
+            startForeground(NOTIF_ID, buildNotification("正在获取虚拟 IP..."))
+            acquireLocks()
+            ktLog("startForeground + acquireLocks 完成")
+        } catch (t: Throwable) {
+            ktLog("startForeground 崩溃: ${t.message}")
+            Log.e(TAG, "startForeground failed", t)
+            stopVpn()
+            return
+        }
 
         val config = Config().apply {
             setSignalingURL(signalingUrl)
@@ -112,46 +141,74 @@ class N2nVpnService : VpnService() {
             setPreferredIP(preferredIp)
             setPreferredPort(443)
         }
+        ktLog("Config 构造完成")
 
         Thread {
             try {
+                ktLog("开始 FetchVIP")
                 val tmpClient = Client()
                 val vip = tmpClient.fetchVirtualIP(config)
+                ktLog("FetchVIP 返回: '$vip'")
+
+                ktLog("开始查 TURN 凭证")
                 val turnIPs = fetchTURNServerIPs(signalingUrl, connectToken)
+                ktLog("TURN IP 数量: ${turnIPs.size}")
+
                 val preferredIPs = resolvePreferredIPs(preferredIp)
+                ktLog("优选 IP 数量: ${preferredIPs.size}")
 
                 handler.post {
-                    if (vip.isEmpty()) {
-                        updateNotification("获取虚拟 IP 失败")
-                        handler.postDelayed({ stopVpn() }, 3000)
-                        return@post
-                    }
-                    val pfd = buildTunInterface(vip, turnIPs, preferredIPs)
-                    if (pfd == null) {
-                        updateNotification("建立 TUN 失败")
-                        handler.postDelayed({ stopVpn() }, 3000)
-                        return@post
-                    }
-                    tunInterface = pfd
-                    val tunFd = pfd.detachFd()
+                    try {
+                        if (vip.isEmpty()) {
+                            ktLog("VIP 为空，退出")
+                            updateNotification("获取虚拟 IP 失败")
+                            handler.postDelayed({ stopVpn() }, 3000)
+                            return@post
+                        }
 
-                    val udpFd = createProtectedUdpSocket()
-                    val stunFd = createProtectedStunSocket()
+                        ktLog("开始建立 TUN")
+                        val pfd = buildTunInterface(vip, turnIPs, preferredIPs)
+                        if (pfd == null) {
+                            ktLog("TUN 建立失败")
+                            updateNotification("建立 TUN 失败")
+                            handler.postDelayed({ stopVpn() }, 3000)
+                            return@post
+                        }
+                        tunInterface = pfd
+                        val tunFd = pfd.detachFd()
+                        ktLog("TUN fd=$tunFd")
 
-                    N2nController.startAsync(tunFd, udpFd, stunFd, config) { err ->
-                        handler.post {
-                            if (err.isNotEmpty()) {
-                                Log.e(TAG, "client start failed: $err")
-                                updateNotification("启动失败: $err")
-                                handler.postDelayed({ stopVpn() }, 3000)
-                            } else {
-                                started = true
-                                handler.post(updateIpRunnable)
+                        ktLog("创建 protected UDP socket")
+                        val udpFd = createProtectedUdpSocket()
+                        ktLog("UDP fd=$udpFd")
+
+                        ktLog("创建 protected STUN socket")
+                        val stunFd = createProtectedStunSocket()
+                        ktLog("STUN fd=$stunFd")
+
+                        ktLog("调用 startAsync")
+                        N2nController.startAsync(tunFd, udpFd, stunFd, config) { err ->
+                            handler.post {
+                                if (err.isNotEmpty()) {
+                                    ktLog("startAsync 失败: $err")
+                                    updateNotification("启动失败: $err")
+                                    handler.postDelayed({ stopVpn() }, 3000)
+                                } else {
+                                    ktLog("startAsync 成功")
+                                    started = true
+                                    handler.post(updateIpRunnable)
+                                }
                             }
                         }
+                    } catch (t: Throwable) {
+                        ktLog("handler.post 崩溃: ${t.message}")
+                        Log.e(TAG, "handler.post failed", t)
+                        updateNotification("启动失败: ${t.message}")
+                        handler.postDelayed({ stopVpn() }, 3000)
                     }
                 }
             } catch (t: Throwable) {
+                ktLog("handleStart Thread 崩溃: ${t.message}")
                 Log.e(TAG, "handleStart thread failed", t)
                 handler.post {
                     updateNotification("启动失败: ${t.message}")
@@ -185,7 +242,7 @@ class N2nVpnService : VpnService() {
 
         if (isIPv4(s) || isIPv6(s)) {
             ips.add(s)
-            Log.i(TAG, "优选 IP: $s")
+            ktLog("优选 IP: $s")
             return ips
         }
 
@@ -195,11 +252,11 @@ class N2nVpnService : VpnService() {
                 val ip = addr.hostAddress ?: continue
                 if (!ips.contains(ip)) {
                     ips.add(ip)
-                    Log.i(TAG, "优选 IP: $s → $ip")
+                    ktLog("优选 IP: $s → $ip")
                 }
             }
         } catch (e: Exception) {
-            Log.w(TAG, "解析优选 IP $s 失败: ${e.message}")
+            ktLog("解析优选 IP $s 失败: ${e.message}")
         }
         return ips
     }
@@ -237,7 +294,7 @@ class N2nVpnService : VpnService() {
                 credURL += "&token=" + URLEncoder.encode(connectToken, "UTF-8")
             }
 
-            Log.i(TAG, "查询 TURN 凭证: $credURL")
+            ktLog("查询 TURN 凭证: $credURL")
 
             val conn = URL(credURL).openConnection() as HttpURLConnection
             conn.connectTimeout = 5000
@@ -245,7 +302,7 @@ class N2nVpnService : VpnService() {
             conn.requestMethod = "GET"
 
             if (conn.responseCode != 200) {
-                Log.w(TAG, "TURN 凭证查询失败: HTTP ${conn.responseCode}")
+                ktLog("TURN 凭证查询失败: HTTP ${conn.responseCode}")
                 return emptyList()
             }
 
@@ -253,7 +310,7 @@ class N2nVpnService : VpnService() {
             val json = JSONObject(body)
 
             if (!json.optBoolean("success", false)) {
-                Log.w(TAG, "TURN 未配置: ${json.optString("error")}")
+                ktLog("TURN 未配置: ${json.optString("error")}")
                 return emptyList()
             }
 
@@ -269,7 +326,7 @@ class N2nVpnService : VpnService() {
                 if (isIPv4(host)) {
                     if (!ips.contains(host)) {
                         ips.add(host)
-                        Log.i(TAG, "  TURN: $url → $host")
+                        ktLog("  TURN: $url → $host")
                     }
                     continue
                 }
@@ -280,16 +337,16 @@ class N2nVpnService : VpnService() {
                         val ip = addr.hostAddress ?: continue
                         if (isIPv4(ip) && !ips.contains(ip)) {
                             ips.add(ip)
-                            Log.i(TAG, "  TURN: $url → $host → $ip")
+                            ktLog("  TURN: $url → $host → $ip")
                         }
                     }
                 } catch (e: Exception) {
-                    Log.w(TAG, "解析 TURN 域名 $host 失败: ${e.message}")
+                    ktLog("解析 TURN 域名 $host 失败: ${e.message}")
                 }
             }
             ips
         } catch (e: Exception) {
-            Log.w(TAG, "fetchTURNServerIPs 异常: ${e.message}")
+            ktLog("fetchTURNServerIPs 异常: ${e.message}")
             emptyList()
         }
     }
@@ -310,14 +367,14 @@ class N2nVpnService : VpnService() {
             val socket = DatagramSocket()
             socket.reuseAddress = true
             val ok = protect(socket)
-            if (!ok) Log.w(TAG, "protect(DatagramSocket) 返回 false")
+            if (!ok) ktLog("protect(DatagramSocket) 返回 false")
             protectedUdpSocket = socket
             val pfd = ParcelFileDescriptor.fromDatagramSocket(socket)
             val fd = pfd.detachFd()
-            Log.i(TAG, "protected UDP socket fd=$fd")
+            ktLog("protected UDP socket fd=$fd")
             fd
         } catch (e: Exception) {
-            Log.e(TAG, "createProtectedUdpSocket failed", e)
+            ktLog("createProtectedUdpSocket 失败: ${e.message}")
             -1
         }
     }
@@ -330,10 +387,10 @@ class N2nVpnService : VpnService() {
             protectedStunSocket = socket
             val pfd = ParcelFileDescriptor.fromDatagramSocket(socket)
             val fd = pfd.detachFd()
-            Log.i(TAG, "protected STUN socket fd=$fd")
+            ktLog("protected STUN socket fd=$fd")
             fd
         } catch (e: Exception) {
-            Log.e(TAG, "createProtectedStunSocket failed", e)
+            ktLog("createProtectedStunSocket 失败: ${e.message}")
             -1
         }
     }
@@ -341,6 +398,7 @@ class N2nVpnService : VpnService() {
     private fun stopVpn() { handleStop() }
 
     private fun handleStop() {
+        ktLog("handleStop 开始")
         handler.removeCallbacks(updateIpRunnable)
         if (started) {
             N2nController.stop()
@@ -353,6 +411,7 @@ class N2nVpnService : VpnService() {
         try { protectedStunSocket?.close() } catch (_: Exception) {}
         protectedStunSocket = null
         releaseLocks()
+        ktLog("handleStop 清理完成")
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -372,7 +431,7 @@ class N2nVpnService : VpnService() {
                 setReferenceCounted(false)
                 acquire()
             }
-        } catch (e: Exception) { Log.w(TAG, "acquire WakeLock failed", e) }
+        } catch (e: Exception) { ktLog("acquire WakeLock 失败: ${e.message}") }
         try {
             val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
             wifiLock = wm.createWifiLock(
@@ -381,7 +440,7 @@ class N2nVpnService : VpnService() {
                 setReferenceCounted(false)
                 acquire()
             }
-        } catch (e: Exception) { Log.w(TAG, "acquire WifiLock failed", e) }
+        } catch (e: Exception) { ktLog("acquire WifiLock 失败: ${e.message}") }
     }
 
     private fun releaseLocks() {
@@ -397,7 +456,7 @@ class N2nVpnService : VpnService() {
         preferredIPs: List<String>
     ): ParcelFileDescriptor? {
         return try {
-            Log.i(TAG, "建立 TUN（全流量），绑定 IP: $vip")
+            ktLog("建立 TUN（全流量），绑定 IP: $vip")
             val builder = Builder()
                 .setSession("n2n-client")
                 .setMtu(1280)
@@ -426,14 +485,16 @@ class N2nVpnService : VpnService() {
                     if (isIPv4(ip)) {
                         excludeIpPrefix(builder, "$ip/32", "preferred")
                     } else {
-                        Log.i(TAG, "优选 IP (IPv6, 无需排除): $ip")
+                        ktLog("优选 IP (IPv6, 无需排除): $ip")
                     }
                 }
             }
 
-            builder.setBlocking(true).establish()
+            val pfd = builder.setBlocking(true).establish()
+            ktLog("TUN establish 成功")
+            pfd
         } catch (e: Exception) {
-            Log.e(TAG, "establish TUN failed", e)
+            ktLog("establish TUN 失败: ${e.message}")
             null
         }
     }
@@ -442,7 +503,7 @@ class N2nVpnService : VpnService() {
         try {
             val slashIdx = cidr.indexOf('/')
             if (slashIdx < 0) {
-                Log.w(TAG, "excludeRoute $cidr failed: missing /")
+                ktLog("excludeRoute $cidr 失败: 无 /")
                 return
             }
             val ipStr = cidr.substring(0, slashIdx)
@@ -451,9 +512,9 @@ class N2nVpnService : VpnService() {
             val prefix = IpPrefix(addr, prefixLen)
             builder.excludeRoute(prefix)
             val tag = if (label.isEmpty()) "" else "[$label] "
-            Log.i(TAG, "  + excludeRoute: $tag$cidr")
+            ktLog("  + excludeRoute: $tag$cidr")
         } catch (e: Exception) {
-            Log.w(TAG, "excludeRoute $cidr failed: ${e.message}")
+            ktLog("excludeRoute $cidr 失败: ${e.message}")
         }
     }
 
@@ -495,6 +556,7 @@ class N2nVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        ktLog("onDestroy")
         handler.removeCallbacks(updateIpRunnable)
         handleStop()
         super.onDestroy()
