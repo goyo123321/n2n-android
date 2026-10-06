@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -67,9 +68,8 @@ func AppendLog(msg string) {
 	}
 }
 
-// ★ GetLogs 每次从文件重读，这样 Kotlin ktLog 写的内容也能被看到
+// GetLogs 每次从文件重读，这样 Kotlin ktLog 写的内容也能被看到
 func GetLogs() string {
-	// 1. 从文件重新读一次（同步 Kotlin 写入的新内容）
 	logFileMu.Lock()
 	path := logFilePath
 	logFileMu.Unlock()
@@ -89,7 +89,6 @@ func GetLogs() string {
 		}
 	}
 
-	// 2. 返回
 	logBufferMu.RLock()
 	defer logBufferMu.RUnlock()
 	if len(logBuffer) == 0 {
@@ -127,11 +126,36 @@ func initLogRedirection() {
 	log.SetFlags(0)
 }
 
+// ★ init 尝试多个候选路径
+//   优先 /data/user/0/（Android 7+ 真实路径，SELinux 上下文更可能正确）
+//   fallback /data/data/（旧版本或符号链接可用时）
 func init() {
 	initLogRedirection()
 
-	const androidLogPath = "/data/data/com.n2n.android/files/n2n.log"
-	if _, err := os.Stat("/data/data/com.n2n.android/files"); err == nil {
-		setLogFilePath(androidLogPath)
+	candidates := []string{
+		"/data/user/0/com.n2n.android/files/n2n.log",
+		"/data/data/com.n2n.android/files/n2n.log",
+	}
+
+	for _, p := range candidates {
+		dir := filepath.Dir(p)
+		_ = os.MkdirAll(dir, 0700)
+
+		if _, err := os.Stat(dir); err != nil {
+			continue
+		}
+
+		// 写入测试
+		testFile := filepath.Join(dir, ".write_test")
+		f, err := os.Create(testFile)
+		if err != nil {
+			continue
+		}
+		_ = f.Close()
+		_ = os.Remove(testFile)
+
+		// 可用，选它
+		setLogFilePath(p)
+		return
 	}
 }
