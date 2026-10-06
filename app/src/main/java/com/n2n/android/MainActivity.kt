@@ -71,6 +71,14 @@ class MainActivity : AppCompatActivity() {
         applyThemeMode(Prefs.loadThemeMode(this))
         super.onCreate(savedInstanceState)
 
+        // ★ 设置日志文件（App 每次启动调一次，读回历史）
+        try {
+            val logFile = java.io.File(filesDir, "n2n.log").absolutePath
+            N2nController.setLogFile(logFile)
+        } catch (e: Exception) {
+            android.util.Log.w("MainActivity", "setLogFile failed", e)
+        }
+
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
@@ -148,7 +156,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ============================================================
-    // 工具：URL host 格式化（IPv6 加方括号）
+    // 工具
     // ============================================================
 
     private fun formatHost(host: String): String {
@@ -448,7 +456,7 @@ class MainActivity : AppCompatActivity() {
 
             val vip = N2nController.getVirtualIP()
             if (vip.isNotEmpty()) {
-                val host = formatHost(vip)   // ★ IPv6 加方括号
+                val host = formatHost(vip)
                 binding.tvShareUrl.text = "共享盘: http://$host:9090/"
                 binding.tvShareUrl.visibility = View.VISIBLE
 
