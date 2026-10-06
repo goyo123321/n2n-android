@@ -45,7 +45,6 @@ const (
 	attrXorMappedAddress = 0x0020
 )
 
-// REQUESTED-TRANSPORT = 17 (UDP)，按 RFC 5766 §14.7，协议号在 32 位值的**第一个字节**
 const transportUDP = 17
 
 const (
@@ -227,7 +226,6 @@ func (t *TURNLite) sign(msg []byte) []byte {
 		return msg
 	}
 
-	// ★ RFC 5389 §15.4：HMAC 计算时长度字段必须"假装" MI 已经存在
 	newBodyLen := len(msg) - 20 + 24
 
 	tmp := make([]byte, len(msg))
@@ -303,20 +301,19 @@ func (t *TURNLite) sendRequest(msgType uint16, attrs []stunAttr, withAuth bool) 
 // ============ Allocate ============
 
 func (t *TURNLite) Allocate() error {
+	// ★ protected dialer：TURN socket 创建后调 VpnService.protect() 绕过 VPN
+	protectedDialer := newProtectedDialer()
+
 	if t.useTCP {
 		log.Printf("[TURN-Lite] TCP transport → %s", t.serverAddr)
-		conn, err := net.DialTimeout("tcp", t.serverAddr, 5*time.Second)
+		conn, err := protectedDialer.Dial("tcp", t.serverAddr)
 		if err != nil {
 			return fmt.Errorf("TCP 连接失败: %w", err)
 		}
 		t.conn = conn
 	} else {
 		log.Printf("[TURN-Lite] UDP transport → %s", t.serverAddr)
-		serverUDP, err := net.ResolveUDPAddr("udp4", t.serverAddr)
-		if err != nil {
-			return fmt.Errorf("解析失败: %w", err)
-		}
-		conn, err := net.DialUDP("udp4", nil, serverUDP)
+		conn, err := protectedDialer.Dial("udp4", t.serverAddr)
 		if err != nil {
 			return fmt.Errorf("UDP 连接失败: %w", err)
 		}
@@ -325,7 +322,6 @@ func (t *TURNLite) Allocate() error {
 
 	go t.readLoop()
 
-	// ★ REQUESTED-TRANSPORT：协议号在第一个字节（RFC 5766 §14.7）
 	reqTransport := []byte{transportUDP, 0, 0, 0}
 
 	log.Printf("[TURN-Lite] 发送初始 Allocate（无认证）")
@@ -513,7 +509,6 @@ func (t *TURNLite) readLoopTCP() {
 	}
 }
 
-// readTCPPacket：STUN 长度字段在 header[2:4]
 func readTCPPacket(conn net.Conn) ([]byte, error) {
 	header := make([]byte, 4)
 	if _, err := io.ReadFull(conn, header); err != nil {
@@ -538,7 +533,6 @@ func readTCPPacket(conn net.Conn) ([]byte, error) {
 		return nil, err
 	}
 
-	// ★ 长度字段在 header[2:4]，不是 rest[2:4]
 	bodyLen := int(binary.BigEndian.Uint16(header[2:4]))
 	if bodyLen > 65535-20 {
 		return nil, fmt.Errorf("非法 STUN bodyLen: %d", bodyLen)
