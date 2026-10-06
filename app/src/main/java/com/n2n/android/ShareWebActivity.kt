@@ -29,8 +29,12 @@ class ShareWebActivity : AppCompatActivity() {
         val port = intent.getIntExtra(EXTRA_PORT, 9090)
         val title = intent.getStringExtra(EXTRA_TITLE) ?: vip
 
+        // ★ IPv6 加方括号
+        val host = formatHost(vip)
+        val baseUrl = "http://$host:$port/"
+
         binding.toolbar.title = title
-        binding.toolbar.subtitle = "http://$vip:$port/"
+        binding.toolbar.subtitle = baseUrl
         binding.toolbar.setNavigationOnClickListener {
             onBackPressedDispatcher.onBackPressed()
         }
@@ -49,10 +53,17 @@ class ShareWebActivity : AppCompatActivity() {
         web.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                 val url = request?.url?.toString() ?: return false
-                return !url.startsWith("http://$vip:$port/")
+                return !url.startsWith(baseUrl)
             }
         }
-        web.loadUrl("http://$vip:$port/")
+        web.loadUrl(baseUrl)
+    }
+
+    private fun formatHost(host: String): String {
+        if (host.contains(":") && !host.startsWith("[")) {
+            return "[$host]"
+        }
+        return host
     }
 
     override fun onDestroy() {
