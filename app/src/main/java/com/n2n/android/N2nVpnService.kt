@@ -7,7 +7,6 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.net.IpPrefix
-import android.net.LinkAddress
 import android.net.VpnService
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -155,7 +154,7 @@ class N2nVpnService : VpnService() {
     }
 
     // ============================================================
-    // 优选 IP 解析（IPv4 / IPv6 / 域名）
+    // 优选 IP 解析
     // ============================================================
 
     private fun resolvePreferredIPs(preferredIP: String): List<String> {
@@ -279,7 +278,6 @@ class N2nVpnService : VpnService() {
                     val addresses = InetAddress.getAllByName(host)
                     for (addr in addresses) {
                         val ip = addr.hostAddress ?: continue
-                        // TURN 只支持 IPv4
                         if (isIPv4(ip) && !ips.contains(ip)) {
                             ips.add(ip)
                             Log.i(TAG, "  TURN: $url → $host → $ip")
@@ -436,7 +434,6 @@ class N2nVpnService : VpnService() {
                     if (isIPv4(ip)) {
                         excludeIpPrefix(builder, "$ip/32", "preferred")
                     } else {
-                        // IPv6 不接管，无需 excludeRoute
                         Log.i(TAG, "优选 IP (IPv6, 无需排除): $ip")
                     }
                 }
@@ -449,15 +446,20 @@ class N2nVpnService : VpnService() {
         }
     }
 
-    // ★ 正确做法：LinkAddress 解析 CIDR → IpPrefix 构造
-    //   IpPrefix 没有 parse() 静态方法，必须用构造函数
+    // ★ 正确做法：自己解析 CIDR → InetAddress → IpPrefix(InetAddress, prefixLength)
+    //   IpPrefix 的 public 构造是 IpPrefix(InetAddress, int)
+    //   LinkAddress(String) 是 package-private，应用层不可用
     private fun excludeIpPrefix(builder: Builder, cidr: String, label: String = "") {
         try {
-            val linkAddr = LinkAddress(cidr)
-            val prefix = IpPrefix(
-                linkAddr.address.address,
-                linkAddr.prefixLength
-            )
+            val slashIdx = cidr.indexOf('/')
+            if (slashIdx < 0) {
+                Log.w(TAG, "excludeRoute $cidr failed: missing /")
+                return
+            }
+            val ipStr = cidr.substring(0, slashIdx)
+            val prefixLen = cidr.substring(slashIdx + 1).toInt()
+            val addr = InetAddress.getByName(ipStr)
+            val prefix = IpPrefix(addr, prefixLen)
             builder.excludeRoute(prefix)
             val tag = if (label.isEmpty()) "" else "[$label] "
             Log.i(TAG, "  + excludeRoute: $tag$cidr")
