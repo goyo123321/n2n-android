@@ -2,16 +2,47 @@ name: Debug All Steps
 
 on:
   workflow_dispatch:
+    inputs:
+      gvisor_version:
+        description: 'gvisor 版本（修复 Go 1.26 WaitReason* redeclared）'
+        required: false
+        type: string
+        default: 'v0.0.0-20260617234043-9307ff8f53c4'
+      x_mobile_version:
+        description: 'golang.org/x/mobile 版本'
+        required: false
+        type: string
+        default: 'v0.0.0-20260908204917-8b95e45f8d3e'
+      go_version:
+        description: 'Go 版本'
+        required: false
+        type: string
+        default: '1.26'
+      ndk_version:
+        description: 'Android NDK 版本'
+        required: false
+        type: string
+        default: '26.1.10909125'
+      skip_ndk_install:
+        description: '跳过 NDK 安装（CI 已预装时加速）'
+        required: false
+        type: boolean
+        default: false
+      run_step2:
+        description: '运行 Step 2 (Kotlin 编译)'
+        required: false
+        type: boolean
+        default: true
+      run_step3:
+        description: '运行 Step 3 (APK 构建)'
+        required: false
+        type: boolean
+        default: true
 
 env:
   GOPROXY: https://proxy.golang.org,direct
   GOTOOLCHAIN: auto
   GOFLAGS: -mod=mod
-  # ★ gvisor 必须用兼容 Go 1.26 的版本（修复 WaitReason* redeclared）
-  GVISOR_VERSION: v0.0.0-20260617234043-9307ff8f53c4
-  # ★ x/mobile 与 go.mod 对齐，不用 @latest
-  X_MOBILE_VERSION: v0.0.0-20260908204917-8b95e45f8d3e
-  NDK_VERSION: 26.1.10909125
 
 jobs:
   debug:
@@ -27,7 +58,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.26'
+          go-version: ${{ inputs.go_version }}
           cache: false
 
       - name: Setup JDK 17
@@ -56,17 +87,31 @@ jobs:
           echo "✅ sdkmanager=$SDKMGR"
 
       - name: Accept licenses + Install NDK
+        if: ${{ !inputs.skip_ndk_install }}
         shell: bash
         run: |
           yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
-          if [ ! -d "$ANDROID_HOME/ndk/${NDK_VERSION}" ]; then
-            yes | "$SDKMANAGER" --install "ndk;${NDK_VERSION}" > /dev/null 2>&1 || true
+          if [ ! -d "$ANDROID_HOME/ndk/${{ inputs.ndk_version }}" ]; then
+            yes | "$SDKMANAGER" --install "ndk;${{ inputs.ndk_version }}" > /dev/null 2>&1 || true
           fi
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${{ inputs.ndk_version }}" >> $GITHUB_ENV
           echo "✅ NDK ready"
 
+      - name: Set NDK env (跳过安装时用)
+        if: ${{ inputs.skip_ndk_install }}
+        shell: bash
+        run: |
+          if [ -d "$ANDROID_HOME/ndk/${{ inputs.ndk_version }}" ]; then
+            echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${{ inputs.ndk_version }}" >> $GITHUB_ENV
+            echo "✅ NDK 已存在：$ANDROID_HOME/ndk/${{ inputs.ndk_version }}"
+          else
+            echo "::error::NDK ${{ inputs.ndk_version }} 不存在，且勾选了跳过安装"
+            ls "$ANDROID_HOME/ndk/" || true
+            exit 1
+          fi
+
       # ============================================================
-      # Step 0: 强制修正 go.mod 里的 gvisor / x/mobile 版本
+      # Step 0: 修正 go.mod
       # ============================================================
       - name: "Step 0: 修正 go.mod"
         id: step0
@@ -74,14 +119,14 @@ jobs:
         working-directory: mobile
         run: |
           echo "=== Before ==="
-          grep -E "gvisor|x/mobile" go.mod || true
+          grep -E "gvisor|x/mobile|^go " go.mod || true
 
-          go mod edit -require="gvisor.dev/gvisor@${GVISOR_VERSION}"
-          go mod edit -require="golang.org/x/mobile@${X_MOBILE_VERSION}"
+          go mod edit -require="gvisor.dev/gvisor@${{ inputs.gvisor_version }}"
+          go mod edit -require="golang.org/x/mobile@${{ inputs.x_mobile_version }}"
 
           echo ""
           echo "=== After ==="
-          grep -E "gvisor|x/mobile" go.mod || true
+          grep -E "gvisor|x/mobile|^go " go.mod || true
           echo "step0_exit=0" >> $GITHUB_OUTPUT
 
       - name: "Step 0b: go mod tidy"
@@ -98,8 +143,7 @@ jobs:
           echo "=== tidy 退出码: $EXIT ==="
 
       # ============================================================
-      # ★ 关键分水岭：不涉及 gomobile，直接 go build
-      #   这一步过了，gomobile bind 才可能过
+      # ★ 分水岭：go build ./...（不涉及 gomobile）
       # ============================================================
       - name: "Step 0c: go build ./..."
         id: step0c
@@ -123,23 +167,25 @@ jobs:
           echo "✅ go build 通过"
 
       # ============================================================
-      # gomobile 安装（固定版本，不用 @latest）
+      # gomobile 安装（固定版本）
       # ============================================================
       - name: Install gomobile（固定版本）
+        if: ${{ steps.step0c.outputs.step0c_exit == '0' }}
         shell: bash
         run: |
           GOBIN="$(go env GOPATH)/bin"
-          go install "golang.org/x/mobile/cmd/gomobile@${X_MOBILE_VERSION}"
-          go install "golang.org/x/mobile/cmd/gobind@${X_MOBILE_VERSION}"
+          go install "golang.org/x/mobile/cmd/gomobile@${{ inputs.x_mobile_version }}"
+          go install "golang.org/x/mobile/cmd/gobind@${{ inputs.x_mobile_version }}"
           echo "$GOBIN" >> $GITHUB_PATH
           echo "✅ gomobile 安装完成："
-          ls -la "$GOBIN" | grep -E "gomobile|gobind"
+          ls -la "$GOBIN" | grep -E "gomobile|gobind" || true
 
       # ============================================================
       # Step 1: gomobile bind
       # ============================================================
       - name: "Step 1: gomobile bind"
         id: step1
+        if: ${{ steps.step0c.outputs.step0c_exit == '0' }}
         shell: bash
         continue-on-error: true
         working-directory: mobile
@@ -157,7 +203,6 @@ jobs:
 
           mkdir -p ../app/libs
           set +e
-          # ★ -ldflags 用等号（不用空格）
           gomobile bind \
             -target=android \
             -androidapi 26 \
@@ -209,6 +254,7 @@ jobs:
       # ============================================================
       - name: "Step 2: Kotlin compile"
         id: step2
+        if: ${{ inputs.run_step2 }}
         shell: bash
         continue-on-error: true
         run: |
@@ -247,6 +293,7 @@ jobs:
       # ============================================================
       - name: "Step 3: APK build"
         id: step3
+        if: ${{ inputs.run_step3 }}
         shell: bash
         continue-on-error: true
         run: |
@@ -297,6 +344,27 @@ jobs:
           retention-days: 7
 
       # ============================================================
+      # 上传 AAR / APK
+      # ============================================================
+      - name: Upload AAR
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: n2nclient-aar
+          path: app/libs/n2nclient.aar
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: n2n-android-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # ============================================================
       # 最终汇总
       # ============================================================
       - name: Final Summary
@@ -306,7 +374,19 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "---" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## 汇总" >> $GITHUB_STEP_SUMMARY
+          echo "## 输入参数" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 参数 | 值 |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| gvisor | \`${{ inputs.gvisor_version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| x/mobile | \`${{ inputs.x_mobile_version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Go | \`${{ inputs.go_version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| NDK | \`${{ inputs.ndk_version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 跳过 NDK 安装 | \`${{ inputs.skip_ndk_install }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 步骤汇总" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| 步骤 | 退出码 | 结果 |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
@@ -317,7 +397,7 @@ jobs:
           E2="${{ steps.step2.outputs.step2_exit }}"
           E3="${{ steps.step3.outputs.step3_exit }}"
 
-          R() { [ "$1" = "0" ] && echo "✅" || echo "❌"; }
+          R() { [ "$1" = "0" ] && echo "✅" || ([ -z "$1" ] && echo "⏭️" || echo "❌"); }
 
           echo "| Step 0b: go mod tidy | $E0b | $(R $E0b) |" >> $GITHUB_STEP_SUMMARY
           echo "| Step 0c: go build ./... | $E0c | $(R $E0c) |" >> $GITHUB_STEP_SUMMARY
@@ -326,7 +406,7 @@ jobs:
           echo "| Step 3: APK build | $E3 | $(R $E3) |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          if [ "$E0b" = "0" ] && [ "$E0c" = "0" ] && [ "$E1" = "0" ] && [ "$E2" = "0" ] && [ "$E3" = "0" ]; then
+          if [ "$E0b" = "0" ] && [ "$E0c" = "0" ] && [ "$E1" = "0" ] && { [ "$E2" = "0" ] || [ -z "$E2" ]; } && { [ "$E3" = "0" ] || [ -z "$E3" ]; }; then
             echo "## 🎉 全部通过" >> $GITHUB_STEP_SUMMARY
           else
             echo "## ⚠️ 有步骤失败，见各步 Summary" >> $GITHUB_STEP_SUMMARY
