@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,29 +37,65 @@ type TURNClient struct {
 	relayAddr    net.Addr
 	server       *TURNServerInfo
 	signalingURL string
-	uuid         string // ★ 组网密钥（原 connectToken）
+	uuid         string
 	edge         *Edge
 	onMessage    func([]byte, net.Addr)
 	stopCh       chan struct{}
 
-	httpClient *http.Client // protected，避免走 TUN 死循环
+	httpClient *http.Client
 }
 
 // NewTURNClient 创建 TURN 客户端。
-// uuid 用于拉取 /api/turn-credentials 的凭证（服务端按 ?token= 读取）。
+//
+// 关键：拉凭证时也走「优选 IP + SNI」，避免依赖 DNS 解析
+// （系统 DNS 指向 TUN 虚拟 IP 时，解析域名会死循环）。
 func NewTURNClient(signalingURL string, uuid string, edge *Edge) *TURNClient {
 	protectedDialer := newProtectedDialer()
+
+	// 从 signalingURL 提取 SNI host
+	var sniHost string
+	if u, err := url.Parse(signalingURL); err == nil {
+		sniHost = u.Hostname()
+	}
+
+	// 从 edge.cfg 读取优选 IP
+	var preferredAddr string
+	if edge != nil && edge.cfg != nil && edge.cfg.PreferredIP != "" {
+		host := edge.cfg.PreferredIP
+		port := edge.cfg.PreferredPort
+		if h, pStr, err := net.SplitHostPort(edge.cfg.PreferredIP); err == nil {
+			host = h
+			if p, err := strconv.Atoi(pStr); err == nil && p > 0 && p <= 65535 {
+				port = p
+			}
+		}
+		if port <= 0 {
+			port = 443
+		}
+		preferredAddr = net.JoinHostPort(host, strconv.Itoa(port))
+	}
+
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// ★ 有优选 IP 就直连 IP，跳过 DNS 解析
+			if preferredAddr != "" {
+				return protectedDialer.DialContext(ctx, network, preferredAddr)
+			}
+			return protectedDialer.DialContext(ctx, network, addr)
+		},
+		// ★ 用域名做 SNI 让证书验证通过，但 TCP 层连的是 IP
+		TLSClientConfig:   &tls.Config{ServerName: sniHost},
+		ForceAttemptHTTP2: false,
+	}
+
 	return &TURNClient{
 		signalingURL: signalingURL,
 		uuid:         uuid,
 		edge:         edge,
 		stopCh:       make(chan struct{}),
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-			Transport: &http.Transport{
-				DialContext:       protectedDialer.DialContext,
-				ForceAttemptHTTP2: false,
-			},
+			Timeout:   30 * time.Second,
+			Transport: transport,
 		},
 	}
 }
@@ -73,7 +111,6 @@ func (tc *TURNClient) FetchAndSetup(ctx context.Context) error {
 
 	credURL := fmt.Sprintf("%s/api/turn-credentials?ttl=86400", httpBase)
 	if tc.uuid != "" {
-		// 服务端按 query 参数 "token" 读取（保持向后兼容）
 		credURL += "&token=" + url.QueryEscape(tc.uuid)
 	}
 
