@@ -12,10 +12,7 @@ app/release/
 # Gradle
 # ============================================================
 .gradle/
-# ★ gradle-wrapper.jar 和 gradle-wrapper.properties 必须提交，
-#   否则 CI 无法执行 ./gradlew，所以这里不忽略 gradle/wrapper/
 gradle-app.setting
-!gradle-wrapper.jar
 .gradletasknamecache
 
 # ============================================================
@@ -58,9 +55,9 @@ signing.properties
 keystore.properties
 
 # ============================================================
-# 生成的 AAR（由 build-aar.sh 重新生成）
+# 生成的 AAR（由 build-aar.sh 重新生成，第三方 AAR 保留）
 # ============================================================
-app/libs/*.aar
+app/libs/n2nclient.aar
 
 # ============================================================
 # Go
