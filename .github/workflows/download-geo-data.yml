@@ -1,0 +1,129 @@
+name: Download Geo Data
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '强制重新下载（即使文件已存在）'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    name: Download geoip_cn + geosite_cn
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare directory
+        run: |
+          mkdir -p mobile/internal/data
+          ls -la mobile/internal/data/ || true
+
+      - name: Check existing files
+        id: check
+        run: |
+          GEOIP_EXISTS=false
+          GEOSITE_EXISTS=false
+
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "强制重新下载"
+          else
+            if [ -s mobile/internal/data/geoip_cn.txt ]; then
+              GEOIP_EXISTS=true
+              echo "geoip_cn.txt 已存在 ($(wc -l < mobile/internal/data/geoip_cn.txt) 行)"
+            fi
+            if [ -s mobile/internal/data/geosite_cn.txt ]; then
+              GEOSITE_EXISTS=true
+              echo "geosite_cn.txt 已存在 ($(wc -l < mobile/internal/data/geosite_cn.txt) 行)"
+            fi
+          fi
+
+          echo "geoip_exists=$GEOIP_EXISTS" >> $GITHUB_OUTPUT
+          echo "geosite_exists=$GEOSITE_EXISTS" >> $GITHUB_OUTPUT
+
+      - name: Download geoip_cn.txt
+        if: steps.check.outputs.geoip_exists != 'true'
+        run: |
+          echo "下载 geoip_cn.txt（v2fly 官方数据）..."
+          curl -fsSL --retry 3 --retry-delay 5 \
+            "https://raw.githubusercontent.com/v2fly/geoip/master/text/cn.txt" \
+            -o mobile/internal/data/geoip_cn.txt
+
+          if [ ! -s mobile/internal/data/geoip_cn.txt ]; then
+            echo "❌ 下载失败或文件为空"
+            exit 1
+          fi
+
+          LINES=$(wc -l < mobile/internal/data/geoip_cn.txt)
+          SIZE=$(du -h mobile/internal/data/geoip_cn.txt | cut -f1)
+          echo "✅ geoip_cn.txt: $LINES 行, $SIZE"
+
+          # 校验文件内容（应该是 CIDR 格式）
+          head -3 mobile/internal/data/geoip_cn.txt
+          if ! head -1 mobile/internal/data/geoip_cn.txt | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+'; then
+            echo "❌ 文件格式异常（第一行不是 CIDR）"
+            exit 1
+          fi
+
+      - name: Download geosite_cn.txt
+        if: steps.check.outputs.geosite_exists != 'true'
+        run: |
+          echo "下载 geosite_cn.txt（v2fly 官方数据）..."
+          curl -fsSL --retry 3 --retry-delay 5 \
+            "https://raw.githubusercontent.com/v2fly/domain-list-community/master/data/cn" \
+            -o mobile/internal/data/geosite_cn.txt
+
+          if [ ! -s mobile/internal/data/geosite_cn.txt ]; then
+            echo "❌ 下载失败或文件为空"
+            exit 1
+          fi
+
+          LINES=$(wc -l < mobile/internal/data/geosite_cn.txt)
+          SIZE=$(du -h mobile/internal/data/geosite_cn.txt | cut -f1)
+          echo "✅ geosite_cn.txt: $LINES 行, $SIZE"
+
+          # 校验文件内容
+          head -3 mobile/internal/data/geosite_cn.txt
+          if [ "$LINES" -lt 100 ]; then
+            echo "❌ 行数太少（$LINES），可能下载不完整"
+            exit 1
+          fi
+
+      - name: Show final status
+        run: |
+          echo "========== 数据文件状态 =========="
+          ls -lh mobile/internal/data/
+          echo ""
+          echo "geoip_cn.txt: $(wc -l < mobile/internal/data/geoip_cn.txt) 行"
+          echo "geosite_cn.txt: $(wc -l < mobile/internal/data/geosite_cn.txt) 行"
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add mobile/internal/data/geoip_cn.txt mobile/internal/data/geosite_cn.txt
+
+          if git diff --staged --quiet; then
+            echo "无变化，跳过提交"
+            exit 0
+          fi
+
+          git commit -m "chore: 更新 geo 数据文件
+
+          - geoip_cn.txt: $(wc -l < mobile/internal/data/geoip_cn.txt) 行
+          - geosite_cn.txt: $(wc -l < mobile/internal/data/geosite_cn.txt) 行
+
+          由 GitHub Actions 自动下载"
+
+          git push
+          echo "✅ 已提交并推送"
