@@ -13,13 +13,14 @@ import (
 	"time"
 )
 
+// RFC 6062 §7
 const (
 	msgConnectRequest    = 0x000A
-	msgConnectSuccess    = 0x000B
-	msgConnectError      = 0x000C
-	msgConnectionBindReq = 0x000D
-	msgConnectionBindSuc = 0x000E
-	msgConnectionBindErr = 0x000F
+	msgConnectSuccess    = 0x010A
+	msgConnectError      = 0x011A
+	msgConnectionBindReq = 0x000B
+	msgConnectionBindSuc = 0x010B
+	msgConnectionBindErr = 0x011B
 )
 
 const attrConnectionID = 0x002A
@@ -37,7 +38,9 @@ type TURNTCPAllocation struct {
 	key   []byte
 
 	controlConn net.Conn
-	respCh      chan *stunMessage
+
+	pendingMu sync.Mutex
+	pending   map[[12]byte]chan *stunMessage
 
 	relayAddr  *net.UDPAddr
 	mappedAddr *net.UDPAddr
@@ -52,7 +55,7 @@ func NewTURNTCPAllocation(serverAddr, username, password string) *TURNTCPAllocat
 		serverAddr: serverAddr,
 		username:   username,
 		password:   password,
-		respCh:     make(chan *stunMessage, 16),
+		pending:    make(map[[12]byte]chan *stunMessage),
 		stopCh:     make(chan struct{}),
 	}
 }
@@ -95,31 +98,42 @@ func (t *TURNTCPAllocation) sendRequest(msgType uint16, attrs []stunAttr, withAu
 		msg = t.sign(msg)
 	}
 
-	for {
-		select {
-		case <-t.respCh:
-			continue
-		default:
-		}
-		break
-	}
+	ch := make(chan *stunMessage, 1)
+	t.pendingMu.Lock()
+	t.pending[txid] = ch
+	t.pendingMu.Unlock()
+	defer func() {
+		t.pendingMu.Lock()
+		delete(t.pending, txid)
+		t.pendingMu.Unlock()
+	}()
 
 	if _, err := t.controlConn.Write(msg); err != nil {
 		return nil, fmt.Errorf("发送失败: %w", err)
 	}
 
 	timeout := time.After(turnRequestTimeout)
-	for {
+	select {
+	case resp := <-ch:
+		if resp == nil {
+			return nil, fmt.Errorf("空响应")
+		}
+		return resp, nil
+	case <-timeout:
+		return nil, fmt.Errorf("请求超时 (type=0x%04x)", msgType)
+	case <-t.stopCh:
+		return nil, fmt.Errorf("已关闭")
+	}
+}
+
+func (t *TURNTCPAllocation) dispatch(msg *stunMessage) {
+	t.pendingMu.Lock()
+	ch := t.pending[msg.txid]
+	t.pendingMu.Unlock()
+	if ch != nil {
 		select {
-		case resp := <-t.respCh:
-			if resp == nil || resp.txid != txid {
-				continue
-			}
-			return resp, nil
-		case <-timeout:
-			return nil, fmt.Errorf("请求超时 (type=0x%04x)", msgType)
-		case <-t.stopCh:
-			return nil, fmt.Errorf("已关闭")
+		case ch <- msg:
+		default:
 		}
 	}
 }
@@ -149,10 +163,7 @@ func (t *TURNTCPAllocation) readControlLoop() {
 		if err != nil {
 			continue
 		}
-		select {
-		case t.respCh <- msg:
-		default:
-		}
+		t.dispatch(msg)
 	}
 }
 
@@ -257,15 +268,14 @@ func (t *TURNTCPAllocation) Dial(targetIP string, targetPort int) (io.ReadWriteC
 	}
 	if connectResp.msgType != msgConnectSuccess {
 		code := parseErrorCode(connectResp.attrs[attrErrorCode])
-		return nil, fmt.Errorf("Connect 被拒: code=%d", code)
+		return nil, fmt.Errorf("Connect 被拒: code=%d (type=0x%04x)", code, connectResp.msgType)
 	}
 
 	connectionID := connectResp.attrs[attrConnectionID]
-	if len(connectionID) < 4 {
+	if len(connectionID) < 1 {
 		return nil, fmt.Errorf("Connect 响应缺 ConnectionID")
 	}
 
-	// ★ data 连接连到 relay 地址（不是 control 端口）
 	dataAddr := net.JoinHostPort(t.relayHost, fmt.Sprintf("%d", t.relayAddr.Port))
 	log.Printf("[TURN-TCP] 建立 data connection → %s", dataAddr)
 
@@ -286,25 +296,25 @@ func (t *TURNTCPAllocation) Dial(targetIP string, targetPort int) (io.ReadWriteC
 	bindMsg = t.sign(bindMsg)
 
 	if _, err := dataConn.Write(bindMsg); err != nil {
-		dataConn.Close()
+		_ = dataConn.Close()
 		return nil, fmt.Errorf("发送 ConnectionBind 失败: %w", err)
 	}
 
 	_ = dataConn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	respPkt, err := readTCPPacket(dataConn)
 	if err != nil {
-		dataConn.Close()
+		_ = dataConn.Close()
 		return nil, fmt.Errorf("读 ConnectionBind 响应失败: %w", err)
 	}
 	bindResp, err := parseSTUNMsg(respPkt)
 	if err != nil {
-		dataConn.Close()
+		_ = dataConn.Close()
 		return nil, fmt.Errorf("解析 ConnectionBind 响应失败: %w", err)
 	}
 	if bindResp.msgType != msgConnectionBindSuc {
 		code := parseErrorCode(bindResp.attrs[attrErrorCode])
-		dataConn.Close()
-		return nil, fmt.Errorf("ConnectionBind 被拒: code=%d", code)
+		_ = dataConn.Close()
+		return nil, fmt.Errorf("ConnectionBind 被拒: code=%d (type=0x%04x)", code, bindResp.msgType)
 	}
 
 	_ = dataConn.SetReadDeadline(time.Time{})
