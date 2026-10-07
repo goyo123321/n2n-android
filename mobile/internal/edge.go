@@ -92,7 +92,7 @@ func FetchVirtualIP(cfg *Config) string {
 		clientId = generateDefaultClientID()
 	}
 	ws, err := NewWSTransport(
-		cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken,
+		cfg.SignalingURL, cfg.RoomID, clientId, cfg.UUID,
 		cfg.PreferredIP, cfg.PreferredPort,
 	)
 	if err != nil {
@@ -219,7 +219,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 
 	// 4. 信令
 	ws, err := NewWSTransport(
-		cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken,
+		cfg.SignalingURL, cfg.RoomID, clientId, cfg.UUID,
 		cfg.PreferredIP, cfg.PreferredPort,
 	)
 	if err != nil {
@@ -233,7 +233,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	e.ws = ws
 
 	// 5. TURN
-	e.turnClient = NewTURNClient(cfg.SignalingURL, cfg.ConnectToken, e)
+	e.turnClient = NewTURNClient(cfg.SignalingURL, cfg.UUID, e)
 	e.turnClient.onMessage = func(data []byte, addr net.Addr) {
 		e.onRemotePacket(data)
 	}
@@ -296,16 +296,11 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 			})
 		}
 
-		uuid := cfg.ConnectToken
-		if uuid == "" {
-			uuid = "2523c510-9ff0-415b-9582-93949bfae7e3"
-		}
-
 		wsOut, err := NewWSOutbound(
-			cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken,
+			cfg.SignalingURL, cfg.RoomID, clientId, cfg.UUID,
 			cfg.PreferredIP, cfg.PreferredPort,
 			e.turnClient,
-			uuid,
+			cfg.UUID,
 			e.GetVirtualIP(),
 			e.udpPort,
 		)
@@ -854,7 +849,6 @@ func (e *Edge) netstackReadLoop(ns *NetstackHost) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 关联 e.doneCh：Edge 停止时取消 ctx
 	go func() {
 		select {
 		case <-e.doneCh:
