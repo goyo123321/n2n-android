@@ -18,10 +18,12 @@ import androidx.core.app.NotificationCompat
 import com.n2n.mobile.Client
 import com.n2n.mobile.Config
 import com.n2n.mobile.Protector
+import java.io.File
 import java.net.DatagramSocket
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 
 class N2nVpnService : VpnService() {
 
@@ -43,7 +45,9 @@ class N2nVpnService : VpnService() {
     }
 
     private var tunInterface: ParcelFileDescriptor? = null
-    private var started = false
+    @Volatile private var started = false
+    private val starting = AtomicBoolean(false)   // ★ 防止重复启动（TOCTOU）
+    private val stopping = AtomicBoolean(false)   // ★ 防止重复清理
     private val handler = Handler(Looper.getMainLooper())
 
     private var wakeLock: PowerManager.WakeLock? = null
@@ -67,26 +71,22 @@ class N2nVpnService : VpnService() {
         val ts = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
         val line = "[$ts] [K] $msg"
 
-        val paths = listOf(
-            "/data/user/0/com.n2n.android/files/n2n.log",
-            "/data/data/com.n2n.android/files/n2n.log"
-        )
+        // ★ 优先用 filesDir（支持多用户 / work profile），其余作为 fallback
+        val candidates = mutableListOf<File>()
+        try { candidates.add(File(filesDir, "n2n.log")) } catch (_: Throwable) {}
+        candidates.add(File("/data/user/0/com.n2n.android/files/n2n.log"))
+        candidates.add(File("/data/data/com.n2n.android/files/n2n.log"))
 
         var written = false
-        for (p in paths) {
+        for (f in candidates) {
             try {
-                val f = java.io.File(p)
                 f.parentFile?.mkdirs()
                 f.appendText("$line\n")
                 written = true
                 break
-            } catch (e: Exception) {
-                Log.w(TAG, "ktLog 写 $p 失败: ${e.message}")
-            }
+            } catch (_: Exception) {}
         }
-        if (!written) {
-            Log.e(TAG, "ktLog 全部路径写入失败")
-        }
+        if (!written) Log.e(TAG, "ktLog 全部路径写入失败")
         Log.i(TAG, msg)
     }
 
@@ -102,7 +102,9 @@ class N2nVpnService : VpnService() {
                 updateNotification("正在连接... (${attempts}s)")
                 handler.postDelayed(this, 1000)
             } else {
-                updateNotification("连接超时")
+                // ★ 超时后降频继续轮询，不再直接放弃
+                updateNotification("正在连接... (${attempts}s)")
+                handler.postDelayed(this, 3000)
             }
         }
     }
@@ -121,15 +123,29 @@ class N2nVpnService : VpnService() {
         return START_NOT_STICKY
     }
 
+    // ★ VPN 权限被系统或另一个 VPN 抢占时回调
+    override fun onRevoke() {
+        ktLog("onRevoke: VPN 权限被撤销")
+        handleStop()
+        super.onRevoke()
+    }
+
     private fun handleStart(intent: Intent) {
         if (started) {
             ktLog("handleStart: 已启动，跳过")
             return
         }
+        // ★ CAS：防止双击导致两次启动流程并行
+        if (!starting.compareAndSet(false, true)) {
+            ktLog("handleStart: 已有启动流程在跑，忽略")
+            return
+        }
+
         ktLog("handleStart 开始")
 
         val signalingUrl = intent.getStringExtra(EXTRA_SIGNALING_URL) ?: run {
             ktLog("handleStart: 无 signalingUrl，退出")
+            starting.set(false)
             stopSelf()
             return
         }
@@ -149,6 +165,7 @@ class N2nVpnService : VpnService() {
         } catch (t: Throwable) {
             ktLog("startForeground 崩溃: ${t.message}")
             Log.e(TAG, "startForeground failed", t)
+            starting.set(false)
             stopVpn()
             return
         }
@@ -201,6 +218,15 @@ class N2nVpnService : VpnService() {
                         val stunFd = createProtectedStunSocket()
                         ktLog("STUN fd=$stunFd")
 
+                        // ★ UDP 是 P2P 打洞的必要条件。fd 无效时直接失败，
+                        //   避免 Go 侧回退到未 protect 的默认 socket（会被 TUN 捕获 → 死循环）
+                        if (udpFd <= 0) {
+                            ktLog("UDP fd 无效，无法建立 P2P，退出")
+                            updateNotification("UDP socket 创建失败")
+                            handler.postDelayed({ stopVpn() }, 3000)
+                            return@post
+                        }
+
                         ktLog("调用 startAsync")
                         N2nController.startAsync(
                             tunFd, udpFd, stunFd, config, ServiceProtector()
@@ -213,6 +239,7 @@ class N2nVpnService : VpnService() {
                                 } else {
                                     ktLog("startAsync 成功")
                                     started = true
+                                    starting.set(false)   // ★ 成功才清 starting
                                     handler.post(updateIpRunnable)
                                 }
                             }
@@ -271,28 +298,40 @@ class N2nVpnService : VpnService() {
     private fun stopVpn() { handleStop() }
 
     private fun handleStop() {
-        ktLog("handleStop 开始")
-        handler.removeCallbacks(updateIpRunnable)
-        if (started) {
-            N2nController.stop()
-            started = false
+        // ★ 保证同一时刻只有一次清理流程
+        if (!stopping.compareAndSet(false, true)) {
+            ktLog("handleStop: 已在清理中，忽略")
+            return
         }
-        try { tunInterface?.close() } catch (_: Exception) {}
-        tunInterface = null
-        try { protectedUdpSocket?.close() } catch (_: Exception) {}
-        protectedUdpSocket = null
-        try { protectedStunSocket?.close() } catch (_: Exception) {}
-        protectedStunSocket = null
-        releaseLocks()
-        ktLog("handleStop 清理完成")
+        try {
+            ktLog("handleStop 开始")
+            handler.removeCallbacks(updateIpRunnable)
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            stopForeground(STOP_FOREGROUND_REMOVE)
-        } else {
-            @Suppress("DEPRECATION")
-            stopForeground(true)
+            if (started) {
+                N2nController.stop()
+                started = false
+            }
+            starting.set(false)
+
+            try { tunInterface?.close() } catch (_: Exception) {}
+            tunInterface = null
+            try { protectedUdpSocket?.close() } catch (_: Exception) {}
+            protectedUdpSocket = null
+            try { protectedStunSocket?.close() } catch (_: Exception) {}
+            protectedStunSocket = null
+            releaseLocks()
+            ktLog("handleStop 清理完成")
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } else {
+                @Suppress("DEPRECATION")
+                stopForeground(true)
+            }
+            stopSelf()
+        } finally {
+            stopping.set(false)
         }
-        stopSelf()
     }
 
     private fun acquireLocks() {
@@ -337,7 +376,7 @@ class N2nVpnService : VpnService() {
                 .addAddress(vip, 24)
                 .addRoute("10.64.0.0", 24)
                 .addRoute("0.0.0.0", 0)
-                .addDnsServer(vip)   // ★ 系统 DNS 指向虚拟 IP → netstack 处理
+                .addDnsServer(vip)   // 系统 DNS 指向虚拟 IP → netstack 处理
 
             ktLog("TUN 接管 0.0.0.0/0，DNS 指向 $vip，信令/TURN/WSOut 靠 socket protect 走物理网络")
 
