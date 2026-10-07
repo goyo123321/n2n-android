@@ -12,7 +12,7 @@
     <string name="card_peers">🌐 已连接节点</string>
 
     <string name="hint_wss">WSS 地址</string>
-    <string name="hint_token">连接密码（可选）</string>
+    <string name="hint_uuid">组网密钥 UUID</string>
     <string name="hint_room">房间名</string>
     <string name="hint_node_name">显示名</string>
     <string name="hint_client_id">Client ID（可选，留空自动生成）</string>
@@ -34,4 +34,6 @@
     <string name="share_browser_title">共享盘</string>
     <string name="empty_peers">暂无其他节点</string>
     <string name="empty_folder">此目录为空</string>
+
+    <string name="uuid_invalid">UUID 格式错误（需 32 位十六进制）</string>
 </resources>
