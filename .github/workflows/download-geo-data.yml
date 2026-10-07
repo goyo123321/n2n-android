@@ -1,0 +1,84 @@
+name: Download Geo Data
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '强制重新下载'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  download:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Check existing files
+        id: check
+        run: |
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "geoip_exists=false" >> $GITHUB_OUTPUT
+            echo "geosite_exists=false" >> $GITHUB_OUTPUT
+          else
+            [ -s mobile/internal/data/geoip_cn.txt ] \
+              && echo "geoip_exists=true" >> $GITHUB_OUTPUT \
+              || echo "geoip_exists=false" >> $GITHUB_OUTPUT
+            [ -s mobile/internal/data/geosite_cn.txt ] \
+              && echo "geosite_exists=true" >> $GITHUB_OUTPUT \
+              || echo "geosite_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download .dat files
+        if: steps.check.outputs.geoip_exists != 'true' || steps.check.outputs.geosite_exists != 'true'
+        run: |
+          BASE="https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release"
+          FALLBACK="https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release"
+
+          echo "下载 geoip.dat..."
+          curl -fsSL --retry 3 "$BASE/geoip.dat" -o /tmp/geoip.dat \
+            || curl -fsSL --retry 3 "$FALLBACK/geoip.dat" -o /tmp/geoip.dat
+
+          echo "下载 geosite.dat..."
+          curl -fsSL --retry 3 "$BASE/geosite.dat" -o /tmp/geosite.dat \
+            || curl -fsSL --retry 3 "$FALLBACK/geosite.dat" -o /tmp/geosite.dat
+
+          ls -lh /tmp/geoip.dat /tmp/geosite.dat
+
+      - name: Convert .dat to text
+        if: steps.check.outputs.geoip_exists != 'true' || steps.check.outputs.geosite_exists != 'true'
+        run: |
+          python3 .github/scripts/convert_geo.py \
+            /tmp/geoip.dat /tmp/geosite.dat cn /tmp/geo-out
+
+          cp /tmp/geo-out/geoip_cn.txt mobile/internal/data/geoip_cn.txt
+          cp /tmp/geo-out/geosite_cn.txt mobile/internal/data/geosite_cn.txt
+
+          echo "geoip_cn.txt: $(wc -l < mobile/internal/data/geoip_cn.txt) 行"
+          echo "geosite_cn.txt: $(wc -l < mobile/internal/data/geosite_cn.txt) 行"
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add mobile/internal/data/geoip_cn.txt mobile/internal/data/geosite_cn.txt
+
+          if git diff --staged --quiet; then
+            echo "无变化"
+            exit 0
+          fi
+
+          git commit -m "chore: 更新 geo 数据文件"
+          git push
