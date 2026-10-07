@@ -53,11 +53,19 @@ type WSOutbound struct {
 	connected bool
 }
 
+// NewWSOutbound 创建 Workers 出口代理客户端。
+//
+// 参数说明：
+//   - signalingURL/roomId/clientId：用于拼接 URL
+//   - uuid：URL 认证（服务端按 ?token= 读取）
+//   - authUUID：认证帧里的 16 字节 UUID（与服务端 env.UUID 一致）
+//
+// 通常情况下 uuid == authUUID。
 func NewWSOutbound(
-	signalingURL, roomId, clientId, connectToken,
+	signalingURL, roomId, clientId, uuid,
 	preferredIP string, preferredPort int,
 	turnClient *TURNClient,
-	uuid, virtualIP string,
+	authUUID, virtualIP string,
 	udpPort int,
 ) (*WSOutbound, error) {
 	u, err := url.Parse(signalingURL)
@@ -82,7 +90,7 @@ func NewWSOutbound(
 		turnClient:    turnClient,
 		streams:       make(map[uint16]*muxStream),
 		nextID:        1,
-		uuid:          uuid,
+		uuid:          authUUID,
 		clientID:      clientId,
 		virtualIP:     virtualIP,
 		udpPort:       udpPort,
@@ -242,7 +250,7 @@ func (o *WSOutbound) sendAuthFrame(conn *websocket.Conn) error {
 		}
 	}
 	if len(uuidHex) != 32 {
-		return fmt.Errorf("UUID 长度不对: %d", len(uuidHex))
+		return fmt.Errorf("UUID 长度不对: %d（应为 32 位 hex）", len(uuidHex))
 	}
 	uuidBytes := make([]byte, 16)
 	for i := 0; i < 16; i++ {
@@ -469,7 +477,7 @@ func (o *WSOutbound) Close() {
 }
 
 // ============================================================
-// muxStream：bytes.Buffer + sync.Cond 保证不丢包
+// muxStream：bytes.Buffer + notify channel 保证不丢包
 // ============================================================
 
 type muxStream struct {
