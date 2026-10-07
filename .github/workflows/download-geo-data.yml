@@ -14,8 +14,8 @@ permissions:
 
 jobs:
   download:
-    runs-on: ubuntu-latest
-    name: Download geoip_cn + geosite_cn (text)
+    runs-on: ubuntu-24.04
+    name: Download geoip_cn + geosite_cn
 
     steps:
       - name: Checkout
@@ -55,11 +55,12 @@ jobs:
         run: |
           echo "下载国内 IP 段..."
 
-          # 主源：17mon/china_ip_list（每天更新，纯 CIDR text）
-          # Fallback：jsdelivr CDN
-          if ! curl -fsSL --retry 3 --retry-delay 5 \
-            "https://raw.githubusercontent.com/17mon/china_ip_list/master/china_ip_list.txt" \
-            -o /tmp/geoip_cn.txt; then
+          # 主源：17mon/china_ip_list
+          if curl -fsSL --retry 3 --retry-delay 5 \
+              "https://raw.githubusercontent.com/17mon/china_ip_list/master/china_ip_list.txt" \
+              -o /tmp/geoip_cn.txt; then
+            echo "✅ 主源成功"
+          else
             echo "主源失败，改用 jsdelivr CDN..."
             curl -fsSL --retry 3 --retry-delay 5 \
               "https://cdn.jsdelivr.net/gh/17mon/china_ip_list@master/china_ip_list.txt" \
@@ -75,10 +76,9 @@ jobs:
           echo "✅ 下载完成: $LINES 行"
           head -5 /tmp/geoip_cn.txt
 
-          # 校验格式：第一行应该是 CIDR
           if ! head -1 /tmp/geoip_cn.txt | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+'; then
             echo "❌ 文件格式异常（第一行不是 CIDR）"
-            cat /tmp/geoip_cn.txt | head -20
+            head -20 /tmp/geoip_cn.txt
             exit 1
           fi
 
@@ -89,11 +89,12 @@ jobs:
         run: |
           echo "下载国内域名列表..."
 
-          # 主源：v2fly/domain-list-community/data/cn（纯 text）
-          # Fallback：jsdelivr CDN
-          if ! curl -fsSL --retry 3 --retry-delay 5 \
-            "https://raw.githubusercontent.com/v2fly/domain-list-community/master/data/cn" \
-            -o /tmp/geosite_cn.txt; then
+          # 主源：v2fly/domain-list-community
+          if curl -fsSL --retry 3 --retry-delay 5 \
+              "https://raw.githubusercontent.com/v2fly/domain-list-community/master/data/cn" \
+              -o /tmp/geosite_cn.txt; then
+            echo "✅ 主源成功"
+          else
             echo "主源失败，改用 jsdelivr CDN..."
             curl -fsSL --retry 3 --retry-delay 5 \
               "https://cdn.jsdelivr.net/gh/v2fly/domain-list-community@master/data/cn" \
@@ -141,8 +142,8 @@ jobs:
 
           git commit -m "chore: 更新 geo 数据文件
 
-          - geoip_cn.txt: $GEOIP_LINES 行（17mon/china_ip_list）
-          - geosite_cn.txt: $GEOSITE_LINES 行（v2fly/domain-list-community）
+          - geoip_cn.txt: $GEOIP_LINES 行 (17mon/china_ip_list)
+          - geosite_cn.txt: $GEOSITE_LINES 行 (v2fly/domain-list-community)
 
           由 GitHub Actions 自动下载"
 
