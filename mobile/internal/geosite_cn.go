@@ -27,7 +27,21 @@ func init() {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
+
+		// ★ 跳过非域名类指令
+		if strings.HasPrefix(line, "include:") ||
+			strings.HasPrefix(line, "ext:") ||
+			strings.HasPrefix(line, "attribute:") {
+			continue
+		}
+
 		line = strings.ToLower(line)
+
+		// ★ 剥离 @ 属性后缀
+		if atIdx := strings.Index(line, " @"); atIdx >= 0 {
+			line = strings.TrimSpace(line[:atIdx])
+		}
+
 		switch {
 		case strings.HasPrefix(line, "full:"):
 			geositeCNFull[strings.TrimPrefix(line, "full:")] = true
