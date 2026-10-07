@@ -29,6 +29,7 @@ class MainActivity : AppCompatActivity() {
 
     private val peersTicker = object : Runnable {
         override fun run() {
+            if (isFinishing || isDestroyed) return
             if (N2nController.isRunning()) refreshPeers()
             binding.root.postDelayed(this, 3000)
         }
@@ -36,6 +37,7 @@ class MainActivity : AppCompatActivity() {
 
     private val statusTicker = object : Runnable {
         override fun run() {
+            if (isFinishing || isDestroyed) return
             refreshStatus()
             binding.root.postDelayed(this, 1000)
         }
@@ -98,14 +100,22 @@ class MainActivity : AppCompatActivity() {
         }
         binding.btnOpenMyShare.setOnClickListener { openMyShare() }
 
+        // 首次刷新（ticker 在 onStart 启动）
         refreshStatus()
-        binding.root.postDelayed(peersTicker, 3000)
-        binding.root.postDelayed(statusTicker, 1000)
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         handleIntentParams(intent)
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // ★ 回前台重启 ticker
+        binding.root.removeCallbacks(peersTicker)
+        binding.root.removeCallbacks(statusTicker)
+        binding.root.postDelayed(statusTicker, 1000)
+        binding.root.postDelayed(peersTicker, 3000)
     }
 
     override fun onResume() {
@@ -119,8 +129,9 @@ class MainActivity : AppCompatActivity() {
         saveCurrentInput()
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
+    override fun onStop() {
+        super.onStop()
+        // ★ 切后台立即停 ticker，避免访问已失效的 binding
         binding.root.removeCallbacks(peersTicker)
         binding.root.removeCallbacks(statusTicker)
     }
@@ -417,6 +428,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshStatus() {
+        if (isFinishing || isDestroyed) return
         val running = N2nController.isRunning()
 
         if (running) {
@@ -466,6 +478,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshPeers() {
+        if (isFinishing || isDestroyed) return
+
         if (!N2nController.isRunning()) {
             lastPeersJson = ""
             binding.tvPeerCount.text = "0"
