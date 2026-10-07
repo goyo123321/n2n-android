@@ -3,6 +3,7 @@ package internal
 import (
 	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net"
 	"net/url"
@@ -50,7 +51,6 @@ func NewWSTransport(signalingURL, roomId, clientId, connectToken, preferredIP st
 		HandshakeTimeout: 10 * time.Second,
 	}
 
-	// ★ protected dialer：socket 创建后调 protect() 绕过 TUN
 	protectedDialer := newProtectedDialer()
 
 	if preferredIP != "" {
@@ -94,7 +94,7 @@ func NewWSTransport(signalingURL, roomId, clientId, connectToken, preferredIP st
 		dialer:   dialer,
 		stopCh:   make(chan struct{}),
 	}
-	go ws.readLoop()
+	go ws.readLoop(conn)
 	go ws.heartbeat(20 * time.Second)
 	return ws, nil
 }
@@ -110,9 +110,15 @@ func maskToken(u string) string {
 	return parts[0] + "token=***"
 }
 
-func (ws *WSTransport) readLoop() {
+func (ws *WSTransport) getConn() *websocket.Conn {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	return ws.conn
+}
+
+func (ws *WSTransport) readLoop(conn *websocket.Conn) {
 	for {
-		msgType, data, err := ws.conn.ReadMessage()
+		msgType, data, err := conn.ReadMessage()
 		if err != nil {
 			log.Printf("[WS] 读取错误: %v", err)
 
@@ -167,7 +173,7 @@ func (ws *WSTransport) tryReconnect() {
 		ws.conn = conn
 		ws.mu.Unlock()
 		log.Printf("[WS] ✅ 重连成功")
-		go ws.readLoop()
+		go ws.readLoop(conn)
 		go ws.heartbeat(20 * time.Second)
 		if ws.onMessage != nil {
 			ws.onMessage(map[string]interface{}{"type": "_reconnected"})
@@ -197,24 +203,42 @@ func (ws *WSTransport) heartbeat(interval time.Duration) {
 }
 
 func (ws *WSTransport) Send(msg map[string]interface{}) error {
-	ws.mu.Lock()
-	defer ws.mu.Unlock()
 	data, _ := json.Marshal(msg)
-	return ws.conn.WriteMessage(websocket.TextMessage, data)
+	ws.mu.Lock()
+	conn := ws.conn
+	ws.mu.Unlock()
+	if conn == nil {
+		return fmt.Errorf("WS 未连接")
+	}
+	return conn.WriteMessage(websocket.TextMessage, data)
 }
 
 func (ws *WSTransport) SendBinary(data []byte) error {
 	ws.mu.Lock()
-	defer ws.mu.Unlock()
-	return ws.conn.WriteMessage(websocket.BinaryMessage, data)
+	conn := ws.conn
+	ws.mu.Unlock()
+	if conn == nil {
+		return fmt.Errorf("WS 未连接")
+	}
+	return conn.WriteMessage(websocket.BinaryMessage, data)
 }
 
 func (ws *WSTransport) Close() error {
 	ws.reconnectMu.Lock()
+	if ws.stopping {
+		ws.reconnectMu.Unlock()
+		return nil
+	}
 	ws.stopping = true
 	close(ws.stopCh)
 	ws.reconnectMu.Unlock()
+
 	ws.mu.Lock()
-	defer ws.mu.Unlock()
-	return ws.conn.Close()
+	conn := ws.conn
+	ws.conn = nil
+	ws.mu.Unlock()
+	if conn != nil {
+		return conn.Close()
+	}
+	return nil
 }
