@@ -182,15 +182,42 @@ func ParseRoutingConfig(jsonStr string) (*RoutingConfig, error) {
 	return &cfg, nil
 }
 
+// DefaultRoutingConfig 默认路由规则
+//
+// 顺序敏感：先匹配先命中
+//   1. edge-p2p      → 10.64.0.0/24 走 n2n 组网
+//   2. local-bypass  → 私网/环回走物理网络
+//   3. default-proxy → 其他走 Workers 出口
+//
+// 未命中以上规则时，Match() 里还会按 IsChinaDomain / IsChinaIP 兜底走 direct。
+//
+// 关于 Telegram：不单独列直连规则。Telegram 直连通常需要本地网络能直连
+// Telegram DC 才行，国内运营商到 Telegram 被阻断的情况下直连必然失败。
+// 让 Telegram 走 default-proxy 经由 Workers 出口（或 TURN 中继）转发。
 func DefaultRoutingConfig() *RoutingConfig {
 	return &RoutingConfig{
 		DomainStrategy: "IPIfNonMatch",
 		Rules: []RoutingRule{
-			{Name: "edge-p2p", IP: []string{"10.64.0.0/24"}, OutboundTag: "p2p"},
-			{Name: "local-bypass",
-				IP: []string{"127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"},
-				OutboundTag: "direct"},
-			{Name: "default-proxy", OutboundTag: "proxy"},
+			{
+				Name:        "edge-p2p",
+				IP:          []string{"10.64.0.0/24"},
+				OutboundTag: "p2p",
+			},
+			{
+				Name: "local-bypass",
+				IP: []string{
+					"127.0.0.0/8",
+					"10.0.0.0/8",
+					"172.16.0.0/12",
+					"192.168.0.0/16",
+					"169.254.0.0/16",
+				},
+				OutboundTag: "direct",
+			},
+			{
+				Name:        "default-proxy",
+				OutboundTag: "proxy",
+			},
 		},
 	}
 }
