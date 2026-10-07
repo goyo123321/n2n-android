@@ -76,15 +76,42 @@ object N2nController {
         running.set(false)
     }
 
-    fun getStatus(): String = client?.status ?: "not running"
-    fun getVirtualIP(): String = client?.virtualIP ?: ""
-    fun getClientID(): String = client?.clientID ?: ""
-    fun getPeersJSON(): String = client?.peersJSON ?: "[]"
+    // ★ 所有 getter 加 try-catch：跨 JNI 调用在切后台时可能处于不一致状态，
+    //   任何未捕获异常都会导致 App 闪退
+
+    fun getStatus(): String = try {
+        client?.status ?: "not running"
+    } catch (t: Throwable) {
+        Log.e(TAG, "getStatus failed", t)
+        "not running"
+    }
+
+    fun getVirtualIP(): String = try {
+        client?.virtualIP ?: ""
+    } catch (t: Throwable) {
+        Log.e(TAG, "getVirtualIP failed", t)
+        ""
+    }
+
+    fun getClientID(): String = try {
+        client?.clientID ?: ""
+    } catch (t: Throwable) {
+        Log.e(TAG, "getClientID failed", t)
+        ""
+    }
+
+    fun getPeersJSON(): String = try {
+        client?.peersJSON ?: "[]"
+    } catch (t: Throwable) {
+        Log.e(TAG, "getPeersJSON failed", t)
+        "[]"
+    }
 
     fun getLogs(): String {
         return try {
             Mobile.getLogs() ?: ""
-        } catch (e: Exception) {
+        } catch (t: Throwable) {
+            Log.e(TAG, "getLogs failed", t)
             ""
         }
     }
@@ -92,8 +119,8 @@ object N2nController {
     fun clearLogs() {
         try {
             Mobile.clearLogs()
-        } catch (e: Exception) {
-            // ignore
+        } catch (t: Throwable) {
+            Log.e(TAG, "clearLogs failed", t)
         }
     }
 }
