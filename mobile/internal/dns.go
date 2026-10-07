@@ -47,10 +47,10 @@ type DNSProxy struct {
 	httpClientOut *http.Client
 }
 
+// 国内 DoH：只保留能硬编码 IP 的，避免解析 DoH 域名本身触发死循环
 var dohServersCN = []string{
 	"https://dns.alidns.com/dns-query",
 	"https://doh.pub/dns-query",
-	"https://dns.360.cn/dns-query",
 }
 
 var dohServersOut = []string{
@@ -60,14 +60,46 @@ var dohServersOut = []string{
 
 var dohOutIPs = []string{"1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4"}
 
+// ★ 硬编码 DoH 服务器 IP，避免 DNS 死循环
+//
+// 死循环场景：
+//   系统 DNS 指向 TUN 虚拟 IP → 查询进 netstack → DNSProxy 用 DoH
+//   → DoH 服务器域名（如 dns.alidns.com）需要解析 → 走 Go resolver
+//   → 读系统 DNS（还是 TUN 虚拟 IP）→ 又回到 netstack → 无限循环
+//
+// 解决：DialContext 里查表命中就直接连 IP，TCP 目标不是域名，Go 不会解析
+var dohHostIPs = map[string]string{
+	"dns.alidns.com": "223.5.5.5",
+	"doh.pub":        "1.12.12.12",
+}
+
 func NewDNSProxy(cache *DNSCache, getWSOutbound func() *WSOutbound) (*DNSProxy, error) {
 	protectedDialer := newProtectedDialer()
+
+	// ★ 国内 DoH：优先走硬编码 IP
+	//
+	// 说明：
+	//   - DialContext 只负责 TCP 层，把域名换成 IP，Go 就不会去解析域名
+	//   - TLSClientConfig 保持空 ServerName → Go 会自动用 URL 的 host
+	//     （dns.alidns.com 等）作为 SNI，证书验证依然通过
 	transportCN := &http.Transport{
-		DialContext:       protectedDialer.DialContext,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return protectedDialer.DialContext(ctx, network, addr)
+			}
+			// 命中映射表 → 直连硬编码 IP
+			if targetIP, ok := dohHostIPs[host]; ok {
+				return protectedDialer.DialContext(ctx, network, targetIP+":"+port)
+			}
+			// 兜底：原样走 protectedDialer（可能会尝试解析域名）
+			return protectedDialer.DialContext(ctx, network, addr)
+		},
 		TLSClientConfig:   &tls.Config{},
 		ForceAttemptHTTP2: false,
 	}
 
+	// 国外 DoH：走 Workers 出口
 	transportOut := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			wsOut := getWSOutbound()
