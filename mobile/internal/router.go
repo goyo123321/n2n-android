@@ -3,7 +3,6 @@ package internal
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
 	"strconv"
 	"strings"
@@ -41,9 +40,7 @@ type compiledRule struct {
 	domainSufs []string
 }
 
-type portRange struct {
-	lo, hi int
-}
+type portRange struct{ lo, hi int }
 
 type Router struct {
 	mu    sync.RWMutex
@@ -66,12 +63,7 @@ func NewRouter(cfg *RoutingConfig) (*Router, error) {
 }
 
 func compileRule(raw RoutingRule) (*compiledRule, error) {
-	c := &compiledRule{
-		name:      raw.Name,
-		action:    RouteAction(raw.OutboundTag),
-		domainSet: make(map[string]bool),
-	}
-
+	c := &compiledRule{name: raw.Name, action: RouteAction(raw.OutboundTag), domainSet: make(map[string]bool)}
 	for _, cidr := range raw.IP {
 		_, n, err := net.ParseCIDR(cidr)
 		if err != nil {
@@ -89,7 +81,6 @@ func compileRule(raw RoutingRule) (*compiledRule, error) {
 			c.cidrs = append(c.cidrs, n)
 		}
 	}
-
 	if raw.Port != "" {
 		for _, p := range strings.Split(raw.Port, ",") {
 			p = strings.TrimSpace(p)
@@ -108,33 +99,34 @@ func compileRule(raw RoutingRule) (*compiledRule, error) {
 			}
 		}
 	}
-
 	for _, d := range raw.Domain {
 		if strings.HasPrefix(d, "domain:") {
 			val := strings.TrimPrefix(d, "domain:")
 			c.domainSet[val] = true
 			c.domainSufs = append(c.domainSufs, "."+val)
-		} else if strings.HasPrefix(d, "geosite:") {
-			log.Printf("[Router] 忽略 geosite: %s", d)
 		} else {
 			c.domainSet[d] = true
 			c.domainSufs = append(c.domainSufs, "."+d)
 		}
 	}
-
 	return c, nil
 }
 
 func (r *Router) Match(dstIP string, dstPort int, domain string) (RouteAction, string) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-
 	ip := net.ParseIP(dstIP)
 
 	for _, rule := range r.rules {
 		if rule.matches(ip, dstPort, domain) {
 			return rule.action, rule.name
 		}
+	}
+	if domain != "" && IsChinaDomain(domain) {
+		return ActionDirect, "geosite:cn"
+	}
+	if ip != nil && IsChinaIP(dstIP) {
+		return ActionDirect, "geoip:cn"
 	}
 	return ActionProxy, "default"
 }
@@ -152,7 +144,6 @@ func (c *compiledRule) matches(ip net.IP, port int, domain string) bool {
 			return false
 		}
 	}
-
 	if len(c.ports) > 0 {
 		hit := false
 		for _, pr := range c.ports {
@@ -165,7 +156,6 @@ func (c *compiledRule) matches(ip net.IP, port int, domain string) bool {
 			return false
 		}
 	}
-
 	if len(c.domainSet) > 0 || len(c.domainSufs) > 0 {
 		if domain == "" {
 			return false
@@ -181,7 +171,6 @@ func (c *compiledRule) matches(ip net.IP, port int, domain string) bool {
 		}
 		return false
 	}
-
 	return true
 }
 
@@ -197,20 +186,11 @@ func DefaultRoutingConfig() *RoutingConfig {
 	return &RoutingConfig{
 		DomainStrategy: "IPIfNonMatch",
 		Rules: []RoutingRule{
-			{
-				Name:        "edge-p2p",
-				IP:          []string{"10.64.0.0/24"},
-				OutboundTag: "p2p",
-			},
-			{
-				Name:        "local-bypass",
-				IP:          []string{"127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"},
-				OutboundTag: "direct",
-			},
-			{
-				Name:        "default-proxy",
-				OutboundTag: "proxy",
-			},
+			{Name: "edge-p2p", IP: []string{"10.64.0.0/24"}, OutboundTag: "p2p"},
+			{Name: "local-bypass",
+				IP: []string{"127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"},
+				OutboundTag: "direct"},
+			{Name: "default-proxy", OutboundTag: "proxy"},
 		},
 	}
 }
