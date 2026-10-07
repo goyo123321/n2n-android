@@ -169,7 +169,6 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		file := os.NewFile(uintptr(udpFd), "protected-udp")
 		if file != nil {
 			pc, err := net.FilePacketConn(file)
-			// FilePacketConn 会 dup fd，无论成败都要关掉原 file
 			_ = file.Close()
 			if err == nil {
 				udpConn = pc
@@ -633,6 +632,9 @@ func (e *Edge) reportMetadata() {
 	ws := e.ws
 	e.mu.Unlock()
 
+	// ★ 读取网卡信息（LAN IP / 网关），供服务端 LAN 直连判断
+	netInfo := getNetInfo()
+
 	metaPayload := map[string]interface{}{
 		"natType":            nm.NATType,
 		"portsDifference":    nm.PortsDifference,
@@ -641,13 +643,17 @@ func (e *Edge) reportMetadata() {
 		"assistedSockets":    nm.AssistedSockets,
 		"sharePort":          9090,
 		"p2pEndpoint":        nm.P2PEndpoint,
+		// ★ LAN 直连必需字段（服务端 p2p_metadata 分支读取）
+		"lanIp":     netInfo.LANIP,
+		"gatewayIp": netInfo.GatewayIP,
+		"udpPort":   e.udpPort,
 	}
 	if nm.PublicEndpoint != "" {
 		metaPayload["publicEndpoint"] = nm.PublicEndpoint
 	}
 
-	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%s p2pEndpoint=%s sharePort=9090",
-		nm.NATType, nm.PublicEndpoint, nm.P2PEndpoint)
+	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%s p2pEndpoint=%s lan=%s gw=%s udp=%d",
+		nm.NATType, nm.PublicEndpoint, nm.P2PEndpoint, netInfo.LANIP, netInfo.GatewayIP, e.udpPort)
 
 	if ws == nil {
 		return
@@ -840,11 +846,6 @@ func (e *Edge) tunWriteLoop() {
 }
 
 // netstackReadLoop 阻塞等待 netstack 出包，通过 ctx 感知 Edge 停止。
-//
-// ctx 与 e.doneCh 关联：Edge.Stop 时 doneCh 关闭 → ctx 取消 →
-// ReadTUNPacketContext 返回 nil → 循环退出。
-//
-// CPU 占用从原来 1ms 轮询的 ~5% 降到空闲时基本为 0。
 func (e *Edge) netstackReadLoop(ns *NetstackHost) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
