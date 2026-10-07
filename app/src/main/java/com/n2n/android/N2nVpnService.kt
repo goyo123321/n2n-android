@@ -51,7 +51,7 @@ class N2nVpnService : VpnService() {
     private var protectedUdpSocket: DatagramSocket? = null
     private var protectedStunSocket: DatagramSocket? = null
 
-    // ★ Protector 是 gomobile 生成的 Kotlin interface，无构造函数
+    // Protector 是 gomobile 生成的 Kotlin interface，无构造函数
     inner class ServiceProtector : Protector {
         override fun protect(fd: Long): Boolean {
             return try {
@@ -326,7 +326,6 @@ class N2nVpnService : VpnService() {
     // ============================================================
     // TUN：接管 0.0.0.0/0 + 下发 DNS 指向虚拟 IP
     // 完全靠 socket protect 保证信令 / TURN / WSOut 不绕 TUN
-    // 不用 excludeRoute（设备兼容性差）
     // ============================================================
     private fun buildTunInterface(vip: String): ParcelFileDescriptor? {
         return try {
@@ -338,7 +337,7 @@ class N2nVpnService : VpnService() {
                 .addAddress(vip, 24)
                 .addRoute("10.64.0.0", 24)
                 .addRoute("0.0.0.0", 0)
-                .addDnsServer(vip)   // ★ 系统 DNS 查询发到虚拟 IP → netstack 处理
+                .addDnsServer(vip)   // ★ 系统 DNS 指向虚拟 IP → netstack 处理
 
             ktLog("TUN 接管 0.0.0.0/0，DNS 指向 $vip，信令/TURN/WSOut 靠 socket protect 走物理网络")
 
