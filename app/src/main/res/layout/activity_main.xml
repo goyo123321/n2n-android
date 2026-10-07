@@ -142,20 +142,20 @@
                             android:textSize="13sp" />
                     </com.google.android.material.textfield.TextInputLayout>
 
+                    <!-- ★ 组网密钥 UUID（原「连接密码」） -->
                     <com.google.android.material.textfield.TextInputLayout
                         style="@style/Widget.N2n.TextInputLayout"
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:layout_marginTop="12dp"
-                        android:hint="@string/hint_token"
-                        app:boxBackgroundColor="@color/brand_bg"
-                        app:endIconMode="password_toggle">
+                        android:hint="@string/hint_uuid"
+                        app:boxBackgroundColor="@color/brand_bg">
                         <com.google.android.material.textfield.TextInputEditText
-                            android:id="@+id/etConnectToken"
+                            android:id="@+id/etUuid"
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
                             android:fontFamily="monospace"
-                            android:inputType="textPassword"
+                            android:inputType="text"
                             android:maxLines="1"
                             android:textColor="@color/brand_text"
                             android:textSize="13sp" />
