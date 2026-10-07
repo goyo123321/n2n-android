@@ -9,7 +9,7 @@ permissions:
 jobs:
   update:
     runs-on: ubuntu-latest
-    name: Download and compress geo data
+    name: Download geo dat files
 
     steps:
       - name: Checkout
@@ -20,72 +20,33 @@ jobs:
       - name: Create data directory
         run: mkdir -p mobile/internal/data
 
-      - name: Download & gzip geoip
+      - name: Download geoip.dat (renamed to geoip_cn.dat)
         run: |
-          TMP=/tmp/geoip_cn.txt
-          OUT=mobile/internal/data/geoip_cn.txt.gz
+          URL="https://github.com/v2fly/geoip/releases/latest/download/geoip.dat"
+          OUT="mobile/internal/data/geoip_cn.dat"
+          echo "下载: $URL"
+          curl -fsSL --retry 3 --retry-delay 5 "$URL" -o "$OUT"
+          SIZE=$(du -h "$OUT" | cut -f1)
+          echo "大小: $SIZE"
+          [ -s "$OUT" ] || { echo "❌ geoip.dat 为空"; exit 1; }
 
-          URLS=(
-            "https://cdn.jsdelivr.net/gh/Loyalsoldier/geoip@release/text/cn.txt"
-            "https://raw.githubusercontent.com/Loyalsoldier/geoip/release/text/cn.txt"
-          )
-
-          OK=0
-          for URL in "${URLS[@]}"; do
-            echo "尝试: $URL"
-            if curl -fsSL --retry 3 --retry-delay 5 "$URL" -o "$TMP"; then
-              LINES=$(wc -l < "$TMP")
-              echo "行数: $LINES"
-              if [ "$LINES" -ge 1000 ]; then
-                OK=1
-                break
-              fi
-            fi
-          done
-
-          [ "$OK" -eq 1 ] || { echo "❌ geoip 下载失败"; exit 1; }
-
-          gzip -9 -c "$TMP" > "$OUT"
-          echo "原始: $(du -h "$TMP" | cut -f1)"
-          echo "压缩: $(du -h "$OUT" | cut -f1)"
-
-      - name: Download & gzip geosite
+      - name: Download dlc.dat
         run: |
-          TMP=/tmp/geosite_cn.txt
-          OUT=mobile/internal/data/geosite_cn.txt.gz
-
-          URLS=(
-            "https://cdn.jsdelivr.net/gh/v2fly/domain-list-community@master/data/cn"
-            "https://raw.githubusercontent.com/v2fly/domain-list-community/master/data/cn"
-            "https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geosite-cn.txt"
-          )
-
-          OK=0
-          for URL in "${URLS[@]}"; do
-            echo "尝试: $URL"
-            if curl -fsSL --retry 3 --retry-delay 5 "$URL" -o "$TMP"; then
-              LINES=$(wc -l < "$TMP")
-              echo "行数: $LINES"
-              if [ "$LINES" -ge 1000 ]; then
-                OK=1
-                break
-              fi
-            fi
-          done
-
-          [ "$OK" -eq 1 ] || { echo "❌ geosite 下载失败"; exit 1; }
-
-          gzip -9 -c "$TMP" > "$OUT"
-          echo "原始: $(du -h "$TMP" | cut -f1)"
-          echo "压缩: $(du -h "$OUT" | cut -f1)"
+          URL="https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat"
+          OUT="mobile/internal/data/dlc.dat"
+          echo "下载: $URL"
+          curl -fsSL --retry 3 --retry-delay 5 "$URL" -o "$OUT"
+          SIZE=$(du -h "$OUT" | cut -f1)
+          echo "大小: $SIZE"
+          [ -s "$OUT" ] || { echo "❌ dlc.dat 为空"; exit 1; }
 
       - name: Verify
         run: |
           ls -la mobile/internal/data/
-          echo "--- geoip 解压后前 3 行 ---"
-          zcat mobile/internal/data/geoip_cn.txt.gz | head -3
-          echo "--- geosite 解压后前 3 行 ---"
-          zcat mobile/internal/data/geosite_cn.txt.gz | head -3
+          echo "--- geoip.dat 头 16 字节 ---"
+          xxd mobile/internal/data/geoip_cn.dat | head -1
+          echo "--- dlc.dat 头 16 字节 ---"
+          xxd mobile/internal/data/dlc.dat | head -1
 
       - name: Check for changes
         id: diff
@@ -103,5 +64,5 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           DATE=$(date -u +%Y-%m-%d)
           git add mobile/internal/data/
-          git commit -m "chore: update geoip/geosite data ($DATE)"
+          git commit -m "chore: update geo dat files ($DATE)"
           git push
