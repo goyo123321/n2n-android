@@ -9,107 +9,91 @@ permissions:
 jobs:
   update:
     runs-on: ubuntu-latest
-    name: Download geo data
+    name: Download and compress geo data
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Show current branch
-        run: |
-          echo "GITHUB_REF: $GITHUB_REF"
-          echo "GITHUB_REF_NAME: $GITHUB_REF_NAME"
-          echo "Current branch: $(git branch --show-current)"
 
       - name: Create data directory
+        run: mkdir -p mobile/internal/data
+
+      - name: Download & gzip geoip
         run: |
-          mkdir -p mobile/internal/data
-          ls -la mobile/internal/
-
-      - name: Download geoip_cn.txt
-        run: |
-          OUTPUT="mobile/internal/data/geoip_cn.txt"
-          URL="https://raw.githubusercontent.com/Loyalsoldier/geoip/release/text/cn.txt"
-
-          echo "下载: $URL"
-          curl -fsSL --retry 3 --retry-delay 5 "$URL" -o "$OUTPUT"
-          echo "退出码: $?"
-
-          LINES=$(wc -l < "$OUTPUT")
-          SIZE=$(du -h "$OUTPUT" | cut -f1)
-          echo "行数: $LINES，大小: $SIZE"
-          echo "首行: $(head -1 "$OUTPUT")"
-
-          if [ "$LINES" -lt 1000 ]; then
-            echo "❌ geoip 行数不足"
-            echo "--- 文件内容前 10 行 ---"
-            head -10 "$OUTPUT"
-            exit 1
-          fi
-
-      - name: Download geosite_cn.txt
-        run: |
-          OUTPUT="mobile/internal/data/geosite_cn.txt"
+          TMP=/tmp/geoip_cn.txt
+          OUT=mobile/internal/data/geoip_cn.txt.gz
 
           URLS=(
-            "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/geosite-cn.txt"
-            "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/geosite-cn"
-            "https://raw.githubusercontent.com/v2fly/domain-list-community/release/cn"
+            "https://cdn.jsdelivr.net/gh/Loyalsoldier/geoip@release/text/cn.txt"
+            "https://raw.githubusercontent.com/Loyalsoldier/geoip/release/text/cn.txt"
           )
 
-          SUCCESS=0
+          OK=0
           for URL in "${URLS[@]}"; do
-            echo "=========================================="
             echo "尝试: $URL"
-
-            if curl -fsSL --retry 2 --retry-delay 3 "$URL" -o "$OUTPUT" 2>&1; then
-              LINES=$(wc -l < "$OUTPUT")
-              SIZE=$(du -h "$OUTPUT" | cut -f1)
-              echo "行数: $LINES，大小: $SIZE"
-              echo "首行: $(head -1 "$OUTPUT")"
-
+            if curl -fsSL --retry 3 --retry-delay 5 "$URL" -o "$TMP"; then
+              LINES=$(wc -l < "$TMP")
+              echo "行数: $LINES"
               if [ "$LINES" -ge 1000 ]; then
-                echo "✅ 成功"
-                SUCCESS=1
+                OK=1
                 break
-              else
-                echo "❌ 行数太少，继续"
               fi
-            else
-              echo "❌ curl 失败"
             fi
           done
 
-          if [ "$SUCCESS" -eq 0 ]; then
-            echo "=========================================="
-            echo "❌ 所有 URL 都失败"
-            echo "--- 最后一次文件内容前 10 行 ---"
-            head -10 "$OUTPUT"
-            exit 1
-          fi
+          [ "$OK" -eq 1 ] || { echo "❌ geoip 下载失败"; exit 1; }
 
-      - name: Verify files
+          gzip -9 -c "$TMP" > "$OUT"
+          echo "原始: $(du -h "$TMP" | cut -f1)"
+          echo "压缩: $(du -h "$OUT" | cut -f1)"
+
+      - name: Download & gzip geosite
+        run: |
+          TMP=/tmp/geosite_cn.txt
+          OUT=mobile/internal/data/geosite_cn.txt.gz
+
+          URLS=(
+            "https://cdn.jsdelivr.net/gh/v2fly/domain-list-community@master/data/cn"
+            "https://raw.githubusercontent.com/v2fly/domain-list-community/master/data/cn"
+            "https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geosite-cn.txt"
+          )
+
+          OK=0
+          for URL in "${URLS[@]}"; do
+            echo "尝试: $URL"
+            if curl -fsSL --retry 3 --retry-delay 5 "$URL" -o "$TMP"; then
+              LINES=$(wc -l < "$TMP")
+              echo "行数: $LINES"
+              if [ "$LINES" -ge 1000 ]; then
+                OK=1
+                break
+              fi
+            fi
+          done
+
+          [ "$OK" -eq 1 ] || { echo "❌ geosite 下载失败"; exit 1; }
+
+          gzip -9 -c "$TMP" > "$OUT"
+          echo "原始: $(du -h "$TMP" | cut -f1)"
+          echo "压缩: $(du -h "$OUT" | cut -f1)"
+
+      - name: Verify
         run: |
           ls -la mobile/internal/data/
-          echo "--- geoip 前 3 行 ---"
-          head -3 mobile/internal/data/geoip_cn.txt
-          echo "--- geosite 前 3 行 ---"
-          head -3 mobile/internal/data/geosite_cn.txt
+          echo "--- geoip 解压后前 3 行 ---"
+          zcat mobile/internal/data/geoip_cn.txt.gz | head -3
+          echo "--- geosite 解压后前 3 行 ---"
+          zcat mobile/internal/data/geosite_cn.txt.gz | head -3
 
       - name: Check for changes
         id: diff
         run: |
-          git status
           if git diff --quiet mobile/internal/data/; then
             echo "changed=false" >> $GITHUB_OUTPUT
-            echo "无变化"
           else
             echo "changed=true" >> $GITHUB_OUTPUT
-            echo "有变化"
-            git diff --stat mobile/internal/data/
           fi
 
       - name: Commit and push
@@ -117,23 +101,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           DATE=$(date -u +%Y-%m-%d)
           git add mobile/internal/data/
           git commit -m "chore: update geoip/geosite data ($DATE)"
-
-          echo "--- 即将 push ---"
-          git log -1 --stat
-          git push origin HEAD:${{ github.ref_name }}
-
-      - name: Summary
-        if: always()
-        run: |
-          echo "## GeoIP/GeoSite 更新结果" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| 文件 | 行数 | 大小 |" >> $GITHUB_STEP_SUMMARY
-          echo "|:---|:---|:---|" >> $GITHUB_STEP_SUMMARY
-          echo "| geoip_cn.txt | $(wc -l < mobile/internal/data/geoip_cn.txt 2>/dev/null || echo 0) | $(du -h mobile/internal/data/geoip_cn.txt 2>/dev/null | cut -f1 || echo 0) |" >> $GITHUB_STEP_SUMMARY
-          echo "| geosite_cn.txt | $(wc -l < mobile/internal/data/geosite_cn.txt 2>/dev/null || echo 0) | $(du -h mobile/internal/data/geosite_cn.txt 2>/dev/null | cut -f1 || echo 0) |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "变化: ${{ steps.diff.outputs.changed }}" >> $GITHUB_STEP_SUMMARY
+          git push
