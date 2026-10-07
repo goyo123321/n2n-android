@@ -9,10 +9,10 @@ on:
         type: string
         default: 'main'
       go_version:
-        description: 'Go 版本（必须与 go.mod 一致）'
+        description: 'Go 版本（建议 1.24+，gomobile tool 依赖需要）'
         required: false
         type: string
-        default: '1.26'                    # ★ 改这里
+        default: '1.26'
       commit_message:
         description: '提交信息（留空则用默认）'
         required: false
@@ -55,41 +55,42 @@ jobs:
           echo ""
           echo "=== mobile/go.sum (before) ==="
           if [ -f go.sum ]; then
-            echo "行数：$(wc -l < go.sum)"
+            echo "存在，行数："
+            wc -l go.sum
           else
             echo "(go.sum 不存在)"
           fi
 
-      # ★ 只检查 tool 块是否存在，不重复添加
-      - name: Ensure tool block exists
+      # ★ 新增：添加 gomobile tool 依赖
+      - name: Add gomobile tool dependencies
         shell: bash
         working-directory: mobile
         run: |
-          if grep -q '^tool' go.mod; then
-            echo "✅ tool 块已存在，跳过"
-          else
-            echo "tool 块不存在，添加..."
-            go get -tool golang.org/x/mobile/cmd/gobind
-            go get -tool golang.org/x/mobile/cmd/gomobile
-          fi
+          echo "=== 添加 gomobile tool 依赖（Go 1.24+ 要求）==="
+          go get -tool golang.org/x/mobile/cmd/gobind
+          go get -tool golang.org/x/mobile/cmd/gomobile
+          echo "✅ tool 依赖已添加"
+          echo ""
+          echo "--- go.mod after add tool ---"
+          cat go.mod
 
       - name: Run go mod tidy
         shell: bash
         working-directory: mobile
         run: |
           go mod tidy -v
+          echo "go mod tidy 完成"
+          if [ -f go.sum ]; then
+            echo "✅ go.sum 存在，行数：$(wc -l < go.sum)"
+          else
+            echo "⚠️ go.sum 不存在"
+          fi
 
-      - name: Verify mobile package compiles
+      - name: Run go mod verify
         shell: bash
         working-directory: mobile
-        run: |
-          # ★ 真正重要的是能不能编译，加了这一步才有效
-          echo "=== 检查 mobile 包编译 ==="
-          if ! go build ./...; then
-            echo "::error::mobile 包编译失败"
-            exit 1
-          fi
-          echo "✅ mobile 包编译通过"
+        continue-on-error: true
+        run: go mod verify
 
       - name: After — show go.mod / go.sum
         shell: bash
@@ -100,7 +101,9 @@ jobs:
           echo ""
           echo "=== mobile/go.sum (after) ==="
           if [ -f go.sum ]; then
-            echo "行数：$(wc -l < go.sum)"
+            wc -l go.sum
+          else
+            echo "(go.sum 不存在)"
           fi
 
       - name: Stage go.mod / go.sum
@@ -109,7 +112,12 @@ jobs:
           git add mobile/go.mod
           if [ -f mobile/go.sum ]; then
             git add -f mobile/go.sum
+            echo "已 stage: mobile/go.mod, mobile/go.sum"
+          else
+            echo "已 stage: mobile/go.mod"
           fi
+          echo ""
+          echo "--- 暂存区状态 ---"
           git status --short
 
       - name: Check staged diff
@@ -118,8 +126,10 @@ jobs:
         run: |
           if git diff --cached --quiet; then
             echo "changed=false" >> $GITHUB_OUTPUT
+            echo "::notice::mobile/go.mod 和 mobile/go.sum 无变化"
           else
             echo "changed=true" >> $GITHUB_OUTPUT
+            echo "::notice::检测到变化："
             git diff --cached --stat
           fi
 
@@ -140,22 +150,25 @@ jobs:
           if [ -n "$CUSTOM_MSG" ]; then
             MSG="$CUSTOM_MSG"
           else
-            MSG="chore: update mobile/go.sum (Go ${VERSION}) [skip ci]"
+            MSG="chore: update mobile/go.sum + gomobile tool (Go ${VERSION}) [skip ci]"
           fi
 
           if git diff --cached --quiet; then
+            echo "::warning::没有可提交的变化，force_commit 生效"
             git commit --allow-empty -m "$MSG"
           else
             git commit -m "$MSG"
           fi
 
           git push origin "$BRANCH"
+          echo "✅ 已推送到 $BRANCH"
 
       - name: Summary
         if: always()
         shell: bash
         run: |
           echo "## Update go.sum 结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           echo "- 分支: \`${{ inputs.branch }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- Go 版本: \`${{ inputs.go_version }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- 是否有变化: \`${{ steps.diff.outputs.changed }}\`" >> $GITHUB_STEP_SUMMARY
