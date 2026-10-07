@@ -16,7 +16,7 @@ type Config struct {
 	RoomID        string
 	ClientID      string
 	NodeName      string
-	ConnectToken  string
+	UUID          string // ★ 组网密钥
 	ShareDir      string
 	PreferredIP   string
 	PreferredPort int
@@ -59,7 +59,6 @@ func (c *Client) SetStunFD(fd int) {
 	c.stunFd = fd
 }
 
-// SetProtector 由 Kotlin 侧调用，传入 VpnService.protect 包装
 func (c *Client) SetProtector(p Protector) {
 	c.mu.Lock()
 	c.protector = p
@@ -86,7 +85,7 @@ func (c *Client) FetchVirtualIP(cfg *Config) (result string) {
 	icfg := &internal.Config{
 		SignalingURL: cfg.SignalingURL, RoomID: cfg.RoomID,
 		ClientID: cfg.ClientID, NodeName: cfg.NodeName,
-		ConnectToken: cfg.ConnectToken, ShareDir: cfg.ShareDir,
+		UUID: cfg.UUID, ShareDir: cfg.ShareDir,
 		PreferredIP: cfg.PreferredIP, PreferredPort: cfg.PreferredPort,
 	}
 	return internal.FetchVirtualIP(icfg)
@@ -117,7 +116,7 @@ func (c *Client) Start(cfg *Config) (errMsg string) {
 	icfg := &internal.Config{
 		SignalingURL: cfg.SignalingURL, RoomID: cfg.RoomID,
 		ClientID: cfg.ClientID, NodeName: cfg.NodeName,
-		ConnectToken: cfg.ConnectToken, ShareDir: cfg.ShareDir,
+		UUID: cfg.UUID, ShareDir: cfg.ShareDir,
 		PreferredIP: cfg.PreferredIP, PreferredPort: cfg.PreferredPort,
 	}
 
