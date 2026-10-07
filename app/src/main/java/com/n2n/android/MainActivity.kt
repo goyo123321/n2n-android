@@ -25,7 +25,6 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
 
-    // ★ 缓存上一次 peers JSON，避免每 3 秒全量重建 View
     private var lastPeersJson: String = ""
 
     private val peersTicker = object : Runnable {
@@ -54,6 +53,9 @@ class MainActivity : AppCompatActivity() {
     ) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // 老用户迁移：connect_token → uuid
+        Prefs.migrateLegacy(this)
+
         applyThemeMode(Prefs.loadThemeMode(this))
         super.onCreate(savedInstanceState)
 
@@ -90,7 +92,6 @@ class MainActivity : AppCompatActivity() {
             saveCurrentInput()
             toast("已保存")
         }
-        // 原「选择目录」按钮改成交互说明弹窗（Go 侧只支持默认目录）
         binding.btnPickDir.setOnClickListener { showShareDirInfo() }
         binding.btnManageFiles.setOnClickListener {
             startActivity(Intent(this, FileManagerActivity::class.java))
@@ -131,7 +132,7 @@ class MainActivity : AppCompatActivity() {
         outState.putString("roomId", binding.etRoomId.text.toString())
         outState.putString("clientId", binding.etClientId.text.toString())
         outState.putString("nodeName", binding.etNodeName.text.toString())
-        outState.putString("connectToken", binding.etConnectToken.text.toString())
+        outState.putString("uuid", binding.etUuid.text.toString())
     }
 
     private fun formatHost(host: String): String {
@@ -258,7 +259,7 @@ class MainActivity : AppCompatActivity() {
             binding.etRoomId.setText(savedInstanceState.getString("roomId", ""))
             binding.etClientId.setText(savedInstanceState.getString("clientId", ""))
             binding.etNodeName.setText(savedInstanceState.getString("nodeName", ""))
-            binding.etConnectToken.setText(savedInstanceState.getString("connectToken", ""))
+            binding.etUuid.setText(savedInstanceState.getString("uuid", ""))
             return
         }
         val cfg = Prefs.load(this)
@@ -267,12 +268,13 @@ class MainActivity : AppCompatActivity() {
         binding.etRoomId.setText(cfg.roomId)
         binding.etClientId.setText(cfg.clientId)
         binding.etNodeName.setText(cfg.nodeName)
-        binding.etConnectToken.setText(cfg.connectToken)
+        binding.etUuid.setText(cfg.uuid)
     }
 
     private fun handleIntentParams(intent: Intent?) {
         intent ?: return
 
+        // 深链：n2n://connect?url=...&uuid=...&room=...&auto=1
         if (intent.action == Intent.ACTION_VIEW && intent.data != null) {
             val data = intent.data!!
             if (data.scheme == "n2n" && data.host == "connect") {
@@ -281,7 +283,12 @@ class MainActivity : AppCompatActivity() {
                 data.getQueryParameter("room")?.let { binding.etRoomId.setText(it) }
                 data.getQueryParameter("cid")?.let { binding.etClientId.setText(it) }
                 data.getQueryParameter("name")?.let { binding.etNodeName.setText(it) }
-                data.getQueryParameter("token")?.let { binding.etConnectToken.setText(it) }
+
+                // ★ 优先读 uuid，兼容旧 token
+                val uuid = data.getQueryParameter("uuid")
+                    ?: data.getQueryParameter("token")
+                uuid?.let { binding.etUuid.setText(it) }
+
                 saveCurrentInput()
                 if (data.getQueryParameter("auto") == "1") {
                     binding.root.postDelayed({ requestVpnPermission() }, 300)
@@ -290,12 +297,13 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // Intent extra
         val url = intent.getStringExtra(N2nVpnService.EXTRA_SIGNALING_URL)
         val ip = intent.getStringExtra("preferred_ip")
         val room = intent.getStringExtra(N2nVpnService.EXTRA_ROOM_ID)
         val cid = intent.getStringExtra(N2nVpnService.EXTRA_CLIENT_ID)
         val name = intent.getStringExtra(N2nVpnService.EXTRA_NODE_NAME)
-        val token = intent.getStringExtra(N2nVpnService.EXTRA_CONNECT_TOKEN)
+        val uuid = intent.getStringExtra(N2nVpnService.EXTRA_UUID)
 
         var changed = false
         if (!url.isNullOrEmpty()) { binding.etSignalingUrl.setText(url); changed = true }
@@ -303,7 +311,7 @@ class MainActivity : AppCompatActivity() {
         if (!room.isNullOrEmpty()) { binding.etRoomId.setText(room); changed = true }
         if (!cid.isNullOrEmpty()) { binding.etClientId.setText(cid); changed = true }
         if (!name.isNullOrEmpty()) { binding.etNodeName.setText(name); changed = true }
-        if (!token.isNullOrEmpty()) { binding.etConnectToken.setText(token); changed = true }
+        if (!uuid.isNullOrEmpty()) { binding.etUuid.setText(uuid); changed = true }
 
         if (changed) {
             saveCurrentInput()
@@ -323,7 +331,7 @@ class MainActivity : AppCompatActivity() {
             roomId = binding.etRoomId.text.toString().trim(),
             clientId = binding.etClientId.text.toString().trim(),
             nodeName = binding.etNodeName.text.toString().trim(),
-            connectToken = binding.etConnectToken.text.toString().trim(),
+            uuid = binding.etUuid.text.toString().trim(),
         ))
         Prefs.savePreferredIp(this, binding.etPreferredIp.text.toString().trim())
     }
@@ -356,6 +364,14 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        // ★ UUID 校验（允许留空用默认值）
+        val uuid = binding.etUuid.text.toString().trim()
+        if (uuid.isNotEmpty() && !isValidUuid(uuid)) {
+            toast(getString(R.string.uuid_invalid))
+            binding.etUuid.requestFocus()
+            return
+        }
+
         val intent = VpnService.prepare(this)
         if (intent != null) {
             vpnPermissionLauncher.launch(intent)
@@ -364,9 +380,17 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ★ 校验 UUID：允许 8-4-4-4-12 带横线格式，也允许 32 位连续 hex
+    private fun isValidUuid(s: String): Boolean {
+        val hex = s.replace("-", "")
+        if (hex.length != 32) return false
+        return hex.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }
+    }
+
     private fun startVpnService() {
         val shareDir = ShareDirManager.getDefaultShareDir(this).absolutePath
         val preferredIp = binding.etPreferredIp.text.toString().trim()
+        val uuid = binding.etUuid.text.toString().trim().ifEmpty { Prefs.DEFAULT_UUID }
 
         val intent = Intent(this, N2nVpnService::class.java).apply {
             action = N2nVpnService.ACTION_START
@@ -375,7 +399,7 @@ class MainActivity : AppCompatActivity() {
             putExtra(N2nVpnService.EXTRA_ROOM_ID, binding.etRoomId.text.toString().trim())
             putExtra(N2nVpnService.EXTRA_CLIENT_ID, binding.etClientId.text.toString().trim())
             putExtra(N2nVpnService.EXTRA_NODE_NAME, binding.etNodeName.text.toString().trim())
-            putExtra(N2nVpnService.EXTRA_CONNECT_TOKEN, binding.etConnectToken.text.toString().trim())
+            putExtra(N2nVpnService.EXTRA_UUID, uuid)
             putExtra(N2nVpnService.EXTRA_SHARE_DIR, shareDir)
         }
         startForegroundService(intent)
@@ -441,7 +465,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ★ peers 状态未变化时跳过重建；数量一致时原地更新，数量变化时才重建
     private fun refreshPeers() {
         if (!N2nController.isRunning()) {
             lastPeersJson = ""
@@ -452,8 +475,6 @@ class MainActivity : AppCompatActivity() {
         }
 
         val json = N2nController.getPeersJSON()
-
-        // 状态未变化 → 直接跳过，不重建 View
         if (json == lastPeersJson) return
         lastPeersJson = json
 
@@ -471,7 +492,6 @@ class MainActivity : AppCompatActivity() {
         val inflater = LayoutInflater.from(this)
         val existing = binding.peersContainer.childCount
 
-        // 数量一致时原地更新，不重建 View
         if (existing == peers.length()) {
             for (i in 0 until peers.length()) {
                 val p = peers.getJSONObject(i)
@@ -496,7 +516,6 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // 数量不同（peer 上线/下线）→ 重建（这种情况不频繁）
         binding.peersContainer.removeAllViews()
         for (i in 0 until peers.length()) {
             val p = peers.getJSONObject(i)
