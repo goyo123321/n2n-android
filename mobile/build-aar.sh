@@ -38,15 +38,28 @@ OUTPUT_DIR="$PROJECT_ROOT/app/libs"
 OUTPUT_AAR="$OUTPUT_DIR/n2nclient.aar"
 
 # ============================================================
-# 1. 检查 Go
+# 1. 检查 Go + 版本校验
 # ============================================================
 if ! command -v go >/dev/null 2>&1; then
     err "未找到 go 命令。请先安装 Go 1.21+"
     echo "  https://go.dev/dl/"
     exit 1
 fi
-GO_VERSION=$(go version | awk '{print $3}')
-log "Go 版本: $GO_VERSION"
+
+GO_VERSION_RAW=$(go version | awk '{print $3}')     # 形如 go1.22.5
+GO_VERSION="${GO_VERSION_RAW#go}"                    # 去掉前缀 → 1.22.5
+log "Go 版本: $GO_VERSION_RAW"
+
+# 只取 major.minor 比较
+GO_MAJOR_MINOR=$(echo "$GO_VERSION" | cut -d. -f1,2)
+REQUIRED="1.21"
+
+# 用 sort -V 判断版本大小
+if [ "$(printf '%s\n' "$REQUIRED" "$GO_MAJOR_MINOR" | sort -V | head -n1)" != "$REQUIRED" ]; then
+    err "Go 版本过低: $GO_VERSION_RAW（需要 go$REQUIRED+）"
+    exit 1
+fi
+ok "Go 版本满足要求 (>= $REQUIRED)"
 
 # ============================================================
 # 2. 检查 / 安装 gomobile
@@ -105,18 +118,21 @@ go mod tidy
 ok "依赖整理完成"
 
 # ============================================================
-# 5. gomobile init（首次或 NDK 变更后需要）
+# 5. gomobile init
 # ============================================================
-# 检测是否需要 init：如果 gomobile 缓存不存在，则执行
-GOMOBILE_CACHE="${GOPATH:-$HOME/go}/pkg/gomobile"
-if [ ! -d "$GOMOBILE_CACHE" ]; then
-    log "首次使用，执行 gomobile init（可能需要几分钟）..."
-    gomobile init
-    ok "gomobile 初始化完成"
-else
-    log "gomobile 已初始化（跳过 init）"
-    log "  如需强制重新初始化，删除: $GOMOBILE_CACHE"
+# 无条件执行：已初始化时 gomobile 会秒退，不浪费时间。
+# 有条件跳过反而容易踩到"缓存目录存在但实际损坏"的情况。
+log "执行 gomobile init（已初始化时秒退）..."
+if ! gomobile init; then
+    err "gomobile init 失败"
+    echo ""
+    echo "常见原因："
+    echo "  1. NDK 路径不对：$ANDROID_NDK_HOME"
+    echo "  2. Go 版本过低：需要 go1.21+"
+    echo "  3. 网络问题：下载 gomobile 依赖失败"
+    exit 1
 fi
+ok "gomobile init 完成"
 
 # ============================================================
 # 6. 构建 AAR
