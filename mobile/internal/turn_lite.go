@@ -14,8 +14,6 @@ import (
 	"time"
 )
 
-// ============ STUN 常量 ============
-
 const stunMagicCookie = 0x2112A442
 
 const (
@@ -54,8 +52,6 @@ const (
 	turnRequestTimeout  = 5 * time.Second
 )
 
-// ============ 内部结构 ============
-
 type stunAttr struct {
 	typ   uint16
 	value []byte
@@ -87,7 +83,8 @@ type TURNLite struct {
 
 	onMessage func([]byte, net.Addr)
 
-	respCh chan *stunMessage
+	pendingMu sync.Mutex
+	pending   map[[12]byte]chan *stunMessage
 
 	mu      sync.Mutex
 	stopped bool
@@ -105,7 +102,7 @@ func NewTURNLiteWithTCP(serverAddr, username, password string, useTCP bool) *TUR
 		password:    password,
 		useTCP:      useTCP,
 		permissions: make(map[string]time.Time),
-		respCh:      make(chan *stunMessage, 16),
+		pending:     make(map[[12]byte]chan *stunMessage),
 		stopCh:      make(chan struct{}),
 	}
 }
@@ -219,13 +216,12 @@ func xorDecodePeer(data []byte) (net.IP, int, error) {
 	return nil, 0, fmt.Errorf("未知地址族 0x%02x", family)
 }
 
-// ============ HMAC-SHA1 签名（RFC 5389 §15.4） ============
+// ============ HMAC-SHA1 签名 ============
 
 func (t *TURNLite) sign(msg []byte) []byte {
 	if t.key == nil {
 		return msg
 	}
-
 	newBodyLen := len(msg) - 20 + 24
 
 	tmp := make([]byte, len(msg))
@@ -251,7 +247,7 @@ func randTxID() [12]byte {
 	return t
 }
 
-// ============ 发送 + 等待 ============
+// ============ 发送 + 等待（按 txid 分发） ============
 
 func (t *TURNLite) sendRequest(msgType uint16, attrs []stunAttr, withAuth bool) (*stunMessage, error) {
 	txid := randTxID()
@@ -269,31 +265,44 @@ func (t *TURNLite) sendRequest(msgType uint16, attrs []stunAttr, withAuth bool) 
 		msg = t.sign(msg)
 	}
 
-	for {
-		select {
-		case <-t.respCh:
-			continue
-		default:
-		}
-		break
-	}
+	// 注册 pending channel
+	ch := make(chan *stunMessage, 1)
+	t.pendingMu.Lock()
+	t.pending[txid] = ch
+	t.pendingMu.Unlock()
+	defer func() {
+		t.pendingMu.Lock()
+		delete(t.pending, txid)
+		t.pendingMu.Unlock()
+	}()
 
 	if _, err := t.conn.Write(msg); err != nil {
 		return nil, fmt.Errorf("发送失败: %w", err)
 	}
 
 	timeout := time.After(turnRequestTimeout)
-	for {
+	select {
+	case resp := <-ch:
+		if resp == nil {
+			return nil, fmt.Errorf("空响应")
+		}
+		return resp, nil
+	case <-timeout:
+		return nil, fmt.Errorf("请求超时 (type=0x%04x)", msgType)
+	case <-t.stopCh:
+		return nil, fmt.Errorf("已关闭")
+	}
+}
+
+// dispatch 由 readLoop 调用，把响应分发给等待的 sendRequest
+func (t *TURNLite) dispatch(msg *stunMessage) {
+	t.pendingMu.Lock()
+	ch := t.pending[msg.txid]
+	t.pendingMu.Unlock()
+	if ch != nil {
 		select {
-		case resp := <-t.respCh:
-			if resp == nil || resp.txid != txid {
-				continue
-			}
-			return resp, nil
-		case <-timeout:
-			return nil, fmt.Errorf("请求超时 (type=0x%04x)", msgType)
-		case <-t.stopCh:
-			return nil, fmt.Errorf("已关闭")
+		case ch <- msg:
+		default:
 		}
 	}
 }
@@ -301,7 +310,6 @@ func (t *TURNLite) sendRequest(msgType uint16, attrs []stunAttr, withAuth bool) 
 // ============ Allocate ============
 
 func (t *TURNLite) Allocate() error {
-	// ★ protected dialer：TURN socket 创建后调 VpnService.protect() 绕过 VPN
 	protectedDialer := newProtectedDialer()
 
 	if t.useTCP {
@@ -577,10 +585,7 @@ func (t *TURNLite) handleIncoming(data []byte) {
 			t.onMessage(dataPayload, &net.UDPAddr{IP: ip, Port: port})
 		}
 	default:
-		select {
-		case t.respCh <- msg:
-		default:
-		}
+		t.dispatch(msg)
 	}
 }
 
