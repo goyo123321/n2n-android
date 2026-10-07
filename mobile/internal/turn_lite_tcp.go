@@ -13,8 +13,6 @@ import (
 	"time"
 )
 
-// ============ RFC 6062 消息类型 ============
-
 const (
 	msgConnectRequest    = 0x000A
 	msgConnectSuccess    = 0x000B
@@ -24,15 +22,8 @@ const (
 	msgConnectionBindErr = 0x000F
 )
 
-// ============ RFC 6062 属性 ============
-
-const (
-	attrConnectionID = 0x002A
-)
-
+const attrConnectionID = 0x002A
 const transportTCP = 6
-
-// ============ TURNTCPAllocation ============
 
 type TURNTCPAllocation struct {
 	serverAddr string
@@ -65,8 +56,6 @@ func NewTURNTCPAllocation(serverAddr, username, password string) *TURNTCPAllocat
 		stopCh:     make(chan struct{}),
 	}
 }
-
-// ============ STUN 签名 ============
 
 func (t *TURNTCPAllocation) sign(msg []byte) []byte {
 	if t.key == nil {
@@ -135,8 +124,6 @@ func (t *TURNTCPAllocation) sendRequest(msgType uint16, attrs []stunAttr, withAu
 	}
 }
 
-// ============ control 连接读循环 ============
-
 func (t *TURNTCPAllocation) readControlLoop() {
 	for {
 		select {
@@ -168,8 +155,6 @@ func (t *TURNTCPAllocation) readControlLoop() {
 		}
 	}
 }
-
-// ============ Allocate (REQUESTED-TRANSPORT=TCP) ============
 
 func (t *TURNTCPAllocation) Allocate() error {
 	dialer := newProtectedDialer()
@@ -244,13 +229,10 @@ func (t *TURNTCPAllocation) extractAllocation(resp *stunMessage) error {
 			t.mappedAddr = &net.UDPAddr{IP: ip2, Port: port2}
 		}
 	}
-
 	log.Printf("[TURN-TCP] ✅ TCP Allocation 成功: relay=%s", t.relayAddr)
 	go t.refreshLoop()
 	return nil
 }
-
-// ============ Connect + ConnectionBind ============
 
 func (t *TURNTCPAllocation) Dial(targetIP string, targetPort int) (io.ReadWriteCloser, error) {
 	t.mu.Lock()
@@ -283,6 +265,7 @@ func (t *TURNTCPAllocation) Dial(targetIP string, targetPort int) (io.ReadWriteC
 		return nil, fmt.Errorf("Connect 响应缺 ConnectionID")
 	}
 
+	// ★ data 连接连到 relay 地址（不是 control 端口）
 	dataAddr := net.JoinHostPort(t.relayHost, fmt.Sprintf("%d", t.relayAddr.Port))
 	log.Printf("[TURN-TCP] 建立 data connection → %s", dataAddr)
 
@@ -326,11 +309,8 @@ func (t *TURNTCPAllocation) Dial(targetIP string, targetPort int) (io.ReadWriteC
 
 	_ = dataConn.SetReadDeadline(time.Time{})
 	log.Printf("[TURN-TCP] ✅ 隧道建立 → %s:%d (connID=%x)", targetIP, targetPort, connectionID)
-
 	return dataConn, nil
 }
-
-// ============ refresh / close ============
 
 func (t *TURNTCPAllocation) refreshLoop() {
 	ticker := time.NewTicker(turnRefreshInterval)
