@@ -280,7 +280,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 
 	// 10. TURN + WSOutbound 异步初始化
 	go func() {
-		time.Sleep(2 * time.Second)
+		time.Sleep(200 * time.Millisecond) // ★ 200ms 足够，让 netstack 先就绪
 		ctx, cancel := contextWithTimeout(30 * time.Second)
 		defer cancel()
 
@@ -474,6 +474,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			} else {
 				ns.progress = e.progress
 
+				// 1. DNS Proxy
 				dnsCache := NewDNSCache()
 				if dp, err := NewDNSProxy(dnsCache, func() *WSOutbound {
 					e.mu.Lock()
@@ -482,16 +483,35 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 				}); err == nil {
 					ns.SetDNSProxy(dp)
 					log.Printf("[Netstack] DNS Proxy 已挂载（双 DNS）")
+				} else {
+					log.Printf("[Netstack] DNS Proxy 初始化失败: %v", err)
 				}
 
+				// ★ 2. Router（必须挂载，否则所有流量都走 proxy）
+				if router, err := NewRouter(DefaultRoutingConfig()); err == nil {
+					ns.SetRouter(router, dnsCache)
+					log.Printf("[Netstack] Router 已挂载（geoip:cn / geosite:cn 直连）")
+				} else {
+					log.Printf("[Netstack] Router 初始化失败: %v", err)
+				}
+
+				// 3. Proxy Handler（★ 等待 wsOutbound 就绪）
 				ns.SetProxyHandler(func(ip string, port int) (io.ReadWriteCloser, error) {
-					e.mu.Lock()
-					wsOut := e.wsOutbound
-					e.mu.Unlock()
-					if wsOut == nil {
-						return nil, fmt.Errorf("wsOutbound 未就绪")
+					deadline := time.Now().Add(15 * time.Second)
+					for time.Now().Before(deadline) {
+						e.mu.Lock()
+						wsOut := e.wsOutbound
+						e.mu.Unlock()
+						if wsOut != nil {
+							return wsOut.NewStream(ip, port)
+						}
+						select {
+						case <-e.doneCh:
+							return nil, fmt.Errorf("已关闭")
+						case <-time.After(200 * time.Millisecond):
+						}
 					}
-					return wsOut.NewStream(ip, port)
+					return nil, fmt.Errorf("wsOutbound 15s 内未就绪")
 				})
 				log.Printf("[Netstack] ProxyHandler 已挂载")
 
@@ -643,7 +663,7 @@ func (e *Edge) reportMetadata() {
 		"assistedSockets":    nm.AssistedSockets,
 		"sharePort":          9090,
 		"p2pEndpoint":        nm.P2PEndpoint,
-		// ★ LAN 直连必需字段（服务端 p2p_metadata 分支读取）
+		// ★ LAN 直连必需字段
 		"lanIp":     netInfo.LANIP,
 		"gatewayIp": netInfo.GatewayIP,
 		"udpPort":   e.udpPort,
