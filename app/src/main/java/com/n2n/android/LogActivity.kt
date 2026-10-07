@@ -4,6 +4,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.os.Bundle
+import android.util.Log
 import android.view.View
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -11,10 +12,15 @@ import com.n2n.android.databinding.ActivityLogBinding
 
 class LogActivity : AppCompatActivity() {
 
+    companion object {
+        private const val TAG = "LogActivity"
+    }
+
     private lateinit var binding: ActivityLogBinding
 
     private val ticker = object : Runnable {
         override fun run() {
+            if (isFinishing || isDestroyed) return
             refresh()
             binding.root.postDelayed(this, 1000)
         }
@@ -60,25 +66,40 @@ class LogActivity : AppCompatActivity() {
             binding.tvAutoScroll.text = if (checked) "🔄 自动滚动已开启" else "⏸ 自动滚动已关闭"
         }
 
+        // 首次刷新（ticker 在 onStart 启动）
         refresh()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // ★ 回前台重启 ticker
+        binding.root.removeCallbacks(ticker)
         binding.root.postDelayed(ticker, 1000)
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
+    override fun onStop() {
+        super.onStop()
+        // ★ 切后台立即停 ticker，避免访问已失效的 binding
         binding.root.removeCallbacks(ticker)
     }
 
     private fun refresh() {
-        val logs = N2nController.getLogs()
-        val text = if (logs.isEmpty()) "(暂无日志)" else logs
-        if (binding.tvLogs.text.toString() != text) {
-            binding.tvLogs.text = text
-            if (binding.switchAutoScroll.isChecked) {
-                binding.scrollView.post {
-                    binding.scrollView.fullScroll(View.FOCUS_DOWN)
+        if (isFinishing || isDestroyed) return
+        try {
+            val logs = N2nController.getLogs()
+            val text = if (logs.isEmpty()) "(暂无日志)" else logs
+            if (binding.tvLogs.text.toString() != text) {
+                binding.tvLogs.text = text
+                if (binding.switchAutoScroll.isChecked) {
+                    binding.scrollView.post {
+                        if (!isFinishing && !isDestroyed) {
+                            binding.scrollView.fullScroll(View.FOCUS_DOWN)
+                        }
+                    }
                 }
             }
+        } catch (t: Throwable) {
+            Log.e(TAG, "refresh failed", t)
         }
     }
 
