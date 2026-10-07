@@ -1,0 +1,256 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（如 v1.0.0）'
+        required: true
+        type: string
+        default: 'v1.0.0'
+      publish:
+        description: '是否发布到 Release'
+        required: false
+        type: boolean
+        default: false
+
+# ★ 允许 workflow 写 Release（修复 "Resource not accessible by integration"）
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    name: Build Debug APK
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ============================================================
+      # 环境准备
+      # ============================================================
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: false
+
+      - name: Show Go version
+        run: go version
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Locate Android SDK
+        shell: bash
+        run: |
+          if [ -z "$ANDROID_HOME" ] && [ -z "$ANDROID_SDK_ROOT" ]; then
+            export ANDROID_HOME=/usr/local/lib/android/sdk
+          fi
+          export ANDROID_HOME="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> $GITHUB_ENV
+
+          SDKMGR=""
+          for p in "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+                   "$ANDROID_HOME/cmdline-tools/16.0/bin/sdkmanager" \
+                   "$ANDROID_HOME/tools/bin/sdkmanager"; do
+            if [ -x "$p" ]; then
+              SDKMGR="$p"
+              break
+            fi
+          done
+          if [ -z "$SDKMGR" ]; then
+            echo "::error::找不到 sdkmanager"
+            find "$ANDROID_HOME" -name sdkmanager 2>/dev/null || true
+            exit 1
+          fi
+          echo "SDKMANAGER=$SDKMGR" >> $GITHUB_ENV
+          echo "✅ ANDROID_HOME=$ANDROID_HOME"
+          echo "✅ sdkmanager=$SDKMGR"
+
+      - name: Accept Android SDK licenses
+        shell: bash
+        run: |
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          echo "✅ 已接受所有 SDK licenses"
+
+      - name: Setup Android NDK
+        shell: bash
+        run: |
+          if [ -d "$ANDROID_HOME/ndk/26.1.10909125" ]; then
+            echo "✅ NDK 26.1.10909125 已存在"
+          else
+            echo "安装 NDK 26.1.10909125..."
+            yes | "$SDKMANAGER" --install "ndk;26.1.10909125" > /dev/null 2>&1 || true
+          fi
+
+          if [ ! -d "$ANDROID_HOME/ndk/26.1.10909125" ]; then
+            echo "::error::NDK 安装失败"
+            ls "$ANDROID_HOME/ndk/" || echo "ndk 目录不存在"
+            exit 1
+          fi
+
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125" >> $GITHUB_ENV
+          echo "✅ ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125"
+
+      - name: Verify NDK
+        shell: bash
+        run: |
+          echo "ANDROID_NDK_HOME = $ANDROID_NDK_HOME"
+          ls -la "$ANDROID_NDK_HOME" | head -20
+
+      # ============================================================
+      # gomobile
+      # ============================================================
+      - name: Install gomobile
+        shell: bash
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+          echo "✅ gomobile 已安装"
+
+      - name: Verify gomobile
+        shell: bash
+        run: |
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          which gomobile
+          gomobile version || true
+
+      # ============================================================
+      # 构建 Go AAR
+      # ============================================================
+      - name: go mod tidy
+        shell: bash
+        working-directory: mobile
+        run: |
+          go mod tidy
+          echo "--- go.mod ---"
+          cat go.mod
+          echo ""
+          echo "✅ go mod tidy 完成"
+
+      - name: gomobile init
+        shell: bash
+        working-directory: mobile
+        run: |
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          gomobile init
+          echo "✅ gomobile init 完成"
+
+      - name: Build gomobile AAR
+        shell: bash
+        working-directory: mobile
+        run: |
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          mkdir -p ../app/libs
+          echo "开始构建 AAR（首次约 3-5 分钟）..."
+          time gomobile bind \
+            -target=android \
+            -androidapi 26 \
+            -javapkg=com.n2n \
+            -ldflags "-checklinkname=0" \
+            -o ../app/libs/n2nclient.aar \
+            .
+          echo ""
+          echo "--- 检查 AAR ---"
+          if [ ! -f ../app/libs/n2nclient.aar ]; then
+            echo "::error::AAR 生成失败"
+            exit 1
+          fi
+          ls -la ../app/libs/
+          echo "✅ AAR 已生成"
+
+      # ============================================================
+      # 构建 APK
+      # ============================================================
+      - name: Grant gradlew permission
+        shell: bash
+        run: chmod +x gradlew
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Build Debug APK
+        shell: bash
+        run: |
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          if [ ! -f "$APK" ]; then
+            echo "::error::APK 生成失败"
+            find app/build/outputs -type f || true
+            exit 1
+          fi
+          SIZE=$(du -h "$APK" | cut -f1)
+          echo "✅ APK: $APK ($SIZE)"
+
+      # ============================================================
+      # 上传产物
+      # ============================================================
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: n2n-android-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30
+
+      # ============================================================
+      # 发布 Release（可选）
+      # ============================================================
+      - name: Rename APK for release
+        if: inputs.publish
+        shell: bash
+        run: |
+          mkdir -p release
+          cp app/build/outputs/apk/debug/app-debug.apk \
+             "release/n2n-android-${{ inputs.version }}.apk"
+          ls -la release/
+
+      - name: Publish Release
+        if: inputs.publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: n2n-android ${{ inputs.version }}
+          files: release/*.apk
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ============================================================
+      # 汇总
+      # ============================================================
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          echo "## Build Android APK 结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- 版本: \`${{ inputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- 发布: \`${{ inputs.publish }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Job 状态: \`${{ job.status }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f "app/build/outputs/apk/debug/app-debug.apk" ]; then
+            SIZE=$(du -h "app/build/outputs/apk/debug/app-debug.apk" | cut -f1)
+            echo "### 产物" >> $GITHUB_STEP_SUMMARY
+            echo "- ✅ \`app-debug.apk\` ($SIZE)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ❌ 未生成 APK" >> $GITHUB_STEP_SUMMARY
+          fi
