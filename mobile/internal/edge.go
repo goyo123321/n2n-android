@@ -123,6 +123,7 @@ func FetchVirtualIP(cfg *Config) string {
 	}
 }
 
+// Start 启动客户端
 func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	if cfg.SignalingURL == "" {
 		return nil, fmt.Errorf("signaling URL 为空")
@@ -291,10 +292,19 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 			})
 		}
 
+		// ★ UUID：取 ConnectToken，为空则用默认
+		uuid := cfg.ConnectToken
+		if uuid == "" {
+			uuid = "2523c510-9ff0-415b-9582-93949bfae7e3"
+		}
+
 		wsOut, err := NewWSOutbound(
 			cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken,
 			cfg.PreferredIP, cfg.PreferredPort,
 			e.turnClient,
+			uuid,
+			e.GetVirtualIP(),
+			e.udpPort,
 		)
 		if err != nil {
 			log.Printf("[WSOut] 初始化失败: %v", err)
@@ -399,6 +409,8 @@ func idxToCode(i int) string {
 	return string(rune('A'+first)) + string(rune('A'+second))
 }
 
+// ============ 信令 ============
+
 func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	t, _ := msg["type"].(string)
 	from, _ := msg["from"].(string)
@@ -442,7 +454,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 				ns.progress = e.progress
 				e.netstack = ns
 
-				// ★ 双 DNS：国内直连 + 国外走 Worker
 				dnsCache := NewDNSCache()
 				if dp, err := NewDNSProxy(dnsCache, func() *WSOutbound {
 					e.mu.Lock()
@@ -536,6 +547,29 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			if p, ok := e.peers[edgeMac]; ok { p.TurnRelayAddr = relayAddr }
 			e.peersMu.Unlock()
 		}
+
+	case "lan_direct":
+		targetMac, _ := msg["targetMac"].(string)
+		targetLanIP, _ := msg["targetLanIp"].(string)
+		targetUdpPort := jsonInt(msg["targetUdpPort"])
+		if targetMac == "" || targetLanIP == "" {
+			return
+		}
+		log.Printf("[同 WiFi] 直连 %s @ %s:%d", targetMac, targetLanIP, targetUdpPort)
+
+		e.peersMu.Lock()
+		if p, ok := e.peers[targetMac]; ok {
+			p.UDPAddr = &net.UDPAddr{IP: net.ParseIP(targetLanIP), Port: targetUdpPort}
+			p.PubIP = targetLanIP
+			p.PubPort = targetUdpPort
+		} else {
+			e.peers[targetMac] = &PeerInfo{
+				ClientID: targetMac,
+				UDPAddr:  &net.UDPAddr{IP: net.ParseIP(targetLanIP), Port: targetUdpPort},
+			}
+		}
+		e.peersMu.Unlock()
+		e.relayMgr.MarkP2P(targetMac)
 
 	case "pong":
 		return
@@ -640,6 +674,8 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 		e.relayMgr.MarkFallback(instr.TargetMac)
 	}
 }
+
+// ============ IO ============
 
 func (e *Edge) udpReadLoop() {
 	buf := make([]byte, 65535)
