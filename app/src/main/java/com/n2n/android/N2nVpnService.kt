@@ -39,15 +39,15 @@ class N2nVpnService : VpnService() {
         const val EXTRA_ROOM_ID = "room_id"
         const val EXTRA_CLIENT_ID = "client_id"
         const val EXTRA_NODE_NAME = "node_name"
-        const val EXTRA_CONNECT_TOKEN = "connect_token"
+        const val EXTRA_UUID = "uuid"                          // ★ 原 EXTRA_CONNECT_TOKEN
         const val EXTRA_SHARE_DIR = "share_dir"
         const val EXTRA_PREFERRED_IP = "preferred_ip"
     }
 
     private var tunInterface: ParcelFileDescriptor? = null
     @Volatile private var started = false
-    private val starting = AtomicBoolean(false)   // ★ 防止重复启动（TOCTOU）
-    private val stopping = AtomicBoolean(false)   // ★ 防止重复清理
+    private val starting = AtomicBoolean(false)
+    private val stopping = AtomicBoolean(false)
     private val handler = Handler(Looper.getMainLooper())
 
     private var wakeLock: PowerManager.WakeLock? = null
@@ -55,7 +55,6 @@ class N2nVpnService : VpnService() {
     private var protectedUdpSocket: DatagramSocket? = null
     private var protectedStunSocket: DatagramSocket? = null
 
-    // Protector 是 gomobile 生成的 Kotlin interface，无构造函数
     inner class ServiceProtector : Protector {
         override fun protect(fd: Long): Boolean {
             return try {
@@ -71,7 +70,6 @@ class N2nVpnService : VpnService() {
         val ts = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
         val line = "[$ts] [K] $msg"
 
-        // ★ 优先用 filesDir（支持多用户 / work profile），其余作为 fallback
         val candidates = mutableListOf<File>()
         try { candidates.add(File(filesDir, "n2n.log")) } catch (_: Throwable) {}
         candidates.add(File("/data/user/0/com.n2n.android/files/n2n.log"))
@@ -102,7 +100,6 @@ class N2nVpnService : VpnService() {
                 updateNotification("正在连接... (${attempts}s)")
                 handler.postDelayed(this, 1000)
             } else {
-                // ★ 超时后降频继续轮询，不再直接放弃
                 updateNotification("正在连接... (${attempts}s)")
                 handler.postDelayed(this, 3000)
             }
@@ -123,7 +120,6 @@ class N2nVpnService : VpnService() {
         return START_NOT_STICKY
     }
 
-    // ★ VPN 权限被系统或另一个 VPN 抢占时回调
     override fun onRevoke() {
         ktLog("onRevoke: VPN 权限被撤销")
         handleStop()
@@ -135,7 +131,6 @@ class N2nVpnService : VpnService() {
             ktLog("handleStart: 已启动，跳过")
             return
         }
-        // ★ CAS：防止双击导致两次启动流程并行
         if (!starting.compareAndSet(false, true)) {
             ktLog("handleStart: 已有启动流程在跑，忽略")
             return
@@ -153,10 +148,10 @@ class N2nVpnService : VpnService() {
         val roomId = intent.getStringExtra(EXTRA_ROOM_ID) ?: "default-room"
         val clientId = intent.getStringExtra(EXTRA_CLIENT_ID) ?: ""
         val nodeName = intent.getStringExtra(EXTRA_NODE_NAME) ?: "Android"
-        val connectToken = intent.getStringExtra(EXTRA_CONNECT_TOKEN) ?: ""
+        val uuid = intent.getStringExtra(EXTRA_UUID) ?: Prefs.DEFAULT_UUID
         val shareDir = intent.getStringExtra(EXTRA_SHARE_DIR)
             ?: ShareDirManager.getDefaultShareDir(this).absolutePath
-        ktLog("参数读取完成 room=$roomId")
+        ktLog("参数读取完成 room=$roomId uuid=${uuid.take(8)}...")
 
         try {
             startForeground(NOTIF_ID, buildNotification("正在获取虚拟 IP..."))
@@ -175,7 +170,7 @@ class N2nVpnService : VpnService() {
             setRoomID(roomId)
             setClientID(clientId)
             setNodeName(nodeName)
-            setConnectToken(connectToken)
+            setUUID(uuid)                                       // ★ 改名
             setShareDir(shareDir)
             setPreferredIP(preferredIp)
             setPreferredPort(443)
@@ -218,8 +213,6 @@ class N2nVpnService : VpnService() {
                         val stunFd = createProtectedStunSocket()
                         ktLog("STUN fd=$stunFd")
 
-                        // ★ UDP 是 P2P 打洞的必要条件。fd 无效时直接失败，
-                        //   避免 Go 侧回退到未 protect 的默认 socket（会被 TUN 捕获 → 死循环）
                         if (udpFd <= 0) {
                             ktLog("UDP fd 无效，无法建立 P2P，退出")
                             updateNotification("UDP socket 创建失败")
@@ -239,7 +232,7 @@ class N2nVpnService : VpnService() {
                                 } else {
                                     ktLog("startAsync 成功")
                                     started = true
-                                    starting.set(false)   // ★ 成功才清 starting
+                                    starting.set(false)
                                     handler.post(updateIpRunnable)
                                 }
                             }
@@ -298,7 +291,6 @@ class N2nVpnService : VpnService() {
     private fun stopVpn() { handleStop() }
 
     private fun handleStop() {
-        // ★ 保证同一时刻只有一次清理流程
         if (!stopping.compareAndSet(false, true)) {
             ktLog("handleStop: 已在清理中，忽略")
             return
@@ -362,10 +354,6 @@ class N2nVpnService : VpnService() {
         wifiLock = null
     }
 
-    // ============================================================
-    // TUN：接管 0.0.0.0/0 + 下发 DNS 指向虚拟 IP
-    // 完全靠 socket protect 保证信令 / TURN / WSOut 不绕 TUN
-    // ============================================================
     private fun buildTunInterface(vip: String): ParcelFileDescriptor? {
         return try {
             ktLog("建立 TUN（全流量 + protect socket + 双 DNS），绑定 IP: $vip")
@@ -376,9 +364,9 @@ class N2nVpnService : VpnService() {
                 .addAddress(vip, 24)
                 .addRoute("10.64.0.0", 24)
                 .addRoute("0.0.0.0", 0)
-                .addDnsServer(vip)   // 系统 DNS 指向虚拟 IP → netstack 处理
+                .addDnsServer(vip)
 
-            ktLog("TUN 接管 0.0.0.0/0，DNS 指向 $vip，信令/TURN/WSOut 靠 socket protect 走物理网络")
+            ktLog("TUN 接管 0.0.0.0/0，DNS 指向 $vip")
 
             val pfd = builder.setBlocking(true).establish()
             ktLog("TUN establish 成功")
