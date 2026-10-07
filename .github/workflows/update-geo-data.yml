@@ -9,26 +9,46 @@ permissions:
 jobs:
   update:
     runs-on: ubuntu-latest
-    name: Download Xray geo data
+    name: Download geo data
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Show current branch
+        run: |
+          echo "GITHUB_REF: $GITHUB_REF"
+          echo "GITHUB_REF_NAME: $GITHUB_REF_NAME"
+          echo "Current branch: $(git branch --show-current)"
 
       - name: Create data directory
-        run: mkdir -p mobile/internal/data
+        run: |
+          mkdir -p mobile/internal/data
+          ls -la mobile/internal/
 
       - name: Download geoip_cn.txt
         run: |
-          curl -fsSL --retry 3 --retry-delay 5 \
-            "https://raw.githubusercontent.com/Loyalsoldier/geoip/release/text/cn.txt" \
-            -o mobile/internal/data/geoip_cn.txt
-          LINES=$(wc -l < mobile/internal/data/geoip_cn.txt)
-          echo "geoip_cn.txt 行数: $LINES"
-          echo "geoip_cn.txt 大小: $(du -h mobile/internal/data/geoip_cn.txt | cut -f1)"
-          [ "$LINES" -ge 1000 ] || { echo "geoip_cn.txt 行数太少"; exit 1; }
+          OUTPUT="mobile/internal/data/geoip_cn.txt"
+          URL="https://raw.githubusercontent.com/Loyalsoldier/geoip/release/text/cn.txt"
+
+          echo "下载: $URL"
+          curl -fsSL --retry 3 --retry-delay 5 "$URL" -o "$OUTPUT"
+          echo "退出码: $?"
+
+          LINES=$(wc -l < "$OUTPUT")
+          SIZE=$(du -h "$OUTPUT" | cut -f1)
+          echo "行数: $LINES，大小: $SIZE"
+          echo "首行: $(head -1 "$OUTPUT")"
+
+          if [ "$LINES" -lt 1000 ]; then
+            echo "❌ geoip 行数不足"
+            echo "--- 文件内容前 10 行 ---"
+            head -10 "$OUTPUT"
+            exit 1
+          fi
 
       - name: Download geosite_cn.txt
         run: |
@@ -36,46 +56,59 @@ jobs:
 
           URLS=(
             "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/geosite-cn.txt"
+            "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/geosite-cn"
             "https://raw.githubusercontent.com/v2fly/domain-list-community/release/cn"
-            "https://raw.githubusercontent.com/v2fly/domain-list-community/master/data/cn"
           )
 
+          SUCCESS=0
           for URL in "${URLS[@]}"; do
+            echo "=========================================="
             echo "尝试: $URL"
-            if curl -fsSL --retry 2 --retry-delay 3 "$URL" -o "$OUTPUT" 2>/dev/null; then
+
+            if curl -fsSL --retry 2 --retry-delay 3 "$URL" -o "$OUTPUT" 2>&1; then
               LINES=$(wc -l < "$OUTPUT")
+              SIZE=$(du -h "$OUTPUT" | cut -f1)
+              echo "行数: $LINES，大小: $SIZE"
+              echo "首行: $(head -1 "$OUTPUT")"
+
               if [ "$LINES" -ge 1000 ]; then
-                echo "✅ 下载成功: $URL ($LINES 行)"
+                echo "✅ 成功"
+                SUCCESS=1
                 break
               else
-                echo "❌ 行数太少 ($LINES)，尝试下一个"
+                echo "❌ 行数太少，继续"
               fi
             else
-              echo "❌ 下载失败，尝试下一个"
+              echo "❌ curl 失败"
             fi
           done
 
-          LINES=$(wc -l < "$OUTPUT")
-          echo "geosite_cn.txt 行数: $LINES"
-          echo "geosite_cn.txt 大小: $(du -h "$OUTPUT" | cut -f1)"
-          [ "$LINES" -ge 1000 ] || { echo "所有源都失败或行数太少"; exit 1; }
+          if [ "$SUCCESS" -eq 0 ]; then
+            echo "=========================================="
+            echo "❌ 所有 URL 都失败"
+            echo "--- 最后一次文件内容前 10 行 ---"
+            head -10 "$OUTPUT"
+            exit 1
+          fi
 
       - name: Verify files
         run: |
-          [ -s mobile/internal/data/geoip_cn.txt ] || { echo "geoip_cn.txt 为空"; exit 1; }
-          [ -s mobile/internal/data/geosite_cn.txt ] || { echo "geosite_cn.txt 为空"; exit 1; }
-          echo "geoip 首行: $(head -1 mobile/internal/data/geoip_cn.txt)"
-          echo "geosite 首行: $(head -1 mobile/internal/data/geosite_cn.txt)"
+          ls -la mobile/internal/data/
+          echo "--- geoip 前 3 行 ---"
+          head -3 mobile/internal/data/geoip_cn.txt
+          echo "--- geosite 前 3 行 ---"
+          head -3 mobile/internal/data/geosite_cn.txt
 
       - name: Check for changes
         id: diff
         run: |
+          git status
           if git diff --quiet mobile/internal/data/; then
             echo "changed=false" >> $GITHUB_OUTPUT
-            echo "数据文件无变化"
+            echo "无变化"
           else
             echo "changed=true" >> $GITHUB_OUTPUT
-            echo "数据文件有更新"
+            echo "有变化"
             git diff --stat mobile/internal/data/
           fi
 
@@ -88,7 +121,10 @@ jobs:
           DATE=$(date -u +%Y-%m-%d)
           git add mobile/internal/data/
           git commit -m "chore: update geoip/geosite data ($DATE)"
-          git push
+
+          echo "--- 即将 push ---"
+          git log -1 --stat
+          git push origin HEAD:${{ github.ref_name }}
 
       - name: Summary
         if: always()
@@ -97,7 +133,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| 文件 | 行数 | 大小 |" >> $GITHUB_STEP_SUMMARY
           echo "|:---|:---|:---|" >> $GITHUB_STEP_SUMMARY
-          echo "| geoip_cn.txt | $(wc -l < mobile/internal/data/geoip_cn.txt) | $(du -h mobile/internal/data/geoip_cn.txt | cut -f1) |" >> $GITHUB_STEP_SUMMARY
-          echo "| geosite_cn.txt | $(wc -l < mobile/internal/data/geosite_cn.txt) | $(du -h mobile/internal/data/geosite_cn.txt | cut -f1) |" >> $GITHUB_STEP_SUMMARY
+          echo "| geoip_cn.txt | $(wc -l < mobile/internal/data/geoip_cn.txt 2>/dev/null || echo 0) | $(du -h mobile/internal/data/geoip_cn.txt 2>/dev/null | cut -f1 || echo 0) |" >> $GITHUB_STEP_SUMMARY
+          echo "| geosite_cn.txt | $(wc -l < mobile/internal/data/geosite_cn.txt 2>/dev/null || echo 0) | $(du -h mobile/internal/data/geosite_cn.txt 2>/dev/null | cut -f1 || echo 0) |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "变化: ${{ steps.diff.outputs.changed }}" >> $GITHUB_STEP_SUMMARY
