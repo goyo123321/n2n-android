@@ -8,6 +8,8 @@ import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.util.Log
+import android.view.View
 import android.widget.EditText
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -21,10 +23,17 @@ import java.io.File
 
 class FileManagerActivity : AppCompatActivity() {
 
+    companion object {
+        private const val TAG = "FileManager"
+    }
+
     private lateinit var binding: ActivityFileManagerBinding
     private lateinit var adapter: FileAdapter
     private lateinit var rootDir: File
     private var currentDir: File? = null
+
+    // 防止 loadDir 里的后台线程回调覆盖已被切走的目录
+    @Volatile private var loadToken = 0
 
     // SAF 多选文件
     private val pickFilesLauncher = registerForActivityResult(
@@ -39,19 +48,12 @@ class FileManagerActivity : AppCompatActivity() {
         binding = ActivityFileManagerBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        // 根目录
+        // 根目录固定为共享盘目录
         rootDir = ShareDirManager.getDefaultShareDir(this)
         currentDir = rootDir
 
         // Toolbar 返回
-        binding.toolbar.setNavigationOnClickListener {
-            if (currentDir?.absolutePath != rootDir.absolutePath) {
-                currentDir = currentDir?.parentFile ?: rootDir
-                loadDir()
-            } else {
-                onBackPressedDispatcher.onBackPressed()
-            }
-        }
+        binding.toolbar.setNavigationOnClickListener { handleBack() }
 
         // RecyclerView
         adapter = FileAdapter(
@@ -79,7 +81,33 @@ class FileManagerActivity : AppCompatActivity() {
     }
 
     // ============================================================
-    // 目录加载
+    // 返回逻辑
+    // ============================================================
+
+    private fun handleBack() {
+        val dir = currentDir
+        if (dir != null && dir.absolutePath != rootDir.absolutePath) {
+            currentDir = dir.parentFile ?: rootDir
+            loadDir()
+        } else {
+            onBackPressedDispatcher.onBackPressed()
+        }
+    }
+
+    @Deprecated("AndroidX 已改为 onBackPressedDispatcher 回调")
+    override fun onBackPressed() {
+        val dir = currentDir
+        if (dir != null && dir.absolutePath != rootDir.absolutePath) {
+            currentDir = dir.parentFile ?: rootDir
+            loadDir()
+        } else {
+            @Suppress("DEPRECATION")
+            super.onBackPressed()
+        }
+    }
+
+    // ============================================================
+    // 目录加载（后台线程读盘，避免 ANR）
     // ============================================================
 
     private fun loadDir() {
@@ -90,41 +118,55 @@ class FileManagerActivity : AppCompatActivity() {
             currentDir = rootDir
             return
         }
-        if (!dir.canRead()) {
-            toast("无法读取此目录")
-            return
-        }
 
-        // 更新路径显示
+        // 更新路径显示（很快，主线程做）
         val relative = dir.absolutePath.removePrefix(rootDir.absolutePath).ifEmpty { "/" }
         binding.tvPath.text = relative
 
-        // 列出文件：文件夹优先，然后按名称排序
-        val files = dir.listFiles()?.toList() ?: emptyList()
-        val sorted = files.sortedWith(
-            compareByDescending<File> { it.isDirectory }
-                .thenBy { it.name.lowercase() }
-        )
+        // 显示加载态
+        binding.tvEmpty.visibility = View.GONE
+        binding.rvFiles.visibility = View.VISIBLE
 
-        if (sorted.isEmpty()) {
-            binding.tvEmpty.visibility = android.view.View.VISIBLE
-            binding.rvFiles.visibility = android.view.View.GONE
-        } else {
-            binding.tvEmpty.visibility = android.view.View.GONE
-            binding.rvFiles.visibility = android.view.View.VISIBLE
-        }
-        adapter.update(sorted)
-    }
+        // token 用于丢弃过期回调
+        val token = ++loadToken
 
-    override fun onBackPressed() {
-        val dir = currentDir
-        if (dir != null && dir.absolutePath != rootDir.absolutePath) {
-            currentDir = dir.parentFile ?: rootDir
-            loadDir()
-        } else {
-            @Suppress("DEPRECATION")
-            super.onBackPressed()
-        }
+        Thread {
+            val canRead = dir.canRead()
+            val files = if (canRead) {
+                try {
+                    dir.listFiles()?.toList() ?: emptyList()
+                } catch (e: Throwable) {
+                    Log.w(TAG, "listFiles 失败: ${e.message}")
+                    emptyList()
+                }
+            } else {
+                emptyList()
+            }
+
+            val sorted = files.sortedWith(
+                compareByDescending<File> { it.isDirectory }
+                    .thenBy { it.name.lowercase() }
+            )
+
+            runOnUiThread {
+                // 目录可能在读盘期间被切走 / 又触发了一次 loadDir
+                if (token != loadToken) return@runOnUiThread
+                if (currentDir != dir) return@runOnUiThread
+
+                if (!canRead) {
+                    toast("无法读取此目录")
+                    return@runOnUiThread
+                }
+                if (sorted.isEmpty()) {
+                    binding.tvEmpty.visibility = View.VISIBLE
+                    binding.rvFiles.visibility = View.GONE
+                } else {
+                    binding.tvEmpty.visibility = View.GONE
+                    binding.rvFiles.visibility = View.VISIBLE
+                }
+                adapter.update(sorted)
+            }
+        }.start()
     }
 
     // ============================================================
@@ -138,16 +180,17 @@ class FileManagerActivity : AppCompatActivity() {
         Thread {
             var ok = 0
             var fail = 0
-            for (uri in uris) {
-                try {
-                    val name = queryFileName(uri) ?: "file_${System.currentTimeMillis()}"
+            val failedNames = mutableListOf<String>()
 
+            for (uri in uris) {
+                val displayName = queryFileName(uri) ?: "file_${System.currentTimeMillis()}"
+                try {
                     // 避免覆盖：如果已存在，加后缀
-                    var dst = File(dir, name)
+                    var dst = File(dir, displayName)
                     var counter = 1
                     while (dst.exists()) {
-                        val base = name.substringBeforeLast('.', name)
-                        val ext = name.substringAfterLast('.', "")
+                        val base = displayName.substringBeforeLast('.', displayName)
+                        val ext = displayName.substringAfterLast('.', "")
                         val newName = if (ext.isEmpty()) "${base}_$counter"
                         else "${base}_$counter.$ext"
                         dst = File(dir, newName)
@@ -158,10 +201,12 @@ class FileManagerActivity : AppCompatActivity() {
                         dst.outputStream().use { output ->
                             input.copyTo(output)
                         }
-                    } ?: throw IllegalStateException("openInputStream null")
+                    } ?: throw IllegalStateException("openInputStream 返回 null")
 
                     ok++
                 } catch (e: Exception) {
+                    Log.w(TAG, "上传失败: $displayName", e)
+                    failedNames.add(displayName)
                     fail++
                 }
             }
@@ -169,8 +214,8 @@ class FileManagerActivity : AppCompatActivity() {
             runOnUiThread {
                 val msg = when {
                     fail == 0 -> "已上传 $ok 个文件"
-                    ok == 0 -> "上传失败（$fail 个）"
-                    else -> "上传完成：成功 $ok，失败 $fail"
+                    ok == 0 -> "上传失败（${fail} 个）：${failedNames.joinToString(", ")}"
+                    else -> "成功 $ok 个，失败 $fail 个：${failedNames.joinToString(", ")}"
                 }
                 toast(msg)
                 loadDir()
@@ -180,11 +225,15 @@ class FileManagerActivity : AppCompatActivity() {
 
     private fun queryFileName(uri: Uri): String? {
         var name: String? = null
-        contentResolver.query(uri, null, null, null, null)?.use { c ->
-            if (c.moveToFirst()) {
-                val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                if (idx >= 0) name = c.getString(idx)
+        try {
+            contentResolver.query(uri, null, null, null, null)?.use { c ->
+                if (c.moveToFirst()) {
+                    val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (idx >= 0) name = c.getString(idx)
+                }
             }
+        } catch (e: Throwable) {
+            Log.w(TAG, "queryFileName 失败: ${e.message}")
         }
         return name
     }
@@ -211,7 +260,12 @@ class FileManagerActivity : AppCompatActivity() {
                     toast("名称不能包含斜杠")
                     return@setPositiveButton
                 }
-                val target = File(currentDir, name)
+                if (name == "." || name == "..") {
+                    toast("名称非法")
+                    return@setPositiveButton
+                }
+                val baseDir = currentDir ?: return@setPositiveButton
+                val target = File(baseDir, name)
                 if (target.exists()) {
                     toast("已存在同名文件夹")
                     return@setPositiveButton
@@ -331,6 +385,7 @@ class FileManagerActivity : AppCompatActivity() {
                     exportDirectLegacy(file)
                 }
             } catch (e: Exception) {
+                Log.w(TAG, "导出失败: ${file.name}", e)
                 false
             }
 
@@ -349,10 +404,15 @@ class FileManagerActivity : AppCompatActivity() {
         }
         val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
             ?: return false
-        contentResolver.openOutputStream(uri)?.use { out ->
-            file.inputStream().use { it.copyTo(out) }
-        } ?: return false
-        return true
+        return try {
+            contentResolver.openOutputStream(uri)?.use { out ->
+                file.inputStream().use { it.copyTo(out) }
+            } != null
+        } catch (e: Exception) {
+            // 清理半成品
+            try { contentResolver.delete(uri, null, null) } catch (_: Exception) {}
+            false
+        }
     }
 
     @Suppress("DEPRECATION")
@@ -383,29 +443,36 @@ class FileManagerActivity : AppCompatActivity() {
             "webp" -> "image/webp"
             "bmp" -> "image/bmp"
             "svg" -> "image/svg+xml"
+            "heic", "heif" -> "image/heif"
             "mp4" -> "video/mp4"
             "mkv" -> "video/x-matroska"
             "mov" -> "video/quicktime"
             "avi" -> "video/x-msvideo"
             "webm" -> "video/webm"
             "3gp" -> "video/3gpp"
+            "flv" -> "video/x-flv"
+            "wmv" -> "video/x-ms-wmv"
             "mp3" -> "audio/mpeg"
             "wav" -> "audio/wav"
             "flac" -> "audio/flac"
             "ogg" -> "audio/ogg"
             "m4a" -> "audio/mp4"
             "aac" -> "audio/aac"
+            "wma" -> "audio/x-ms-wma"
             "pdf" -> "application/pdf"
             "zip" -> "application/zip"
             "rar" -> "application/x-rar-compressed"
             "7z" -> "application/x-7z-compressed"
             "tar" -> "application/x-tar"
             "gz" -> "application/gzip"
+            "bz2" -> "application/x-bzip2"
+            "xz" -> "application/x-xz"
             "apk" -> "application/vnd.android.package-archive"
             "txt", "md", "log" -> "text/plain"
             "html", "htm" -> "text/html"
             "css" -> "text/css"
             "js" -> "application/javascript"
+            "ts" -> "application/typescript"
             "json" -> "application/json"
             "xml" -> "application/xml"
             "csv" -> "text/csv"
