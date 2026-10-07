@@ -15,18 +15,13 @@ permissions:
 jobs:
   download:
     runs-on: ubuntu-latest
-    name: Download geoip + geosite (.dat → text)
+    name: Download geoip_cn + geosite_cn (text)
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.21'
 
       - name: Prepare directory
         run: |
@@ -55,404 +50,79 @@ jobs:
           echo "geoip_exists=$GEOIP_EXISTS" >> $GITHUB_OUTPUT
           echo "geosite_exists=$GEOSITE_EXISTS" >> $GITHUB_OUTPUT
 
-      - name: Download geoip.dat (Loyalsoldier)
+      - name: Download geoip_cn.txt
         if: steps.check.outputs.geoip_exists != 'true'
         run: |
-          echo "下载 geoip.dat (Loyalsoldier/v2ray-rules-dat)..."
-          # 先试 Release，失败则用 raw 分支
-          if ! curl -fsSL --retry 3 --retry-delay 5 \
-            "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" \
-            -o /tmp/geoip.dat; then
-            echo "Release 下载失败，改用 raw 分支..."
-            curl -fsSL --retry 3 --retry-delay 5 \
-              "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/geoip.dat" \
-              -o /tmp/geoip.dat
-          fi
-          ls -lh /tmp/geoip.dat
+          echo "下载国内 IP 段..."
 
-      - name: Download geosite.dat (Loyalsoldier)
+          # 主源：17mon/china_ip_list（每天更新，纯 CIDR text）
+          # Fallback：jsdelivr CDN
+          if ! curl -fsSL --retry 3 --retry-delay 5 \
+            "https://raw.githubusercontent.com/17mon/china_ip_list/master/china_ip_list.txt" \
+            -o /tmp/geoip_cn.txt; then
+            echo "主源失败，改用 jsdelivr CDN..."
+            curl -fsSL --retry 3 --retry-delay 5 \
+              "https://cdn.jsdelivr.net/gh/17mon/china_ip_list@master/china_ip_list.txt" \
+              -o /tmp/geoip_cn.txt
+          fi
+
+          if [ ! -s /tmp/geoip_cn.txt ]; then
+            echo "❌ 下载失败或文件为空"
+            exit 1
+          fi
+
+          LINES=$(wc -l < /tmp/geoip_cn.txt)
+          echo "✅ 下载完成: $LINES 行"
+          head -5 /tmp/geoip_cn.txt
+
+          # 校验格式：第一行应该是 CIDR
+          if ! head -1 /tmp/geoip_cn.txt | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+'; then
+            echo "❌ 文件格式异常（第一行不是 CIDR）"
+            cat /tmp/geoip_cn.txt | head -20
+            exit 1
+          fi
+
+          cp /tmp/geoip_cn.txt mobile/internal/data/geoip_cn.txt
+
+      - name: Download geosite_cn.txt
         if: steps.check.outputs.geosite_exists != 'true'
         run: |
-          echo "下载 geosite.dat (Loyalsoldier/v2ray-rules-dat)..."
+          echo "下载国内域名列表..."
+
+          # 主源：v2fly/domain-list-community/data/cn（纯 text）
+          # Fallback：jsdelivr CDN
           if ! curl -fsSL --retry 3 --retry-delay 5 \
-            "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" \
-            -o /tmp/geosite.dat; then
-            echo "Release 下载失败，改用 raw 分支..."
+            "https://raw.githubusercontent.com/v2fly/domain-list-community/master/data/cn" \
+            -o /tmp/geosite_cn.txt; then
+            echo "主源失败，改用 jsdelivr CDN..."
             curl -fsSL --retry 3 --retry-delay 5 \
-              "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/geosite.dat" \
-              -o /tmp/geosite.dat
+              "https://cdn.jsdelivr.net/gh/v2fly/domain-list-community@master/data/cn" \
+              -o /tmp/geosite_cn.txt
           fi
-          ls -lh /tmp/geosite.dat
 
-      - name: Prepare converter
-        if: steps.check.outputs.geoip_exists != 'true' || steps.check.outputs.geosite_exists != 'true'
-        run: |
-          mkdir -p /tmp/geo-tool
-          cat > /tmp/geo-tool/convert.go <<'GOEOF'
-package main
-
-import (
-	"encoding/binary"
-	"fmt"
-	"net"
-	"os"
-	"strconv"
-)
-
-// ============ protobuf 手写解析 ============
-
-func readVarint(data []byte, pos int) (uint64, int) {
-	var result uint64
-	var shift uint
-	for {
-		if pos >= len(data) {
-			return 0, pos
-		}
-		b := data[pos]
-		pos++
-		result |= uint64(b&0x7f) << shift
-		if b&0x80 == 0 {
-			break
-		}
-		shift += 7
-	}
-	return result, pos
-}
-
-func skipField(data []byte, pos int, wireType int) int {
-	switch wireType {
-	case 0:
-		_, pos = readVarint(data, pos)
-	case 1:
-		pos += 8
-	case 2:
-		l, p := readVarint(data, pos)
-		pos = p + int(l)
-	case 5:
-		pos += 4
-	}
-	return pos
-}
-
-// ============ GeoIP ============
-
-type cidrEntry struct {
-	ip     []byte
-	prefix uint32
-}
-
-func parseCIDR(data []byte) cidrEntry {
-	var c cidrEntry
-	pos := 0
-	for pos < len(data) {
-		tag, p := readVarint(data, pos)
-		fieldNum := int(tag >> 3)
-		wireType := int(tag & 7)
-		pos = p
-		switch fieldNum {
-		case 1:
-			if wireType == 2 {
-				l, pp := readVarint(data, pos)
-				pos = pp
-				c.ip = data[pos : pos+int(l)]
-				pos += int(l)
-			} else {
-				pos = skipField(data, pos, wireType)
-			}
-		case 2:
-			if wireType == 0 {
-				v, pp := readVarint(data, pos)
-				pos = pp
-				c.prefix = uint32(v)
-			} else {
-				pos = skipField(data, pos, wireType)
-			}
-		default:
-			pos = skipField(data, pos, wireType)
-		}
-	}
-	return c
-}
-
-func parseGeoIP(data []byte) (string, []cidrEntry) {
-	var code string
-	var cidrs []cidrEntry
-	pos := 0
-	for pos < len(data) {
-		tag, p := readVarint(data, pos)
-		fieldNum := int(tag >> 3)
-		wireType := int(tag & 7)
-		pos = p
-		switch fieldNum {
-		case 1:
-			if wireType == 2 {
-				l, pp := readVarint(data, pos)
-				pos = pp
-				code = string(data[pos : pos+int(l)])
-				pos += int(l)
-			} else {
-				pos = skipField(data, pos, wireType)
-			}
-		case 2:
-			if wireType == 2 {
-				l, pp := readVarint(data, pos)
-				pos = pp
-				cidrs = append(cidrs, parseCIDR(data[pos:pos+int(l)]))
-				pos += int(l)
-			} else {
-				pos = skipField(data, pos, wireType)
-			}
-		default:
-			pos = skipField(data, pos, wireType)
-		}
-	}
-	return code, cidrs
-}
-
-func convertGeoIP(input, output string, wantCode string) error {
-	data, err := os.ReadFile(input)
-	if err != nil {
-		return err
-	}
-
-	var lines []string
-	pos := 0
-	for pos < len(data) {
-		tag, p := readVarint(data, pos)
-		fieldNum := int(tag >> 3)
-		wireType := int(tag & 7)
-		pos = p
-		if fieldNum == 1 && wireType == 2 {
-			l, pp := readVarint(data, pos)
-			pos = pp
-			code, cidrs := parseGeoIP(data[pos : pos+int(l)])
-			pos += int(l)
-			if code != wantCode {
-				continue
-			}
-			for _, c := range cidrs {
-				if len(c.ip) == 4 {
-					ip := net.IPv4(c.ip[0], c.ip[1], c.ip[2], c.ip[3])
-					lines = append(lines, fmt.Sprintf("%s/%d", ip.String(), c.prefix))
-				} else if len(c.ip) == 16 {
-					ip := net.IP(c.ip)
-					lines = append(lines, fmt.Sprintf("%s/%d", ip.String(), c.prefix))
-				}
-			}
-		} else {
-			pos = skipField(data, pos, wireType)
-		}
-	}
-
-	out, err := os.Create(output)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	for _, l := range lines {
-		fmt.Fprintln(out, l)
-	}
-	fmt.Printf("✅ %s → %s: %d 条\n", input, output, len(lines))
-	return nil
-}
-
-// ============ GeoSite ============
-
-func parseDomain(data []byte) (int, string) {
-	var typ int
-	var value string
-	pos := 0
-	for pos < len(data) {
-		tag, p := readVarint(data, pos)
-		fieldNum := int(tag >> 3)
-		wireType := int(tag & 7)
-		pos = p
-		switch fieldNum {
-		case 1:
-			if wireType == 0 {
-				v, pp := readVarint(data, pos)
-				pos = pp
-				typ = int(v)
-			} else {
-				pos = skipField(data, pos, wireType)
-			}
-		case 2:
-			if wireType == 2 {
-				l, pp := readVarint(data, pos)
-				pos = pp
-				value = string(data[pos : pos+int(l)])
-				pos += int(l)
-			} else {
-				pos = skipField(data, pos, wireType)
-			}
-		default:
-			pos = skipField(data, pos, wireType)
-		}
-	}
-	return typ, value
-}
-
-func parseGeoSite(data []byte) (string, []string) {
-	var code string
-	var lines []string
-	pos := 0
-	for pos < len(data) {
-		tag, p := readVarint(data, pos)
-		fieldNum := int(tag >> 3)
-		wireType := int(tag & 7)
-		pos = p
-		switch fieldNum {
-		case 1:
-			if wireType == 2 {
-				l, pp := readVarint(data, pos)
-				pos = pp
-				code = string(data[pos : pos+int(l)])
-				pos += int(l)
-			} else {
-				pos = skipField(data, pos, wireType)
-			}
-		case 2:
-			if wireType == 2 {
-				l, pp := readVarint(data, pos)
-				pos = pp
-				typ, value := parseDomain(data[pos : pos+int(l)])
-				pos += int(l)
-				var prefix string
-				switch typ {
-				case 0:
-					prefix = ""
-				case 1:
-					prefix = "regexp:"
-				case 2:
-					prefix = "domain:"
-				case 3:
-					prefix = "full:"
-				}
-				if value != "" {
-					lines = append(lines, prefix+value)
-				}
-			} else {
-				pos = skipField(data, pos, wireType)
-			}
-		default:
-			pos = skipField(data, pos, wireType)
-		}
-	}
-	return code, lines
-}
-
-func convertGeoSite(input, output string, wantCode string) error {
-	data, err := os.ReadFile(input)
-	if err != nil {
-		return err
-	}
-
-	var lines []string
-	pos := 0
-	for pos < len(data) {
-		tag, p := readVarint(data, pos)
-		fieldNum := int(tag >> 3)
-		wireType := int(tag & 7)
-		pos = p
-		if fieldNum == 1 && wireType == 2 {
-			l, pp := readVarint(data, pos)
-			pos = pp
-			code, doms := parseGeoSite(data[pos : pos+int(l)])
-			pos += int(l)
-			if code != wantCode {
-				continue
-			}
-			lines = append(lines, doms...)
-		} else {
-			pos = skipField(data, pos, wireType)
-		}
-	}
-
-	out, err := os.Create(output)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	for _, l := range lines {
-		fmt.Fprintln(out, l)
-	}
-	fmt.Printf("✅ %s → %s: %d 条\n", input, output, len(lines))
-	return nil
-}
-
-func main() {
-	if len(os.Args) < 5 {
-		fmt.Fprintln(os.Stderr, "用法: convert <geoip.dat> <geosite.dat> <out-dir> <code>")
-		os.Exit(1)
-	}
-	geoipDat := os.Args[1]
-	geositeDat := os.Args[2]
-	outDir := os.Args[3]
-	code := os.Args[4]
-
-	if err := os.MkdirAll(outDir, 0755); err != nil {
-		fmt.Fprintln(os.Stderr, "mkdir:", err)
-		os.Exit(1)
-	}
-
-	if err := convertGeoIP(geoipDat, outDir+"/geoip_"+code+".txt", code); err != nil {
-		fmt.Fprintln(os.Stderr, "convert geoip:", err)
-		os.Exit(1)
-	}
-	if err := convertGeoSite(geositeDat, outDir+"/geosite_"+code+".txt", code); err != nil {
-		fmt.Fprintln(os.Stderr, "convert geosite:", err)
-		os.Exit(1)
-	}
-
-	for _, name := range []string{"geoip_" + code + ".txt", "geosite_" + code + ".txt"} {
-		info, _ := os.Stat(outDir + "/" + name)
-		if info == nil || info.Size() == 0 {
-			fmt.Fprintf(os.Stderr, "❌ %s 为空\n", name)
-			os.Exit(1)
-		}
-		fmt.Printf("   %s: %d 字节\n", name, info.Size())
-	}
-
-	_ = strconv.Itoa(0)
-	_ = binary.BigEndian
-}
-GOEOF
-
-      - name: Convert .dat → .txt
-        if: steps.check.outputs.geoip_exists != 'true' || steps.check.outputs.geosite_exists != 'true'
-        run: |
-          cd /tmp/geo-tool
-          GO111MODULE=off go run convert.go /tmp/geoip.dat /tmp/geosite.dat /tmp/geo-out cn
-
-          if [ ! -s /tmp/geo-out/geoip_cn.txt ]; then
-            echo "❌ geoip_cn.txt 转换失败"
-            exit 1
-          fi
-          if [ ! -s /tmp/geo-out/geosite_cn.txt ]; then
-            echo "❌ geosite_cn.txt 转换失败"
+          if [ ! -s /tmp/geosite_cn.txt ]; then
+            echo "❌ 下载失败或文件为空"
             exit 1
           fi
 
-          echo ""
-          echo "========== 转换结果 =========="
-          echo "geoip_cn.txt: $(wc -l < /tmp/geo-out/geoip_cn.txt) 行"
-          echo "geosite_cn.txt: $(wc -l < /tmp/geo-out/geosite_cn.txt) 行"
-          echo ""
-          echo "--- geoip_cn.txt 前 5 行 ---"
-          head -5 /tmp/geo-out/geoip_cn.txt
-          echo "--- geosite_cn.txt 前 5 行 ---"
-          head -5 /tmp/geo-out/geosite_cn.txt
+          LINES=$(wc -l < /tmp/geosite_cn.txt)
+          echo "✅ 下载完成: $LINES 行"
+          head -5 /tmp/geosite_cn.txt
 
-      - name: Copy to repo
-        if: steps.check.outputs.geoip_exists != 'true' || steps.check.outputs.geosite_exists != 'true'
+          if [ "$LINES" -lt 100 ]; then
+            echo "❌ 行数太少（$LINES），可能下载不完整"
+            exit 1
+          fi
+
+          cp /tmp/geosite_cn.txt mobile/internal/data/geosite_cn.txt
+
+      - name: Show final status
         run: |
-          if [ -f /tmp/geo-out/geoip_cn.txt ]; then
-            cp /tmp/geo-out/geoip_cn.txt mobile/internal/data/geoip_cn.txt
-          fi
-          if [ -f /tmp/geo-out/geosite_cn.txt ]; then
-            cp /tmp/geo-out/geosite_cn.txt mobile/internal/data/geosite_cn.txt
-          fi
+          echo "========== 数据文件状态 =========="
           ls -lh mobile/internal/data/
+          echo ""
+          echo "geoip_cn.txt: $(wc -l < mobile/internal/data/geoip_cn.txt) 行"
+          echo "geosite_cn.txt: $(wc -l < mobile/internal/data/geosite_cn.txt) 行"
 
       - name: Commit and push
         run: |
@@ -469,13 +139,12 @@ GOEOF
           GEOIP_LINES=$(wc -l < mobile/internal/data/geoip_cn.txt)
           GEOSITE_LINES=$(wc -l < mobile/internal/data/geosite_cn.txt)
 
-          git commit -m "chore: 更新 geo 数据文件（Loyalsoldier 镜像）
+          git commit -m "chore: 更新 geo 数据文件
 
-          - geoip_cn.txt: $GEOIP_LINES 行
-          - geosite_cn.txt: $GEOSITE_LINES 行
+          - geoip_cn.txt: $GEOIP_LINES 行（17mon/china_ip_list）
+          - geosite_cn.txt: $GEOSITE_LINES 行（v2fly/domain-list-community）
 
-          来源: Loyalsoldier/v2ray-rules-dat
-          由 GitHub Actions 自动转换"
+          由 GitHub Actions 自动下载"
 
           git push
           echo "✅ 已提交并推送"
