@@ -29,11 +29,14 @@ type WSTransport struct {
 	stopping    bool
 }
 
-func NewWSTransport(signalingURL, roomId, clientId, connectToken, preferredIP string, preferredPort int) (*WSTransport, error) {
+// NewWSTransport 建立信令 WebSocket。
+// uuid 用于 URL 认证（服务端按 ?token= 读取），同时可用于日志标识。
+func NewWSTransport(signalingURL, roomId, clientId, uuid, preferredIP string, preferredPort int) (*WSTransport, error) {
 	base := strings.TrimRight(signalingURL, "/")
 	fullURL := base + "/ws/" + url.PathEscape(roomId) + "?cid=" + url.QueryEscape(clientId)
-	if connectToken != "" {
-		fullURL += "&token=" + url.QueryEscape(connectToken)
+	if uuid != "" {
+		// 服务端按 query 参数 "token" 读取（保持向后兼容）
+		fullURL += "&token=" + url.QueryEscape(uuid)
 	}
 
 	u, err := url.Parse(fullURL)
@@ -108,12 +111,6 @@ func maskToken(u string) string {
 		return u
 	}
 	return parts[0] + "token=***"
-}
-
-func (ws *WSTransport) getConn() *websocket.Conn {
-	ws.mu.Lock()
-	defer ws.mu.Unlock()
-	return ws.conn
 }
 
 func (ws *WSTransport) readLoop(conn *websocket.Conn) {
