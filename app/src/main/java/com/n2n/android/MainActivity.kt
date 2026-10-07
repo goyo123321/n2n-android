@@ -2,8 +2,10 @@ package com.n2n.android
 
 import android.Manifest
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
-import android.net.Uri
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
@@ -48,25 +50,6 @@ class MainActivity : AppCompatActivity() {
         ActivityResultContracts.RequestPermission()
     ) { }
 
-    private val pickDirLauncher = registerForActivityResult(
-        ActivityResultContracts.OpenDocumentTree()
-    ) { uri: Uri? ->
-        if (uri != null) {
-            try {
-                contentResolver.takePersistableUriPermission(
-                    uri,
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION or
-                        Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-                )
-                Prefs.saveShareDirUri(this, uri.toString())
-                refreshShareDirDisplay(uri.toString())
-                toast("共享目录已更新")
-            } catch (e: Exception) {
-                toast("授权失败: ${e.message}")
-            }
-        }
-    }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         applyThemeMode(Prefs.loadThemeMode(this))
         super.onCreate(savedInstanceState)
@@ -76,7 +59,7 @@ class MainActivity : AppCompatActivity() {
 
         loadConfig(savedInstanceState)
         handleIntentParams(intent)
-        refreshShareDirDisplay(Prefs.loadShareDirUri(this))
+        refreshShareDirDisplay()
 
         requestNotifPermissionIfNeeded()
         requestIgnoreBatteryOptimizationIfNeeded()
@@ -104,7 +87,8 @@ class MainActivity : AppCompatActivity() {
             saveCurrentInput()
             toast("已保存")
         }
-        binding.btnPickDir.setOnClickListener { pickDirLauncher.launch(null) }
+        // ★ 原「选择目录」按钮改成交互说明弹窗（Go 侧只支持默认目录）
+        binding.btnPickDir.setOnClickListener { showShareDirInfo() }
         binding.btnManageFiles.setOnClickListener {
             startActivity(Intent(this, FileManagerActivity::class.java))
         }
@@ -185,7 +169,7 @@ class MainActivity : AppCompatActivity() {
     @android.annotation.SuppressLint("BatteryLife")
     private fun requestIgnoreBatteryOptimizationIfNeeded() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
-        val pm = getSystemService(android.content.Context.POWER_SERVICE)
+        val pm = getSystemService(Context.POWER_SERVICE)
             as android.os.PowerManager
         val pkg = packageName
         if (pm.isIgnoringBatteryOptimizations(pkg)) return
@@ -378,8 +362,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startVpnService() {
-        val safUri = Prefs.loadShareDirUri(this)
-        val shareDir = ShareDirManager.getAbsolutePathForGo(this, safUri)
+        val shareDir = ShareDirManager.getDefaultShareDir(this).absolutePath
         val preferredIp = binding.etPreferredIp.text.toString().trim()
 
         val intent = Intent(this, N2nVpnService::class.java).apply {
@@ -524,16 +507,40 @@ class MainActivity : AppCompatActivity() {
         startActivity(intent)
     }
 
-    private fun refreshShareDirDisplay(uri: String?) {
-        binding.tvShareDir.text = if (uri.isNullOrEmpty()) {
-            ShareDirManager.getDefaultShareDir(this).absolutePath
-        } else {
-            try {
-                java.net.URLDecoder.decode(uri, "UTF-8")
-            } catch (e: Exception) {
-                uri
+    // ★ 无参：始终显示默认目录
+    private fun refreshShareDirDisplay() {
+        binding.tvShareDir.text = ShareDirManager.getDefaultShareDir(this).absolutePath
+    }
+
+    // ★ 替代原「选择目录」按钮的行为
+    private fun showShareDirInfo() {
+        val dir = ShareDirManager.getDefaultShareDir(this)
+        val path = dir.absolutePath
+        AlertDialog.Builder(this)
+            .setTitle("共享盘目录")
+            .setMessage(
+                """
+                当前共享盘固定使用以下目录：
+
+                $path
+
+                • MT 管理器 / USB 连电脑可直接访问
+                • 微信/QQ 能直接选到里面的文件
+                • 通过 n2n 组网的其它设备可访问
+
+                如需自定义目录，请在"管理文件"中把文件放进去即可。
+                """.trimIndent()
+            )
+            .setPositiveButton("复制路径") { _, _ ->
+                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("n2n share dir", path))
+                toast("已复制路径")
             }
-        }
+            .setNeutralButton("管理文件") { _, _ ->
+                startActivity(Intent(this, FileManagerActivity::class.java))
+            }
+            .setNegativeButton("关闭", null)
+            .show()
     }
 
     private fun toast(msg: String) {
