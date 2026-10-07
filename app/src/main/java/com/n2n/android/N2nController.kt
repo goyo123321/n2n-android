@@ -11,6 +11,8 @@ object N2nController {
 
     private const val TAG = "N2nController"
 
+    // ★ @Volatile：start 线程写入，UI / 后台线程读取，避免可见性问题
+    @Volatile
     private var client: Client? = null
     private val running = AtomicBoolean(false)
 
