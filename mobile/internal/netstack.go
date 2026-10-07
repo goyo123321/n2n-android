@@ -90,14 +90,22 @@ func NewNetstackHost(virtualIP string) (*NetstackHost, error) {
 }
 
 // Close 释放 gVisor stack 资源
+//
+// 注意：channel.Endpoint 的 Read() 在 Close 之后可能还在阻塞，
+// 先 Close stack 让内部 goroutine 退出，再 Wait 收敛。
 func (n *NetstackHost) Close() error {
 	n.mu.Lock()
-	defer n.mu.Unlock()
-	if n.stack != nil {
-		n.stack.Close()
-		n.stack.Wait()
-		n.stack = nil
+	if n.stack == nil {
+		n.mu.Unlock()
+		return nil
 	}
+	s := n.stack
+	n.stack = nil
+	n.started = false
+	n.mu.Unlock()
+
+	s.Close()
+	s.Wait()
 	return nil
 }
 
@@ -126,6 +134,7 @@ func (n *NetstackHost) startTCPForwarder() {
 		targetIP := id.LocalAddress.String()
 		targetPort := int(id.LocalPort)
 
+		// 目标是自己 → 直接 Complete(true) 让 gVisor 拒绝
 		if targetIP == net.IP(n.v4[:]).String() {
 			r.Complete(true)
 			return
@@ -161,7 +170,12 @@ func (n *NetstackHost) startTCPForwarder() {
 			var wq waiter.Queue
 			ep, epErr := r.CreateEndpoint(&wq)
 			if epErr != nil {
-				rawConn.Close()
+				// ★ 修复：Endpoint 建立失败必须 Complete(true)，
+				//    否则 gVisor 内部会残留一个半初始化的 pending endpoint，
+				//    长时间运行会持续泄漏。
+				log.Printf("[Netstack-TCP] CreateEndpoint 失败: %v", epErr)
+				_ = rawConn.Close()
+				r.Complete(true)
 				return
 			}
 			r.Complete(false)
@@ -170,8 +184,8 @@ func (n *NetstackHost) startTCPForwarder() {
 			go func() {
 				defer conn.Close()
 				defer rawConn.Close()
-				go func() { io.Copy(rawConn, conn) }()
-				io.Copy(conn, rawConn)
+				go func() { _, _ = io.Copy(rawConn, conn) }()
+				_, _ = io.Copy(conn, rawConn)
 			}()
 			return
 		}
@@ -192,7 +206,10 @@ func (n *NetstackHost) startTCPForwarder() {
 		var wq waiter.Queue
 		ep, epErr := r.CreateEndpoint(&wq)
 		if epErr != nil {
-			stream.Close()
+			// ★ 同上：建 Endpoint 失败，补 Complete(true)
+			log.Printf("[Netstack-TCP] CreateEndpoint(proxy) 失败: %v", epErr)
+			_ = stream.Close()
+			r.Complete(true)
 			return
 		}
 		r.Complete(false)
@@ -201,8 +218,8 @@ func (n *NetstackHost) startTCPForwarder() {
 		go func() {
 			defer conn.Close()
 			defer stream.Close()
-			go func() { io.Copy(stream, conn) }()
-			io.Copy(conn, stream)
+			go func() { _, _ = io.Copy(stream, conn) }()
+			_, _ = io.Copy(conn, stream)
 		}()
 	})
 
@@ -223,17 +240,29 @@ func (n *NetstackHost) startUDPForwarder() {
 			n.handleDNSUDP(r)
 			return
 		}
+		// ★ 其它 UDP 端口：当前实现不转发，让 gVisor 自动拒绝。
+		//    如果不调 Complete，gVisor 会一直挂着这个 request，
+		//    sendto() 会一直阻塞直到应用超时。
+		r.Complete(true)
 	})
 	n.stack.SetTransportProtocolHandler(udp.ProtocolNumber, forwarder.HandlePacket)
 }
 
 func (n *NetstackHost) handleDNSUDP(r *udp.ForwarderRequest) {
+	if n.dnsProxy == nil {
+		log.Printf("[Netstack-UDP] DNS proxy 未就绪，拒绝 DNS 请求")
+		r.Complete(true)
+		return
+	}
+
 	var wq waiter.Queue
 	ep, epErr := r.CreateEndpoint(&wq)
 	if epErr != nil {
 		log.Printf("[Netstack-UDP] CreateEndpoint 失败: %v", epErr)
+		r.Complete(true)
 		return
 	}
+	r.Complete(false)
 
 	conn := gonet.NewUDPConn(&wq, ep)
 	go func() {
@@ -248,11 +277,9 @@ func (n *NetstackHost) handleDNSUDP(r *udp.ForwarderRequest) {
 			query := make([]byte, nr)
 			copy(query, buf[:nr])
 
-			if n.dnsProxy != nil {
-				resp, err := n.dnsProxy.HandleDNSQuery(query)
-				if err == nil && resp != nil {
-					_, _ = conn.Write(resp)
-				}
+			resp, err := n.dnsProxy.HandleDNSQuery(query)
+			if err == nil && resp != nil {
+				_, _ = conn.Write(resp)
 			}
 		}
 	}()
@@ -274,7 +301,16 @@ func (n *NetstackHost) InjectTUNPacket(data []byte) {
 }
 
 func (n *NetstackHost) ReadTUNPacket() ([]byte, bool) {
-	pkt := n.linkEP.Read()
+	// netstack 已被 Close → 直接返回
+	n.mu.Lock()
+	ep := n.linkEP
+	closed := n.stack == nil
+	n.mu.Unlock()
+	if closed || ep == nil {
+		return nil, false
+	}
+
+	pkt := ep.Read()
 	if pkt == nil {
 		return nil, false
 	}
@@ -326,7 +362,7 @@ func (n *NetstackHost) StartShareServer(rootDir string) error {
 
 	go func() {
 		log.Printf("[Netstack] 共享盘监听 http://%s:%d/", net.IP(n.v4[:]).String(), shareServerPort)
-		if err := srv.Serve(lis); err != nil {
+		if err := srv.Serve(lis); err != nil && err != http.ErrServerClosed {
 			log.Printf("[Netstack] HTTP 退出: %v", err)
 		}
 	}()
@@ -485,7 +521,7 @@ func (n *NetstackHost) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if n.progress != nil {
 		n.progress.Complete(filename, int(written), true)
 	}
-	fmt.Fprintf(w, "OK: %d bytes", written)
+	_, _ = fmt.Fprintf(w, "OK: %d bytes", written)
 }
 
 func (n *NetstackHost) handleDelete(w http.ResponseWriter, r *http.Request) {
@@ -535,7 +571,7 @@ func (n *NetstackHost) handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write([]byte(shareIndexHTML))
+	_, _ = w.Write([]byte(shareIndexHTML))
 }
 
 const shareIndexHTML = `<!DOCTYPE html>
