@@ -148,6 +148,35 @@ func (n *NetstackHost) startTCPForwarder() {
 			return
 		}
 
+		// ★ ActionDirect：走物理网络直连（protectedDialer 绕过 TUN）
+		if action == ActionDirect {
+			d := newProtectedDialer()
+			rawConn, err := d.Dial("tcp", net.JoinHostPort(targetIP, strconv.Itoa(targetPort)))
+			if err != nil {
+				log.Printf("[Netstack-TCP] Direct 连接失败: %v", err)
+				r.Complete(true)
+				return
+			}
+
+			var wq waiter.Queue
+			ep, epErr := r.CreateEndpoint(&wq)
+			if epErr != nil {
+				rawConn.Close()
+				return
+			}
+			r.Complete(false)
+
+			conn := gonet.NewTCPConn(&wq, ep)
+			go func() {
+				defer conn.Close()
+				defer rawConn.Close()
+				go func() { io.Copy(rawConn, conn) }()
+				io.Copy(conn, rawConn)
+			}()
+			return
+		}
+
+		// ActionProxy / ActionP2P：走 Worker / TURN
 		if n.onProxyTCPConn == nil {
 			r.Complete(true)
 			return
@@ -155,7 +184,7 @@ func (n *NetstackHost) startTCPForwarder() {
 
 		stream, err := n.onProxyTCPConn(targetIP, targetPort)
 		if err != nil {
-			log.Printf("[Netstack-TCP] 建立失败: %v", err)
+			log.Printf("[Netstack-TCP] Proxy 失败: %v", err)
 			r.Complete(true)
 			return
 		}
