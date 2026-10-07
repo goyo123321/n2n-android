@@ -65,7 +65,7 @@ type Edge struct {
 	doneCh  chan struct{}
 	closeMu sync.Mutex
 	closed  bool
-	mu      sync.Mutex
+	mu      sync.Mutex // 保护 natMeta / ws / netstack / wsOutbound / httpProxy
 }
 
 var httpClient = &http.Client{Timeout: 30 * time.Second}
@@ -162,18 +162,33 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	}
 	e.tun = tun
 
+	// 关闭辅助：Start 中途失败时清理已分配资源
+	cleanupOnFail := func(closeTun, closeUdp, closeStun bool) {
+		if closeStun && e != nil {
+			// stun 尚未挂到 e 上时由局部变量管理，见下方
+		}
+		if closeUdp && e.udpConn != nil {
+			_ = e.udpConn.Close()
+		}
+		if closeTun && e.tun != nil {
+			_ = e.tun.Close()
+		}
+	}
+	_ = cleanupOnFail
+
 	// 2. UDP（P2P 打洞，protected）
 	var udpConn net.PacketConn
 	if udpFd > 0 {
 		file := os.NewFile(uintptr(udpFd), "protected-udp")
 		if file != nil {
 			pc, err := net.FilePacketConn(file)
+			// FilePacketConn 会 dup fd，因此无论成败都要关掉原 file
+			_ = file.Close()
 			if err == nil {
 				udpConn = pc
 				log.Printf("[P2P] 使用 protected UDP fd=%d（绕过 VPN）", udpFd)
 			} else {
 				log.Printf("[P2P] FilePacketConn 失败: %v，回退默认 socket", err)
-				file.Close()
 			}
 		}
 	}
@@ -181,6 +196,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		addr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
 		u, err := net.ListenUDP("udp", addr)
 		if err != nil {
+			_ = tun.Close()
 			return nil, fmt.Errorf("绑定 UDP 失败: %w", err)
 		}
 		udpConn = u
@@ -201,12 +217,12 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		file := os.NewFile(uintptr(stunFd), "protected-stun")
 		if file != nil {
 			pc, err := net.FilePacketConn(file)
+			_ = file.Close()
 			if err == nil {
 				stunConn = pc
 				log.Printf("[NAT] 使用 protected STUN socket fd=%d", stunFd)
 			} else {
 				log.Printf("[NAT] STUN FilePacketConn 失败: %v", err)
-				file.Close()
 			}
 		}
 	}
@@ -220,10 +236,11 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		cfg.PreferredIP, cfg.PreferredPort,
 	)
 	if err != nil {
-		udpConn.Close()
+		_ = udpConn.Close()
 		if stunConn != nil {
-			stunConn.Close()
+			_ = stunConn.Close()
 		}
+		_ = tun.Close()
 		return nil, fmt.Errorf("连接信令失败: %w", err)
 	}
 	e.ws = ws
@@ -292,7 +309,6 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 			})
 		}
 
-		// ★ UUID：取 ConnectToken，为空则用默认
 		uuid := cfg.ConnectToken
 		if uuid == "" {
 			uuid = "2523c510-9ff0-415b-9582-93949bfae7e3"
@@ -330,15 +346,36 @@ func (e *Edge) Stop() {
 	close(e.doneCh)
 	e.closeMu.Unlock()
 
-	if e.ws != nil { _ = e.ws.Close() }
-	if e.turnClient != nil { e.turnClient.Close() }
-	if e.udpConn != nil { _ = e.udpConn.Close() }
-	if e.tun != nil { _ = e.tun.Close() }
-	if e.wsOutbound != nil { e.wsOutbound.Close() }
-	if e.httpProxy != nil { e.httpProxy.Close() }
-	if e.netstack != nil {
-		_ = e.netstack.Close()
-		e.netstack = nil
+	if e.ws != nil {
+		_ = e.ws.Close()
+	}
+	if e.turnClient != nil {
+		e.turnClient.Close()
+	}
+	if e.udpConn != nil {
+		_ = e.udpConn.Close()
+	}
+	if e.tun != nil {
+		_ = e.tun.Close()
+	}
+
+	e.mu.Lock()
+	wsOut := e.wsOutbound
+	proxy := e.httpProxy
+	ns := e.netstack
+	e.wsOutbound = nil
+	e.httpProxy = nil
+	e.netstack = nil
+	e.mu.Unlock()
+
+	if wsOut != nil {
+		wsOut.Close()
+	}
+	if proxy != nil {
+		proxy.Close()
+	}
+	if ns != nil {
+		_ = ns.Close()
 	}
 	log.Printf("[Edge] 已停止")
 }
@@ -355,8 +392,6 @@ func (e *Edge) GetClientID() string { return e.clientId }
 
 func (e *Edge) GetPeersJSON() string {
 	e.peersMu.RLock()
-	defer e.peersMu.RUnlock()
-
 	type pair struct {
 		id string
 		p  *PeerInfo
@@ -365,6 +400,8 @@ func (e *Edge) GetPeersJSON() string {
 	for id, p := range e.peers {
 		list = append(list, pair{id, p})
 	}
+	e.peersMu.RUnlock()
+
 	for i := 0; i < len(list); i++ {
 		for j := i + 1; j < len(list); j++ {
 			if list[i].id > list[j].id {
@@ -446,13 +483,15 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			}
 		}
 
-		if e.netstack == nil && vip != "" {
+		e.mu.Lock()
+		nsExisting := e.netstack
+		e.mu.Unlock()
+		if nsExisting == nil && vip != "" {
 			ns, err := NewNetstackHost(vip)
 			if err != nil {
 				log.Printf("[Netstack] 初始化失败: %v", err)
 			} else {
 				ns.progress = e.progress
-				e.netstack = ns
 
 				dnsCache := NewDNSCache()
 				if dp, err := NewDNSProxy(dnsCache, func() *WSOutbound {
@@ -475,11 +514,20 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 				})
 				log.Printf("[Netstack] ProxyHandler 已挂载")
 
-				go e.netstackReadLoop()
+				e.mu.Lock()
+				if e.netstack != nil {
+					e.mu.Unlock()
+					_ = ns.Close()
+				} else {
+					e.netstack = ns
+					e.mu.Unlock()
 
-				if e.cfg != nil && e.cfg.ShareDir != "" {
-					if err := ns.StartShareServer(e.cfg.ShareDir); err != nil {
-						log.Printf("[Netstack] 共享盘启动失败: %v", err)
+					go e.netstackReadLoop(ns)
+
+					if e.cfg != nil && e.cfg.ShareDir != "" {
+						if err := ns.StartShareServer(e.cfg.ShareDir); err != nil {
+							log.Printf("[Netstack] 共享盘启动失败: %v", err)
+						}
 					}
 				}
 			}
@@ -491,18 +539,24 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			log.Printf("[信令] ready: 返回 %d 个已有节点", len(peers))
 			for _, p := range peers {
 				pm, ok := p.(map[string]interface{})
-				if !ok { continue }
+				if !ok {
+					continue
+				}
 				pid, _ := pm["id"].(string)
 				pip, _ := pm["virtualIp"].(string)
 				pubIP, _ := pm["publicIp"].(string)
 				pubPort := jsonInt(pm["publicPort"])
 				sharePort := jsonInt(pm["sharePort"])
 				relayAddr, _ := pm["turnRelayAddr"].(string)
-				if pid == "" || pip == "" { continue }
+				if pid == "" || pip == "" {
+					continue
+				}
 				e.registerPeer(pid, pip, pubIP, pubPort, sharePort)
 				if relayAddr != "" {
 					e.peersMu.Lock()
-					if pi, ok := e.peers[pid]; ok { pi.TurnRelayAddr = relayAddr }
+					if pi, ok := e.peers[pid]; ok {
+						pi.TurnRelayAddr = relayAddr
+					}
 					e.peersMu.Unlock()
 				}
 				log.Printf("[信令] 已有节点: %s vip=%s pub=%s:%d share=%d", pid, pip, pubIP, pubPort, sharePort)
@@ -511,7 +565,9 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 
 	case "joined":
 		payload, _ := msg["payload"].(map[string]interface{})
-		if payload == nil { return }
+		if payload == nil {
+			return
+		}
 		pip, _ := payload["virtualIp"].(string)
 		pubIP, _ := payload["publicIp"].(string)
 		pubPort := jsonInt(payload["publicPort"])
@@ -524,7 +580,9 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			e.registerPeer(from, pip, pubIP, pubPort, sharePort)
 			if relayAddr != "" {
 				e.peersMu.Lock()
-				if pi, ok := e.peers[from]; ok { pi.TurnRelayAddr = relayAddr }
+				if pi, ok := e.peers[from]; ok {
+					pi.TurnRelayAddr = relayAddr
+				}
 				e.peersMu.Unlock()
 			}
 		}
@@ -544,7 +602,9 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		relayAddr, _ := msg["relayAddr"].(string)
 		if edgeMac != "" && relayAddr != "" {
 			e.peersMu.Lock()
-			if p, ok := e.peers[edgeMac]; ok { p.TurnRelayAddr = relayAddr }
+			if p, ok := e.peers[edgeMac]; ok {
+				p.TurnRelayAddr = relayAddr
+			}
 			e.peersMu.Unlock()
 		}
 
@@ -588,6 +648,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 func (e *Edge) reportMetadata() {
 	e.mu.Lock()
 	nm := e.natMeta
+	ws := e.ws
 	e.mu.Unlock()
 
 	metaPayload := map[string]interface{}{
@@ -606,17 +667,24 @@ func (e *Edge) reportMetadata() {
 	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%s p2pEndpoint=%s sharePort=9090",
 		nm.NATType, nm.PublicEndpoint, nm.P2PEndpoint)
 
-	_ = e.ws.Send(map[string]interface{}{"type": "p2p_metadata", "payload": metaPayload})
-	_ = e.ws.Send(map[string]interface{}{
+	if ws == nil {
+		return
+	}
+	_ = ws.Send(map[string]interface{}{"type": "p2p_metadata", "payload": metaPayload})
+
+	vip := e.GetVirtualIP()
+	_ = ws.Send(map[string]interface{}{
 		"type": "share_announce",
 		"payload": map[string]interface{}{
-			"name": e.nodeName, "virtualIp": e.GetVirtualIP(), "port": 9090,
+			"name": e.nodeName, "virtualIp": vip, "port": 9090,
 		},
 	})
 }
 
 func jsonInt(v interface{}) int {
-	if f, ok := v.(float64); ok { return int(f) }
+	if f, ok := v.(float64); ok {
+		return int(f)
+	}
 	return 0
 }
 
@@ -628,11 +696,21 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, sharePort int) 
 	e.peersMu.Lock()
 	defer e.peersMu.Unlock()
 	if p, ok := e.peers[pid]; ok {
-		if vip != "" { p.VirtualIP = vip }
-		if pubIP != "" { p.PubIP = pubIP }
-		if pubPort > 0 { p.PubPort = pubPort }
-		if sharePort > 0 { p.SharePort = sharePort }
-		if udpAddr != nil { p.UDPAddr = udpAddr }
+		if vip != "" {
+			p.VirtualIP = vip
+		}
+		if pubIP != "" {
+			p.PubIP = pubIP
+		}
+		if pubPort > 0 {
+			p.PubPort = pubPort
+		}
+		if sharePort > 0 {
+			p.SharePort = sharePort
+		}
+		if udpAddr != nil {
+			p.UDPAddr = udpAddr
+		}
 	} else {
 		e.peers[pid] = &PeerInfo{
 			ClientID: pid, VirtualIP: vip, PubIP: pubIP,
@@ -642,14 +720,22 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, sharePort int) 
 }
 
 func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
-	if instr.TargetMac == "" { return }
+	if instr.TargetMac == "" {
+		return
+	}
 	var udpAddr *net.UDPAddr
-	if instr.TargetPubSocket != "" { udpAddr = parseSockAddr(instr.TargetPubSocket) }
+	if instr.TargetPubSocket != "" {
+		udpAddr = parseSockAddr(instr.TargetPubSocket)
+	}
 	e.peersMu.Lock()
 	defer e.peersMu.Unlock()
 	if p, ok := e.peers[instr.TargetMac]; ok {
-		if udpAddr != nil { p.UDPAddr = udpAddr }
-		if instr.TargetVirtualIp != "" { p.VirtualIP = instr.TargetVirtualIp }
+		if udpAddr != nil {
+			p.UDPAddr = udpAddr
+		}
+		if instr.TargetVirtualIp != "" {
+			p.VirtualIP = instr.TargetVirtualIp
+		}
 	} else {
 		e.peers[instr.TargetMac] = &PeerInfo{
 			ClientID: instr.TargetMac, VirtualIP: instr.TargetVirtualIp, UDPAddr: udpAddr,
@@ -689,13 +775,19 @@ func (e *Edge) udpReadLoop() {
 			}
 			return
 		}
-		if n < 4 { continue }
+		if n < 4 {
+			continue
+		}
 		if buf[0] == 'N' && buf[1] == '2' && buf[2] == 'N' && buf[3] == 'P' {
-			if ua, ok := addr.(*net.UDPAddr); ok { e.notePeerTraffic(ua) }
+			if ua, ok := addr.(*net.UDPAddr); ok {
+				e.notePeerTraffic(ua)
+			}
 			continue
 		}
 		if buf[0]>>4 == 4 {
-			if ua, ok := addr.(*net.UDPAddr); ok { e.notePeerTraffic(ua) }
+			if ua, ok := addr.(*net.UDPAddr); ok {
+				e.notePeerTraffic(ua)
+			}
 			e.onRemotePacket(buf[:n])
 		}
 	}
@@ -713,20 +805,29 @@ func (e *Edge) tunReadLoop() {
 			}
 			return
 		}
-		if n < 20 || buf[0]>>4 != 4 { continue }
+		if n < 20 || buf[0]>>4 != 4 {
+			continue
+		}
 
 		dstIP := net.IP(buf[16:20]).String()
 		vip := e.GetVirtualIP()
 
-		if dstIP == vip && e.netstack != nil {
-			e.netstack.InjectTUNPacket(buf[:n])
+		e.mu.Lock()
+		ns := e.netstack
+		e.mu.Unlock()
+
+		if dstIP == vip && ns != nil {
+			ns.InjectTUNPacket(buf[:n])
 			continue
 		}
 
 		e.peersMu.RLock()
 		var target *PeerInfo
 		for _, p := range e.peers {
-			if p.VirtualIP == dstIP { target = p; break }
+			if p.VirtualIP == dstIP {
+				target = p
+				break
+			}
 		}
 		e.peersMu.RUnlock()
 
@@ -737,8 +838,8 @@ func (e *Edge) tunReadLoop() {
 			continue
 		}
 
-		if e.netstack != nil {
-			e.netstack.InjectTUNPacket(buf[:n])
+		if ns != nil {
+			ns.InjectTUNPacket(buf[:n])
 		}
 	}
 }
@@ -749,20 +850,21 @@ func (e *Edge) tunWriteLoop() {
 		case <-e.doneCh:
 			return
 		case data := <-e.tunWriteCh:
-			if e.tun != nil { _, _ = e.tun.Write(data) }
+			if e.tun != nil {
+				_, _ = e.tun.Write(data)
+			}
 		}
 	}
 }
 
-func (e *Edge) netstackReadLoop() {
+func (e *Edge) netstackReadLoop(ns *NetstackHost) {
 	for {
 		select {
 		case <-e.doneCh:
 			return
 		default:
 		}
-		if e.netstack == nil { return }
-		data, ok := e.netstack.ReadTUNPacket()
+		data, ok := ns.ReadTUNPacket()
 		if !ok {
 			time.Sleep(time.Millisecond)
 			continue
@@ -772,7 +874,9 @@ func (e *Edge) netstackReadLoop() {
 }
 
 func (e *Edge) forwardPacketToPeer(data []byte) {
-	if len(data) < 20 || data[0]>>4 != 4 { return }
+	if len(data) < 20 || data[0]>>4 != 4 {
+		return
+	}
 	dstIP := net.IP(data[16:20]).String()
 
 	if dstIP == e.GetVirtualIP() {
@@ -783,7 +887,10 @@ func (e *Edge) forwardPacketToPeer(data []byte) {
 	e.peersMu.RLock()
 	var target *PeerInfo
 	for _, p := range e.peers {
-		if p.VirtualIP == dstIP { target = p; break }
+		if p.VirtualIP == dstIP {
+			target = p
+			break
+		}
 	}
 	e.peersMu.RUnlock()
 
@@ -804,18 +911,27 @@ func (e *Edge) enqueueTUN(data []byte) {
 }
 
 func (e *Edge) onRemotePacket(data []byte) {
-	if len(data) < 20 || data[0]>>4 != 4 { return }
+	if len(data) < 20 || data[0]>>4 != 4 {
+		return
+	}
 
 	dstIP := net.IP(data[16:20]).String()
 	vip := e.GetVirtualIP()
-	if dstIP != vip { return }
+	if dstIP != vip {
+		return
+	}
 
 	const sharePort = 9090
 	proto := data[9]
 	if proto == 6 && len(data) >= 24 {
 		dstPort := int(binary.BigEndian.Uint16(data[22:24]))
 		if dstPort == sharePort {
-			if e.netstack != nil { e.netstack.InjectTUNPacket(data) }
+			e.mu.Lock()
+			ns := e.netstack
+			e.mu.Unlock()
+			if ns != nil {
+				ns.InjectTUNPacket(data)
+			}
 			return
 		}
 	}
@@ -828,14 +944,26 @@ func (e *Edge) notePeerTraffic(addr *net.UDPAddr) {
 	var best *PeerInfo
 	bestScore := -1
 	for _, p := range e.peers {
-		if p.UDPAddr == nil || !p.UDPAddr.IP.Equal(addr.IP) { continue }
+		if p.UDPAddr == nil || !p.UDPAddr.IP.Equal(addr.IP) {
+			continue
+		}
 		score := 1
-		if p.UDPAddr.Port == addr.Port { score = 2 }
-		if score > bestScore { best = p; bestScore = score }
+		if p.UDPAddr.Port == addr.Port {
+			score = 2
+		}
+		if score > bestScore {
+			best = p
+			bestScore = score
+		}
 	}
-	if best == nil { e.peersMu.Unlock(); return }
+	if best == nil {
+		e.peersMu.Unlock()
+		return
+	}
 	best.lastRecvAt = now
-	if bestScore == 1 { best.UDPAddr = &net.UDPAddr{IP: addr.IP, Port: addr.Port} }
+	if bestScore == 1 {
+		best.UDPAddr = &net.UDPAddr{IP: addr.IP, Port: addr.Port}
+	}
 	clientID := best.ClientID
 	e.peersMu.Unlock()
 
