@@ -23,7 +23,7 @@ jobs:
       - name: Download geoip_cn.txt
         run: |
           curl -fsSL --retry 3 --retry-delay 5 \
-            "https://raw.githubusercontent.com/v2fly/geoip/master/text/cn.txt" \
+            "https://raw.githubusercontent.com/Loyalsoldier/geoip/release/text/cn.txt" \
             -o mobile/internal/data/geoip_cn.txt
           echo "geoip_cn.txt 行数: $(wc -l < mobile/internal/data/geoip_cn.txt)"
           echo "geoip_cn.txt 大小: $(du -h mobile/internal/data/geoip_cn.txt | cut -f1)"
