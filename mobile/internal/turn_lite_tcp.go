@@ -330,11 +330,33 @@ func (t *TURNTCPAllocation) refreshLoop() {
 		case <-t.stopCh:
 			return
 		case <-ticker.C:
-			_, err := t.sendRequest(msgRefreshRequest, []stunAttr{
+			resp, err := t.sendRequest(msgRefreshRequest, []stunAttr{
 				{typ: attrLifetime, value: uint32ToBytes(turnDefaultLifetime)},
 			}, true)
 			if err != nil {
 				log.Printf("[TURN-TCP] Refresh 失败: %v", err)
+				continue
+			}
+			// ★ 438 Stale Nonce：更新 nonce 后重试一次
+			if resp.msgType != msgRefreshSuccess {
+				code := parseErrorCode(resp.attrs[attrErrorCode])
+				if code == 438 {
+					newNonce := resp.attrs[attrNonce]
+					if len(newNonce) > 0 {
+						t.mu.Lock()
+						t.nonce = newNonce
+						t.mu.Unlock()
+						log.Printf("[TURN-TCP] 438 刷新 nonce，重试 Refresh")
+						_, err2 := t.sendRequest(msgRefreshRequest, []stunAttr{
+							{typ: attrLifetime, value: uint32ToBytes(turnDefaultLifetime)},
+						}, true)
+						if err2 != nil {
+							log.Printf("[TURN-TCP] 438 重试失败: %v", err2)
+						}
+					}
+				} else {
+					log.Printf("[TURN-TCP] Refresh 被拒: code=%d", code)
+				}
 			}
 		}
 	}
