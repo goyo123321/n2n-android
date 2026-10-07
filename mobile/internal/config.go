@@ -5,7 +5,7 @@ type Config struct {
 	RoomID        string
 	ClientID      string
 	NodeName      string
-	ConnectToken  string
+	UUID          string
 	ShareDir      string
 	PreferredIP   string
 	PreferredPort int
