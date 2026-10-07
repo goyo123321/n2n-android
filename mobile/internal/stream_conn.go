@@ -6,8 +6,6 @@ import (
 	"time"
 )
 
-// streamConn 把 io.ReadWriteCloser 包装成 net.Conn
-// 用于让 http.Transport 通过 wsOutbound / TURN 建立 HTTPS 连接
 type streamConn struct {
 	rwc    io.ReadWriteCloser
 	remote string
@@ -15,11 +13,7 @@ type streamConn struct {
 }
 
 func newStreamConn(rwc io.ReadWriteCloser, remote string) net.Conn {
-	return &streamConn{
-		rwc:    rwc,
-		remote: remote,
-		local:  "10.64.0.1:0",
-	}
+	return &streamConn{rwc: rwc, remote: remote, local: "10.64.0.1:0"}
 }
 
 func (c *streamConn) Read(b []byte) (int, error)  { return c.rwc.Read(b) }
