@@ -104,9 +104,6 @@ func (rm *RelayManager) GetState(peerId string) ConnType {
 }
 
 // SendToPeer 三级降级：P2P → TURN → WS
-//
-// ★ P3：P2P 用 net.PacketConn.WriteTo（udpConn 类型变了）
-//   修复后 UDP 失败时立即 WS 兜底，避免对称 NAT 首包丢失
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
 	state := rm.GetState(peerId)
 
@@ -115,7 +112,6 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 		sent := false
 
 		if target != nil && target.UDPAddr != nil {
-			// ★ WriteTo 替代 WriteToUDP
 			_, err := rm.edge.udpConn.WriteTo(data, target.UDPAddr)
 			if err == nil {
 				sent = true
@@ -151,23 +147,34 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 	return false
 }
 
+// Report 定期上报连接状态
+//
+// ★ 通过 rm.edge.doneCh 感知 Edge 停止，避免 goroutine 泄漏
+//   （反复启停 VPN 时若旧 goroutine 不退出，每次会累积一个 + 每 10 秒一次无效网络调用）
 func (rm *RelayManager) Report(interval time.Duration) {
 	go func() {
 		ticker := time.NewTicker(interval)
-		for range ticker.C {
-			rm.mu.RLock()
-			conns := make(map[string]string)
-			for peerId, t := range rm.states {
-				conns[peerId] = string(t)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				rm.mu.RLock()
+				conns := make(map[string]string)
+				for peerId, t := range rm.states {
+					conns[peerId] = string(t)
+				}
+				rm.mu.RUnlock()
+				if len(conns) == 0 {
+					continue
+				}
+				_ = rm.ws.Send(map[string]interface{}{
+					"type":    "connection_status",
+					"payload": map[string]interface{}{"connections": conns},
+				})
+			case <-rm.edge.doneCh:
+				// ★ Edge 停止时退出
+				return
 			}
-			rm.mu.RUnlock()
-			if len(conns) == 0 {
-				continue
-			}
-			_ = rm.ws.Send(map[string]interface{}{
-				"type":    "connection_status",
-				"payload": map[string]interface{}{"connections": conns},
-			})
 		}
 	}()
 }
