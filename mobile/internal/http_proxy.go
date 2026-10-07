@@ -81,7 +81,7 @@ func (p *HTTPProxy) handleConn(clientConn net.Conn) {
 	port := 0
 	fmt.Sscanf(portStr, "%d", &port)
 	if port <= 0 {
-		clientConn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+		_, _ = clientConn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
 		return
 	}
 
@@ -89,21 +89,21 @@ func (p *HTTPProxy) handleConn(clientConn net.Conn) {
 	if net.ParseIP(ipStr) == nil {
 		ips, err := net.LookupIP(ipStr)
 		if err != nil || len(ips) == 0 {
-			clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+			_, _ = clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 			return
 		}
 		ipStr = ips[0].String()
 	}
 
 	if p.wsOutbound == nil {
-		clientConn.Write([]byte("HTTP/1.1 503 Service Unavailable\r\n\r\n"))
+		_, _ = clientConn.Write([]byte("HTTP/1.1 503 Service Unavailable\r\n\r\n"))
 		return
 	}
 
 	remote, err := p.wsOutbound.NewStream(ipStr, port)
 	if err != nil {
 		log.Printf("[HTTPProxy] 建立 Workers 流失败: %v", err)
-		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		_, _ = clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
 	defer remote.Close()
@@ -111,7 +111,20 @@ func (p *HTTPProxy) handleConn(clientConn net.Conn) {
 	_ = clientConn.SetReadDeadline(time.Time{})
 
 	if req.Method == "CONNECT" {
-		clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		_, _ = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+
+		// ★ 关键修复：bufio.Reader 里可能已经缓存了客户端发来的 TLS ClientHello 头部，
+		//   必须原样转发给 remote，否则 HTTPS 握手会卡死/失败。
+		if n := br.Buffered(); n > 0 {
+			head, peekErr := br.Peek(n)
+			if peekErr == nil && len(head) > 0 {
+				if _, werr := remote.Write(head); werr != nil {
+					return
+				}
+			}
+			_, _ = br.Discard(n)
+		}
+
 		p.bridge(clientConn, remote)
 		return
 	}
@@ -121,7 +134,7 @@ func (p *HTTPProxy) handleConn(clientConn net.Conn) {
 	if err := req.Write(remote); err != nil {
 		return
 	}
-	io.Copy(clientConn, remote)
+	_, _ = io.Copy(clientConn, remote)
 }
 
 func (p *HTTPProxy) bridge(a, b io.ReadWriteCloser) {
@@ -129,11 +142,11 @@ func (p *HTTPProxy) bridge(a, b io.ReadWriteCloser) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		io.Copy(b, a)
+		_, _ = io.Copy(b, a)
 	}()
 	go func() {
 		defer wg.Done()
-		io.Copy(a, b)
+		_, _ = io.Copy(a, b)
 	}()
 	wg.Wait()
 }
@@ -147,6 +160,6 @@ func (p *HTTPProxy) Close() {
 	p.stopped = true
 	p.mu.Unlock()
 	if p.listener != nil {
-		p.listener.Close()
+		_ = p.listener.Close()
 	}
 }
