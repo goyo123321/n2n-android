@@ -35,19 +35,21 @@ type TURNClient struct {
 	relayAddr    net.Addr
 	server       *TURNServerInfo
 	signalingURL string
-	connectToken string
+	uuid         string // ★ 组网密钥（原 connectToken）
 	edge         *Edge
 	onMessage    func([]byte, net.Addr)
 	stopCh       chan struct{}
 
-	httpClient *http.Client // ★ protected，避免走 TUN 死循环
+	httpClient *http.Client // protected，避免走 TUN 死循环
 }
 
-func NewTURNClient(signalingURL string, connectToken string, edge *Edge) *TURNClient {
+// NewTURNClient 创建 TURN 客户端。
+// uuid 用于拉取 /api/turn-credentials 的凭证（服务端按 ?token= 读取）。
+func NewTURNClient(signalingURL string, uuid string, edge *Edge) *TURNClient {
 	protectedDialer := newProtectedDialer()
 	return &TURNClient{
 		signalingURL: signalingURL,
-		connectToken: connectToken,
+		uuid:         uuid,
 		edge:         edge,
 		stopCh:       make(chan struct{}),
 		httpClient: &http.Client{
@@ -70,8 +72,9 @@ func (tc *TURNClient) FetchAndSetup(ctx context.Context) error {
 	httpBase = strings.TrimRight(httpBase, "/")
 
 	credURL := fmt.Sprintf("%s/api/turn-credentials?ttl=86400", httpBase)
-	if tc.connectToken != "" {
-		credURL += "&token=" + url.QueryEscape(tc.connectToken)
+	if tc.uuid != "" {
+		// 服务端按 query 参数 "token" 读取（保持向后兼容）
+		credURL += "&token=" + url.QueryEscape(tc.uuid)
 	}
 
 	log.Printf("[TURN] 请求凭证: %s", redactToken(credURL))
