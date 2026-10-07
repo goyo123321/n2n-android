@@ -25,6 +25,9 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
 
+    // ★ 缓存上一次 peers JSON，避免每 3 秒全量重建 View
+    private var lastPeersJson: String = ""
+
     private val peersTicker = object : Runnable {
         override fun run() {
             if (N2nController.isRunning()) refreshPeers()
@@ -87,7 +90,7 @@ class MainActivity : AppCompatActivity() {
             saveCurrentInput()
             toast("已保存")
         }
-        // ★ 原「选择目录」按钮改成交互说明弹窗（Go 侧只支持默认目录）
+        // 原「选择目录」按钮改成交互说明弹窗（Go 侧只支持默认目录）
         binding.btnPickDir.setOnClickListener { showShareDirInfo() }
         binding.btnManageFiles.setOnClickListener {
             startActivity(Intent(this, FileManagerActivity::class.java))
@@ -438,14 +441,22 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ★ peers 状态未变化时跳过重建；数量一致时原地更新，数量变化时才重建
     private fun refreshPeers() {
         if (!N2nController.isRunning()) {
+            lastPeersJson = ""
             binding.tvPeerCount.text = "0"
             binding.tvPeersEmpty.visibility = View.VISIBLE
             binding.peersContainer.removeAllViews()
             return
         }
+
         val json = N2nController.getPeersJSON()
+
+        // 状态未变化 → 直接跳过，不重建 View
+        if (json == lastPeersJson) return
+        lastPeersJson = json
+
         val peers = try { JSONArray(json) } catch (e: Exception) { JSONArray() }
 
         binding.tvPeerCount.text = peers.length().toString()
@@ -455,10 +466,38 @@ class MainActivity : AppCompatActivity() {
             binding.peersContainer.removeAllViews()
             return
         }
-        binding.tvPeersEmpty.visibility = View.GONE
-        binding.peersContainer.removeAllViews()
-        val inflater = LayoutInflater.from(this)
 
+        binding.tvPeersEmpty.visibility = View.GONE
+        val inflater = LayoutInflater.from(this)
+        val existing = binding.peersContainer.childCount
+
+        // 数量一致时原地更新，不重建 View
+        if (existing == peers.length()) {
+            for (i in 0 until peers.length()) {
+                val p = peers.getJSONObject(i)
+                val row = binding.peersContainer.getChildAt(i)
+
+                val tvCode = row.findViewById<android.widget.TextView>(R.id.tvPeerCode)
+                val tvVip = row.findViewById<android.widget.TextView>(R.id.tvPeerVip)
+                val tvMeta = row.findViewById<android.widget.TextView>(R.id.tvPeerMeta)
+                val btnOpen = row.findViewById<com.google.android.material.button.MaterialButton>(R.id.btnOpenShare)
+
+                tvCode.text = p.optString("code", "?")
+                tvVip.text = p.optString("vip", "--")
+                val connType = p.optString("connType", "unknown")
+                val natType = p.optString("natType", "unknown")
+                tvMeta.text = "$connType · $natType"
+
+                val vip = p.optString("vip", "")
+                val sharePort = p.optInt("sharePort", 9090)
+                btnOpen.isEnabled = vip.isNotEmpty()
+                btnOpen.setOnClickListener { openShareInBrowser(vip, sharePort) }
+            }
+            return
+        }
+
+        // 数量不同（peer 上线/下线）→ 重建（这种情况不频繁）
+        binding.peersContainer.removeAllViews()
         for (i in 0 until peers.length()) {
             val p = peers.getJSONObject(i)
             val item = ItemPeerBinding.inflate(inflater, binding.peersContainer, false)
@@ -507,12 +546,10 @@ class MainActivity : AppCompatActivity() {
         startActivity(intent)
     }
 
-    // ★ 无参：始终显示默认目录
     private fun refreshShareDirDisplay() {
         binding.tvShareDir.text = ShareDirManager.getDefaultShareDir(this).absolutePath
     }
 
-    // ★ 替代原「选择目录」按钮的行为
     private fun showShareDirInfo() {
         val dir = ShareDirManager.getDefaultShareDir(this)
         val path = dir.absolutePath
