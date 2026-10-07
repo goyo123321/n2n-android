@@ -125,7 +125,10 @@ func (n *NetstackHost) SetProxyHandler(fn func(ip string, port int) (io.ReadWrit
 }
 
 // ============ TCP Forwarder ============
-
+//
+// gVisor 的 tcp.ForwarderRequest 有 Complete(handshake bool) 方法，
+// 所有失败路径必须调用 Complete(true) 释放内部资源，
+// 成功路径必须调用 Complete(false) 让 gVisor 建立端点。
 func (n *NetstackHost) startTCPForwarder() {
 	forwarder := tcp.NewForwarder(n.stack, 0, 65535, func(r *tcp.ForwarderRequest) {
 		id := r.ID()
@@ -167,8 +170,6 @@ func (n *NetstackHost) startTCPForwarder() {
 			var wq waiter.Queue
 			ep, epErr := r.CreateEndpoint(&wq)
 			if epErr != nil {
-				// 建 Endpoint 失败必须 Complete(true)，否则 gVisor 内部会
-				// 残留一个半初始化的 pending endpoint，持续泄漏。
 				log.Printf("[Netstack-TCP] CreateEndpoint 失败: %v", epErr)
 				_ = rawConn.Close()
 				r.Complete(true)
@@ -222,7 +223,11 @@ func (n *NetstackHost) startTCPForwarder() {
 }
 
 // ============ UDP Forwarder ============
-
+//
+// gVisor 的 udp.ForwarderRequest 没有 Complete 方法。
+// 只能通过 CreateEndpoint 决定是否接受，然后直接 return 即可。
+// - 不处理：直接 return，gVisor 会让 sendto 超时或返回错误
+// - 处理：CreateEndpoint 成功后，用 goroutine 读写
 func (n *NetstackHost) startUDPForwarder() {
 	forwarder := udp.NewForwarder(n.stack, func(r *udp.ForwarderRequest) {
 		id := r.ID()
@@ -231,21 +236,20 @@ func (n *NetstackHost) startUDPForwarder() {
 
 		log.Printf("[Netstack-UDP] %s:%d", targetIP, targetPort)
 
+		// 只处理 DNS
 		if targetPort == 53 {
 			n.handleDNSUDP(r)
 			return
 		}
-		// 其它 UDP 端口不转发，显式 Complete(true) 让 gVisor 拒绝，
-		// 否则 sendto() 会一直阻塞直到应用超时。
-		r.Complete(true)
+
+		// 其他 UDP 直接忽略（gVisor 会自动让 sendto 失败）
 	})
 	n.stack.SetTransportProtocolHandler(udp.ProtocolNumber, forwarder.HandlePacket)
 }
 
 func (n *NetstackHost) handleDNSUDP(r *udp.ForwarderRequest) {
 	if n.dnsProxy == nil {
-		log.Printf("[Netstack-UDP] DNS proxy 未就绪，拒绝 DNS 请求")
-		r.Complete(true)
+		log.Printf("[Netstack-UDP] DNS proxy 未就绪，忽略 DNS 请求")
 		return
 	}
 
@@ -253,10 +257,8 @@ func (n *NetstackHost) handleDNSUDP(r *udp.ForwarderRequest) {
 	ep, epErr := r.CreateEndpoint(&wq)
 	if epErr != nil {
 		log.Printf("[Netstack-UDP] CreateEndpoint 失败: %v", epErr)
-		r.Complete(true)
 		return
 	}
-	r.Complete(false)
 
 	conn := gonet.NewUDPConn(&wq, ep)
 	go func() {
@@ -295,8 +297,6 @@ func (n *NetstackHost) InjectTUNPacket(data []byte) {
 }
 
 // ReadTUNPacket 非阻塞读出。没有包时立即返回 (nil, false)。
-//
-// 建议使用 ReadTUNPacketContext（阻塞式），避免 CPU 轮询开销。
 func (n *NetstackHost) ReadTUNPacket() ([]byte, bool) {
 	n.mu.Lock()
 	ep := n.linkEP
@@ -320,9 +320,6 @@ func (n *NetstackHost) ReadTUNPacket() ([]byte, bool) {
 }
 
 // ReadTUNPacketContext 阻塞读取，直到有包或 ctx 被取消。
-//
-// CPU 开销远低于 1ms 轮询：空闲时只走 10ms 退避 sleep。
-// 返回 (nil, false) 表示 ctx 已取消或 netstack 已关闭。
 func (n *NetstackHost) ReadTUNPacketContext(ctx context.Context) ([]byte, bool) {
 	n.mu.Lock()
 	ep := n.linkEP
@@ -341,7 +338,6 @@ func (n *NetstackHost) ReadTUNPacketContext(ctx context.Context) ([]byte, bool) 
 
 		pkt := ep.Read()
 		if pkt == nil {
-			// 10ms 退避：兼顾响应性和 CPU 占用
 			select {
 			case <-ctx.Done():
 				return nil, false
