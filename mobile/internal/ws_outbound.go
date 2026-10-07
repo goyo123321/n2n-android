@@ -25,6 +25,9 @@ const (
 
 	// WebSocket 单帧 payload 上限，与 JS 端 16 位长度字段对齐
 	maxFramePayload = 0xFFFF
+
+	// ★ 每秒新流上限：防止单个 App（如 Telegram）的重连风暴吃光所有配额
+	maxStreamsPerSecond = 50
 )
 
 type WSOutbound struct {
@@ -51,6 +54,11 @@ type WSOutbound struct {
 	netInfo   *NetInfo
 
 	connected bool
+
+	// ★ 限流状态
+	rateMu      sync.Mutex
+	rateCount   int
+	rateResetAt time.Time
 }
 
 // NewWSOutbound 创建 Workers 出口代理客户端。
@@ -94,6 +102,7 @@ func NewWSOutbound(
 		clientID:      clientId,
 		virtualIP:     virtualIP,
 		udpPort:       udpPort,
+		rateResetAt:   time.Now(),
 	}
 	o.dialer = o.buildDialer()
 	go o.connectLoop()
@@ -310,6 +319,16 @@ func (o *WSOutbound) readLoop(conn *websocket.Conn) {
 			copy(cp, payload)
 			s.push(cp)
 		case frameClose, frameOpenFail:
+			// ★ 诊断日志：区分 Worker 侧失败 vs 远端关闭
+			kind := "远端"
+			if typ == frameOpenFail {
+				kind = "Worker"
+			}
+			if len(payload) > 0 {
+				log.Printf("[WSOut-Mux] stream %d 被 %s 关闭: %q", id, kind, string(payload))
+			} else {
+				log.Printf("[WSOut-Mux] stream %d 被 %s 关闭", id, kind)
+			}
 			s.closeInternal()
 			o.mu.Lock()
 			delete(o.streams, id)
@@ -431,6 +450,25 @@ func (o *WSOutbound) NewStream(targetIP string, targetPort int) (io.ReadWriteClo
 }
 
 func (o *WSOutbound) openMuxStream(ip4 net.IP, targetIP string, targetPort int) (io.ReadWriteCloser, error) {
+	// ★ 限流检查：1 秒内超过 maxStreamsPerSecond 个新流就拒绝
+	o.rateMu.Lock()
+	now := time.Now()
+	if now.Sub(o.rateResetAt) > time.Second {
+		o.rateCount = 0
+		o.rateResetAt = now
+	}
+	o.rateCount++
+	count := o.rateCount
+	o.rateMu.Unlock()
+
+	if count > maxStreamsPerSecond {
+		if count == maxStreamsPerSecond+1 {
+			log.Printf("[WSOut-Mux] ⚠️ 限流触发：1 秒内超过 %d 个新流，拒绝 %s:%d",
+				maxStreamsPerSecond, targetIP, targetPort)
+		}
+		return nil, fmt.Errorf("rate limited")
+	}
+
 	o.mu.Lock()
 	if !o.connected {
 		o.mu.Unlock()
@@ -488,7 +526,7 @@ type muxStream struct {
 
 	mu       sync.Mutex
 	buf      bytes.Buffer
-	notify   chan struct{} // 容量 1，用于唤醒 Read
+	notify   chan struct{}
 	closed   bool
 	closeOne sync.Once
 }
