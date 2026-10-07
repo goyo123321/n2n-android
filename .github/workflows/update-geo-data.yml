@@ -1,0 +1,79 @@
+name: Update GeoIP/GeoSite Data
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    name: Download v2fly geo data
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Create data directory
+        run: mkdir -p mobile/internal/data
+
+      - name: Download geoip_cn.txt
+        run: |
+          curl -fsSL --retry 3 --retry-delay 5 \
+            "https://raw.githubusercontent.com/v2fly/geoip/master/text/cn.txt" \
+            -o mobile/internal/data/geoip_cn.txt
+          echo "geoip_cn.txt 行数: $(wc -l < mobile/internal/data/geoip_cn.txt)"
+          echo "geoip_cn.txt 大小: $(du -h mobile/internal/data/geoip_cn.txt | cut -f1)"
+
+      - name: Download geosite_cn.txt
+        run: |
+          curl -fsSL --retry 3 --retry-delay 5 \
+            "https://raw.githubusercontent.com/v2fly/domain-list-community/master/data/cn" \
+            -o mobile/internal/data/geosite_cn.txt
+          echo "geosite_cn.txt 行数: $(wc -l < mobile/internal/data/geosite_cn.txt)"
+          echo "geosite_cn.txt 大小: $(du -h mobile/internal/data/geosite_cn.txt | cut -f1)"
+
+      - name: Verify files
+        run: |
+          [ -s mobile/internal/data/geoip_cn.txt ] || { echo "geoip_cn.txt 为空"; exit 1; }
+          [ -s mobile/internal/data/geosite_cn.txt ] || { echo "geosite_cn.txt 为空"; exit 1; }
+          echo "geoip 首行: $(head -1 mobile/internal/data/geoip_cn.txt)"
+          echo "geosite 首行: $(head -1 mobile/internal/data/geosite_cn.txt)"
+
+      - name: Check for changes
+        id: diff
+        run: |
+          if git diff --quiet mobile/internal/data/; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "数据文件无变化"
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "数据文件有更新"
+            git diff --stat mobile/internal/data/
+          fi
+
+      - name: Commit and push
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          DATE=$(date -u +%Y-%m-%d)
+          git add mobile/internal/data/
+          git commit -m "chore: update geoip/geosite data ($DATE)"
+          git push
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## GeoIP/GeoSite 更新结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 文件 | 行数 | 大小 |" >> $GITHUB_STEP_SUMMARY
+          echo "|:---|:---|:---|" >> $GITHUB_STEP_SUMMARY
+          echo "| geoip_cn.txt | $(wc -l < mobile/internal/data/geoip_cn.txt) | $(du -h mobile/internal/data/geoip_cn.txt | cut -f1) |" >> $GITHUB_STEP_SUMMARY
+          echo "| geosite_cn.txt | $(wc -l < mobile/internal/data/geosite_cn.txt) | $(du -h mobile/internal/data/geosite_cn.txt | cut -f1) |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "变化: ${{ steps.diff.outputs.changed }}" >> $GITHUB_STEP_SUMMARY
