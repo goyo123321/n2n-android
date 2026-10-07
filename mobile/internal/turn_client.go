@@ -233,4 +233,21 @@ func (tc *TURNClient) Close() {
 		tc.lite.Close()
 		tc.lite = nil
 	}
-	if tc
+	if tc.tcpAlloc != nil {
+		tc.tcpAlloc.Close()
+		tc.tcpAlloc = nil
+	}
+}
+
+func redactToken(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	q := u.Query()
+	if q.Get("token") != "" {
+		q.Set("token", "***")
+		u.RawQuery = q.Encode()
+	}
+	return u.String()
+}
