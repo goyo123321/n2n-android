@@ -9,7 +9,7 @@ permissions:
 jobs:
   update:
     runs-on: ubuntu-latest
-    name: Download v2fly geo data
+    name: Download Xray geo data
 
     steps:
       - name: Checkout
@@ -34,11 +34,10 @@ jobs:
         run: |
           OUTPUT="mobile/internal/data/geosite_cn.txt"
 
-          # 多源 fallback
           URLS=(
+            "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/geosite-cn.txt"
             "https://raw.githubusercontent.com/v2fly/domain-list-community/release/cn"
             "https://raw.githubusercontent.com/v2fly/domain-list-community/master/data/cn"
-            "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/geosite-cn.txt"
           )
 
           for URL in "${URLS[@]}"; do
@@ -66,9 +65,7 @@ jobs:
           [ -s mobile/internal/data/geoip_cn.txt ] || { echo "geoip_cn.txt 为空"; exit 1; }
           [ -s mobile/internal/data/geosite_cn.txt ] || { echo "geosite_cn.txt 为空"; exit 1; }
           echo "geoip 首行: $(head -1 mobile/internal/data/geoip_cn.txt)"
-          echo "geoip 尾行: $(tail -1 mobile/internal/data/geoip_cn.txt)"
           echo "geosite 首行: $(head -1 mobile/internal/data/geosite_cn.txt)"
-          echo "geosite 尾行: $(tail -1 mobile/internal/data/geosite_cn.txt)"
 
       - name: Check for changes
         id: diff
