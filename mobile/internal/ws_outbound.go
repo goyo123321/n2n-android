@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
@@ -21,6 +22,9 @@ const (
 	frameData     = 0x02
 	frameClose    = 0x03
 	frameOpenFail = 0x04
+
+	// WebSocket 单帧 payload 上限，与 JS 端 16 位长度字段对齐
+	maxFramePayload = 0xFFFF
 )
 
 type WSOutbound struct {
@@ -157,14 +161,14 @@ func (o *WSOutbound) connectLoop() {
 		}
 		if err := o.sendAuthFrame(conn); err != nil {
 			log.Printf("[WSOut-Mux] 发送认证帧失败: %v", err)
-			conn.Close()
+			_ = conn.Close()
 			time.Sleep(5 * time.Second)
 			continue
 		}
 		_, resp, err := conn.ReadMessage()
 		if err != nil || len(resp) < 1 || resp[0] != 0x00 {
 			log.Printf("[WSOut-Mux] 认证失败: err=%v resp=%v", err, resp)
-			conn.Close()
+			_ = conn.Close()
 			time.Sleep(30 * time.Second)
 			continue
 		}
@@ -173,7 +177,16 @@ func (o *WSOutbound) connectLoop() {
 		o.mu.Lock()
 		o.conn = conn
 		o.connected = true
+		streams := make([]*muxStream, 0, len(o.streams))
+		for id, s := range o.streams {
+			streams = append(streams, s)
+			delete(o.streams, id)
+		}
 		o.mu.Unlock()
+
+		for _, s := range streams {
+			s.closeInternal()
+		}
 
 		go o.heartbeat(conn)
 		o.readLoop(conn)
@@ -181,11 +194,15 @@ func (o *WSOutbound) connectLoop() {
 		o.mu.Lock()
 		o.conn = nil
 		o.connected = false
+		remaining := make([]*muxStream, 0, len(o.streams))
 		for id, s := range o.streams {
-			s.closeInternal()
+			remaining = append(remaining, s)
 			delete(o.streams, id)
 		}
 		o.mu.Unlock()
+		for _, s := range remaining {
+			s.closeInternal()
+		}
 
 		o.mu.RLock()
 		stopped = o.stopped
@@ -203,11 +220,11 @@ func (o *WSOutbound) heartbeat(conn *websocket.Conn) {
 	defer ticker.Stop()
 	for range ticker.C {
 		o.mu.RLock()
-		if o.conn != conn {
-			o.mu.RUnlock()
+		cur := o.conn
+		o.mu.RUnlock()
+		if cur != conn {
 			return
 		}
-		o.mu.RUnlock()
 		o.writeMu.Lock()
 		err := conn.WriteMessage(websocket.PingMessage, nil)
 		o.writeMu.Unlock()
@@ -230,7 +247,7 @@ func (o *WSOutbound) sendAuthFrame(conn *websocket.Conn) error {
 	uuidBytes := make([]byte, 16)
 	for i := 0; i < 16; i++ {
 		var b byte
-		fmt.Sscanf(uuidHex[i*2:i*2+2], "%02x", &b)
+		_, _ = fmt.Sscanf(uuidHex[i*2:i*2+2], "%02x", &b)
 		uuidBytes[i] = b
 	}
 
@@ -283,10 +300,7 @@ func (o *WSOutbound) readLoop(conn *websocket.Conn) {
 		case frameData:
 			cp := make([]byte, len(payload))
 			copy(cp, payload)
-			select {
-			case s.recvCh <- cp:
-			default:
-			}
+			s.push(cp)
 		case frameClose, frameOpenFail:
 			s.closeInternal()
 			o.mu.Lock()
@@ -308,6 +322,9 @@ func (o *WSOutbound) allocID() uint16 {
 }
 
 func (o *WSOutbound) sendFrame(typ byte, id uint16, payload []byte) error {
+	if len(payload) > maxFramePayload {
+		return fmt.Errorf("payload 过长: %d", len(payload))
+	}
 	o.mu.RLock()
 	conn := o.conn
 	o.mu.RUnlock()
@@ -322,6 +339,24 @@ func (o *WSOutbound) sendFrame(typ byte, id uint16, payload []byte) error {
 	o.writeMu.Lock()
 	defer o.writeMu.Unlock()
 	return conn.WriteMessage(websocket.BinaryMessage, buf)
+}
+
+// writeChunked 把任意长度 payload 拆成多个 ≤ maxFramePayload 的帧发送
+func (o *WSOutbound) writeChunked(id uint16, payload []byte) error {
+	if len(payload) == 0 {
+		return o.sendFrame(frameData, id, nil)
+	}
+	for len(payload) > 0 {
+		n := len(payload)
+		if n > maxFramePayload {
+			n = maxFramePayload
+		}
+		if err := o.sendFrame(frameData, id, payload[:n]); err != nil {
+			return err
+		}
+		payload = payload[n:]
+	}
+	return nil
 }
 
 func (o *WSOutbound) waitConnected(timeout time.Duration) bool {
@@ -355,7 +390,6 @@ func (o *WSOutbound) NewStream(targetIP string, targetPort int) (io.ReadWriteClo
 		return nil, fmt.Errorf("仅支持 IPv4: %s", targetIP)
 	}
 
-	// ★ CF CDN IP：Worker 不能连，走 TURN
 	if IsCloudflareCDN(targetIP) {
 		log.Printf("[WSOut-Mux] 目标 %s 属于 CF CDN，走 TURN", targetIP)
 		if o.turnClient != nil && o.turnClient.HasTCPAlloc() {
@@ -369,7 +403,6 @@ func (o *WSOutbound) NewStream(targetIP string, targetPort int) (io.ReadWriteClo
 		return nil, fmt.Errorf("CF CDN 目标 %s 需要 TURN，但 TURN 未就绪", targetIP)
 	}
 
-	// 非 CF CDN：优先 Mux
 	if o.waitConnected(2 * time.Second) {
 		stream, err := o.openMuxStream(ip4, targetIP, targetPort)
 		if err == nil {
@@ -396,14 +429,7 @@ func (o *WSOutbound) openMuxStream(ip4 net.IP, targetIP string, targetPort int) 
 		return nil, fmt.Errorf("WSS 未连接")
 	}
 	id := o.allocID()
-	stream := &muxStream{
-		id:         id,
-		out:        o,
-		recvCh:     make(chan []byte, 128),
-		closed:     make(chan struct{}),
-		remoteIP:   targetIP,
-		remotePort: targetPort,
-	}
+	stream := newMuxStream(id, o, targetIP, targetPort)
 	o.streams[id] = stream
 	o.mu.Unlock()
 
@@ -428,52 +454,107 @@ func (o *WSOutbound) Close() {
 	}
 	o.stopped = true
 	conn := o.conn
+	streams := make([]*muxStream, 0, len(o.streams))
+	for id, s := range o.streams {
+		streams = append(streams, s)
+		delete(o.streams, id)
+	}
 	o.mu.Unlock()
+	for _, s := range streams {
+		s.closeInternal()
+	}
 	if conn != nil {
-		conn.Close()
+		_ = conn.Close()
 	}
 }
+
+// ============================================================
+// muxStream：bytes.Buffer + sync.Cond 保证不丢包
+// ============================================================
 
 type muxStream struct {
 	id         uint16
 	out        *WSOutbound
-	recvCh     chan []byte
-	closed     chan struct{}
-	closeOnce  sync.Once
 	remoteIP   string
 	remotePort int
+
+	mu       sync.Mutex
+	buf      bytes.Buffer
+	notify   chan struct{} // 容量 1，用于唤醒 Read
+	closed   bool
+	closeOne sync.Once
+}
+
+func newMuxStream(id uint16, out *WSOutbound, ip string, port int) *muxStream {
+	return &muxStream{
+		id:         id,
+		out:        out,
+		remoteIP:   ip,
+		remotePort: port,
+		notify:     make(chan struct{}, 1),
+	}
+}
+
+// push 由 readLoop 调用，把数据入队
+func (s *muxStream) push(data []byte) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.buf.Write(data)
+	s.mu.Unlock()
+	select {
+	case s.notify <- struct{}{}:
+	default:
+	}
 }
 
 func (s *muxStream) Read(p []byte) (int, error) {
-	select {
-	case data := <-s.recvCh:
-		return copy(p, data), nil
-	case <-s.closed:
-		select {
-		case data := <-s.recvCh:
-			return copy(p, data), nil
-		default:
+	for {
+		s.mu.Lock()
+		if s.buf.Len() > 0 {
+			n, _ := s.buf.Read(p)
+			s.mu.Unlock()
+			return n, nil
+		}
+		if s.closed {
+			s.mu.Unlock()
 			return 0, io.EOF
+		}
+		s.mu.Unlock()
+
+		select {
+		case <-s.notify:
+		case <-time.After(50 * time.Millisecond):
+			// 超时后再检查一次 closed，防止 missed wake-up
 		}
 	}
 }
 
 func (s *muxStream) Write(p []byte) (int, error) {
-	select {
-	case <-s.closed:
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
 		return 0, io.ErrClosedPipe
-	default:
 	}
-	if err := s.out.sendFrame(frameData, s.id, p); err != nil {
+	s.mu.Unlock()
+	if err := s.out.writeChunked(s.id, p); err != nil {
 		return 0, err
 	}
 	return len(p), nil
 }
 
 func (s *muxStream) Close() error {
-	s.closeOnce.Do(func() {
-		close(s.closed)
-		s.out.sendFrame(frameClose, s.id, nil)
+	s.closeOne.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		s.mu.Unlock()
+		select {
+		case s.notify <- struct{}{}:
+		default:
+		}
+		_ = s.out.sendFrame(frameClose, s.id, nil)
 		s.out.mu.Lock()
 		delete(s.out.streams, s.id)
 		s.out.mu.Unlock()
@@ -482,5 +563,13 @@ func (s *muxStream) Close() error {
 }
 
 func (s *muxStream) closeInternal() {
-	s.closeOnce.Do(func() { close(s.closed) })
+	s.closeOne.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		s.mu.Unlock()
+		select {
+		case s.notify <- struct{}{}:
+		default:
+		}
+	})
 }
