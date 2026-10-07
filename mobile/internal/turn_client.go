@@ -39,14 +39,24 @@ type TURNClient struct {
 	edge         *Edge
 	onMessage    func([]byte, net.Addr)
 	stopCh       chan struct{}
+
+	httpClient *http.Client // ★ protected，避免走 TUN 死循环
 }
 
 func NewTURNClient(signalingURL string, connectToken string, edge *Edge) *TURNClient {
+	protectedDialer := newProtectedDialer()
 	return &TURNClient{
 		signalingURL: signalingURL,
 		connectToken: connectToken,
 		edge:         edge,
 		stopCh:       make(chan struct{}),
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				DialContext:       protectedDialer.DialContext,
+				ForceAttemptHTTP2: false,
+			},
+		},
 	}
 }
 
@@ -71,11 +81,11 @@ func (tc *TURNClient) FetchAndSetup(ctx context.Context) error {
 		return fmt.Errorf("create request: %w", err)
 	}
 
-	resp, err := httpClient.Do(req)
+	resp, err := tc.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("fetch credentials: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _, _ = io.Copy(io.Discard, resp.Body); _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		return fmt.Errorf("turn-credentials 未授权 (http=%d)", resp.StatusCode)
@@ -118,7 +128,6 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 	turnAddr = strings.TrimPrefix(turnAddr, "turns:")
 	turnAddr = strings.TrimPrefix(turnAddr, "//")
 
-	// 1. UDP allocation
 	log.Printf("[TURN] 尝试 UDP transport: %s", turnAddr)
 	lite := NewTURNLiteWithTCP(turnAddr, srv.Username, srv.Password, false)
 	lite.onMessage = func(data []byte, addr net.Addr) {
@@ -150,7 +159,6 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 		log.Printf("[TURN] ✅ UDP 就绪: %s", tc.relayAddr)
 	}
 
-	// 2. RFC 6062 TCP allocation
 	log.Printf("[TURN] 尝试 RFC 6062 TCP allocation: %s", turnAddr)
 	tcpAlloc := NewTURNTCPAllocation(turnAddr, srv.Username, srv.Password)
 	if err := tcpAlloc.Allocate(); err != nil {
@@ -225,23 +233,4 @@ func (tc *TURNClient) Close() {
 		tc.lite.Close()
 		tc.lite = nil
 	}
-	if tc.tcpAlloc != nil {
-		tc.tcpAlloc.Close()
-		tc.tcpAlloc = nil
-	}
-}
-
-func redactToken(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return raw
-	}
-	q := u.Query()
-	if q.Get("token") != "" {
-		q.Set("token", "***")
-		u.RawQuery = q.Encode()
-	}
-	return u.String()
-}
-
-var _ = time.Now
+	if tc
