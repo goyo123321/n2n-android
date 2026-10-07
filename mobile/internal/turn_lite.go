@@ -14,6 +14,8 @@ import (
 	"time"
 )
 
+// ============ STUN 常量 ============
+
 const stunMagicCookie = 0x2112A442
 
 const (
@@ -51,6 +53,8 @@ const (
 	turnRefreshInterval = 60 * time.Second
 	turnRequestTimeout  = 5 * time.Second
 )
+
+// ============ 内部结构 ============
 
 type stunAttr struct {
 	typ   uint16
@@ -222,6 +226,7 @@ func (t *TURNLite) sign(msg []byte) []byte {
 	if t.key == nil {
 		return msg
 	}
+
 	newBodyLen := len(msg) - 20 + 24
 
 	tmp := make([]byte, len(msg))
@@ -599,11 +604,33 @@ func (t *TURNLite) refreshLoop() {
 		case <-t.stopCh:
 			return
 		case <-ticker.C:
-			_, err := t.sendRequest(msgRefreshRequest, []stunAttr{
+			resp, err := t.sendRequest(msgRefreshRequest, []stunAttr{
 				{typ: attrLifetime, value: uint32ToBytes(turnDefaultLifetime)},
 			}, true)
 			if err != nil {
 				log.Printf("[TURN-Lite] Refresh 失败: %v", err)
+				continue
+			}
+			// ★ 438 Stale Nonce：更新 nonce 后重试一次
+			if resp.msgType != msgRefreshSuccess {
+				code := parseErrorCode(resp.attrs[attrErrorCode])
+				if code == 438 {
+					newNonce := resp.attrs[attrNonce]
+					if len(newNonce) > 0 {
+						t.mu.Lock()
+						t.nonce = newNonce
+						t.mu.Unlock()
+						log.Printf("[TURN-Lite] 438 刷新 nonce，重试 Refresh")
+						_, err2 := t.sendRequest(msgRefreshRequest, []stunAttr{
+							{typ: attrLifetime, value: uint32ToBytes(turnDefaultLifetime)},
+						}, true)
+						if err2 != nil {
+							log.Printf("[TURN-Lite] 438 重试失败: %v", err2)
+						}
+					}
+				} else {
+					log.Printf("[TURN-Lite] Refresh 被拒: code=%d", code)
+				}
 			}
 		}
 	}
