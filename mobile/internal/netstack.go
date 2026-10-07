@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -90,9 +91,6 @@ func NewNetstackHost(virtualIP string) (*NetstackHost, error) {
 }
 
 // Close 释放 gVisor stack 资源
-//
-// 注意：channel.Endpoint 的 Read() 在 Close 之后可能还在阻塞，
-// 先 Close stack 让内部 goroutine 退出，再 Wait 收敛。
 func (n *NetstackHost) Close() error {
 	n.mu.Lock()
 	if n.stack == nil {
@@ -134,7 +132,6 @@ func (n *NetstackHost) startTCPForwarder() {
 		targetIP := id.LocalAddress.String()
 		targetPort := int(id.LocalPort)
 
-		// 目标是自己 → 直接 Complete(true) 让 gVisor 拒绝
 		if targetIP == net.IP(n.v4[:]).String() {
 			r.Complete(true)
 			return
@@ -157,7 +154,7 @@ func (n *NetstackHost) startTCPForwarder() {
 			return
 		}
 
-		// ★ ActionDirect：走物理网络直连（protectedDialer 绕过 TUN）
+		// ActionDirect：走物理网络直连（protectedDialer 绕过 TUN）
 		if action == ActionDirect {
 			d := newProtectedDialer()
 			rawConn, err := d.Dial("tcp", net.JoinHostPort(targetIP, strconv.Itoa(targetPort)))
@@ -170,9 +167,8 @@ func (n *NetstackHost) startTCPForwarder() {
 			var wq waiter.Queue
 			ep, epErr := r.CreateEndpoint(&wq)
 			if epErr != nil {
-				// ★ 修复：Endpoint 建立失败必须 Complete(true)，
-				//    否则 gVisor 内部会残留一个半初始化的 pending endpoint，
-				//    长时间运行会持续泄漏。
+				// 建 Endpoint 失败必须 Complete(true)，否则 gVisor 内部会
+				// 残留一个半初始化的 pending endpoint，持续泄漏。
 				log.Printf("[Netstack-TCP] CreateEndpoint 失败: %v", epErr)
 				_ = rawConn.Close()
 				r.Complete(true)
@@ -206,7 +202,6 @@ func (n *NetstackHost) startTCPForwarder() {
 		var wq waiter.Queue
 		ep, epErr := r.CreateEndpoint(&wq)
 		if epErr != nil {
-			// ★ 同上：建 Endpoint 失败，补 Complete(true)
 			log.Printf("[Netstack-TCP] CreateEndpoint(proxy) 失败: %v", epErr)
 			_ = stream.Close()
 			r.Complete(true)
@@ -240,9 +235,8 @@ func (n *NetstackHost) startUDPForwarder() {
 			n.handleDNSUDP(r)
 			return
 		}
-		// ★ 其它 UDP 端口：当前实现不转发，让 gVisor 自动拒绝。
-		//    如果不调 Complete，gVisor 会一直挂着这个 request，
-		//    sendto() 会一直阻塞直到应用超时。
+		// 其它 UDP 端口不转发，显式 Complete(true) 让 gVisor 拒绝，
+		// 否则 sendto() 会一直阻塞直到应用超时。
 		r.Complete(true)
 	})
 	n.stack.SetTransportProtocolHandler(udp.ProtocolNumber, forwarder.HandlePacket)
@@ -300,8 +294,10 @@ func (n *NetstackHost) InjectTUNPacket(data []byte) {
 	pkt.DecRef()
 }
 
+// ReadTUNPacket 非阻塞读出。没有包时立即返回 (nil, false)。
+//
+// 建议使用 ReadTUNPacketContext（阻塞式），避免 CPU 轮询开销。
 func (n *NetstackHost) ReadTUNPacket() ([]byte, bool) {
-	// netstack 已被 Close → 直接返回
 	n.mu.Lock()
 	ep := n.linkEP
 	closed := n.stack == nil
@@ -321,6 +317,47 @@ func (n *NetstackHost) ReadTUNPacket() ([]byte, bool) {
 	out := make([]byte, len(data))
 	copy(out, data)
 	return out, true
+}
+
+// ReadTUNPacketContext 阻塞读取，直到有包或 ctx 被取消。
+//
+// CPU 开销远低于 1ms 轮询：空闲时只走 10ms 退避 sleep。
+// 返回 (nil, false) 表示 ctx 已取消或 netstack 已关闭。
+func (n *NetstackHost) ReadTUNPacketContext(ctx context.Context) ([]byte, bool) {
+	n.mu.Lock()
+	ep := n.linkEP
+	closed := n.stack == nil
+	n.mu.Unlock()
+	if closed || ep == nil {
+		return nil, false
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, false
+		default:
+		}
+
+		pkt := ep.Read()
+		if pkt == nil {
+			// 10ms 退避：兼顾响应性和 CPU 占用
+			select {
+			case <-ctx.Done():
+				return nil, false
+			case <-time.After(10 * time.Millisecond):
+				continue
+			}
+		}
+
+		view := pkt.ToView()
+		data := view.AsSlice()
+		out := make([]byte, len(data))
+		copy(out, data)
+		view.Release()
+		pkt.DecRef()
+		return out, true
+	}
 }
 
 func (n *NetstackHost) ListenTCP(port uint16) (net.Listener, error) {
@@ -606,5 +643,3 @@ return '<tr><td>'+n+'</td><td class="size">'+(f.isDir?'--':fmtSize(f.size))+'</t
 function nav(n){cur=(cur+'/'+n).replace(/\/+/g,'/');load()}
 load();
 </script></body></html>`
-
-var _ = strconv.Itoa
