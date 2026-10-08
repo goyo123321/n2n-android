@@ -39,8 +39,7 @@ class N2nVpnService : VpnService() {
         const val EXTRA_ROOM_ID = "room_id"
         const val EXTRA_CLIENT_ID = "client_id"
         const val EXTRA_NODE_NAME = "node_name"
-        const val EXTRA_UUID = "uuid"                          // ★ 原 EXTRA_CONNECT_TOKEN
-        const val EXTRA_SHARE_DIR = "share_dir"
+        const val EXTRA_UUID = "uuid"
         const val EXTRA_PREFERRED_IP = "preferred_ip"
     }
 
@@ -149,8 +148,7 @@ class N2nVpnService : VpnService() {
         val clientId = intent.getStringExtra(EXTRA_CLIENT_ID) ?: ""
         val nodeName = intent.getStringExtra(EXTRA_NODE_NAME) ?: "Android"
         val uuid = intent.getStringExtra(EXTRA_UUID) ?: Prefs.DEFAULT_UUID
-        val shareDir = intent.getStringExtra(EXTRA_SHARE_DIR)
-            ?: ShareDirManager.getDefaultShareDir(this).absolutePath
+
         ktLog("参数读取完成 room=$roomId uuid=${uuid.take(8)}...")
 
         try {
@@ -170,8 +168,7 @@ class N2nVpnService : VpnService() {
             setRoomID(roomId)
             setClientID(clientId)
             setNodeName(nodeName)
-            setUUID(uuid)                                       // ★ 改名
-            setShareDir(shareDir)
+            setUUID(uuid)
             setPreferredIP(preferredIp)
             setPreferredPort(443)
         }
@@ -354,19 +351,26 @@ class N2nVpnService : VpnService() {
         wifiLock = null
     }
 
+    /**
+     * 建立 TUN，只接管虚拟网段（对标 PC 端）。
+     *
+     * - addAddress：本机虚拟 IP /24
+     * - addRoute：只加 10.64.0.0/24，**不接管全部流量**
+     * - **不设置 DNS**：所有 DNS 查询走系统默认
+     *
+     * 结果：物理流量完全不受影响，只有发往 10.64.0.x 的包进 TUN。
+     */
     private fun buildTunInterface(vip: String): ParcelFileDescriptor? {
         return try {
-            ktLog("建立 TUN（全流量 + protect socket + 双 DNS），绑定 IP: $vip")
+            ktLog("建立 TUN（仅组网段），绑定 IP: $vip")
 
             val builder = Builder()
                 .setSession("n2n-client")
                 .setMtu(1280)
                 .addAddress(vip, 24)
                 .addRoute("10.64.0.0", 24)
-                .addRoute("0.0.0.0", 0)
-                .addDnsServer(vip)
 
-            ktLog("TUN 接管 0.0.0.0/0，DNS 指向 $vip")
+            ktLog("TUN 仅接管 10.64.0.0/24，其他流量走系统默认")
 
             val pfd = builder.setBlocking(true).establish()
             ktLog("TUN establish 成功")
