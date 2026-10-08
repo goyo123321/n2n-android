@@ -1,6 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<paths>
-    <external-media-path name="shared_media" path="shared/" />
-    <external-files-path name="shared_files" path="shared/" />
-    <files-path name="internal" path="shared/" />
-</paths>
