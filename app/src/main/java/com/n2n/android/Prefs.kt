@@ -11,7 +11,7 @@ object Prefs {
     private const val KEY_ROOM_ID = "room_id"
     private const val KEY_CLIENT_ID = "client_id"
     private const val KEY_NODE_NAME = "node_name"
-    private const val KEY_UUID = "uuid"                       // ★ 原 connect_token
+    private const val KEY_CONNECT_TOKEN = "connect_token"     // ★ 原 uuid
     private const val KEY_SHARE_DIR_URI = "share_dir_uri"
     private const val KEY_THEME_MODE = "theme_mode"
     private const val KEY_FIRST_LAUNCH = "first_launch_done"
@@ -21,15 +21,15 @@ object Prefs {
     private const val DEFAULT_ROOM_ID = "default-room"
     private const val DEFAULT_NODE_NAME = "Android"
 
-    // ★ 与服务端 DEFAULT_UUID 保持一致
-    const val DEFAULT_UUID = "2523c510-9ff0-415b-9582-93949bfae7e3"
+    // ★ 与服务端 DEFAULT_CONNECT_TOKEN 保持一致
+    const val DEFAULT_CONNECT_TOKEN = "2523c510-9ff0-415b-9582-93949bfae7e3"
 
     data class Config(
         val signalingUrl: String,
         val roomId: String,
         val clientId: String,
         val nodeName: String,
-        val uuid: String,
+        val connectToken: String,
     )
 
     private fun sp(ctx: Context) = ctx.getSharedPreferences(NAME, Context.MODE_PRIVATE)
@@ -41,7 +41,7 @@ object Prefs {
             roomId = s.getString(KEY_ROOM_ID, DEFAULT_ROOM_ID) ?: DEFAULT_ROOM_ID,
             clientId = s.getString(KEY_CLIENT_ID, "") ?: "",
             nodeName = s.getString(KEY_NODE_NAME, DEFAULT_NODE_NAME) ?: DEFAULT_NODE_NAME,
-            uuid = s.getString(KEY_UUID, DEFAULT_UUID) ?: DEFAULT_UUID,
+            connectToken = s.getString(KEY_CONNECT_TOKEN, DEFAULT_CONNECT_TOKEN) ?: DEFAULT_CONNECT_TOKEN,
         )
     }
 
@@ -51,7 +51,7 @@ object Prefs {
             .putString(KEY_ROOM_ID, cfg.roomId)
             .putString(KEY_CLIENT_ID, cfg.clientId)
             .putString(KEY_NODE_NAME, cfg.nodeName)
-            .putString(KEY_UUID, cfg.uuid)
+            .putString(KEY_CONNECT_TOKEN, cfg.connectToken)
             .apply()
     }
 
@@ -64,7 +64,7 @@ object Prefs {
         sp(ctx).edit().putString(KEY_PREFERRED_IP, ip).apply()
     }
 
-    // ============ 共享目录 URI ============
+    // ============ 共享目录 URI（保留占位，功能已停用）============
 
     fun loadShareDirUri(ctx: Context): String? =
         sp(ctx).getString(KEY_SHARE_DIR_URI, null)
@@ -103,19 +103,33 @@ object Prefs {
         return newId
     }
 
-    // ============ 迁移：老的 connect_token → uuid ============
+    // ============ 迁移：老的 uuid / connect_token 统一到 connect_token ============
 
     fun migrateLegacy(ctx: Context) {
         val s = sp(ctx)
-        val legacy = s.getString("connect_token", null)
-        if (legacy.isNullOrEmpty()) return
-
-        val currentUuid = s.getString(KEY_UUID, null)
         val editor = s.edit()
-        if (currentUuid.isNullOrEmpty()) {
-            // 老用户没配 uuid，把 connect_token 值搬过去
-            editor.putString(KEY_UUID, legacy)
+        var dirty = false
+
+        // 情况 1：已有 connect_token，删掉遗留的 uuid
+        val hasNew = !s.getString(KEY_CONNECT_TOKEN, null).isNullOrEmpty()
+        if (hasNew) {
+            if (s.contains("uuid")) {
+                editor.remove("uuid")
+                dirty = true
+            }
+        } else {
+            // 情况 2：没有 connect_token，尝试从 uuid 迁移
+            val legacyUuid = s.getString("uuid", null)
+            if (!legacyUuid.isNullOrEmpty()) {
+                editor.putString(KEY_CONNECT_TOKEN, legacyUuid)
+                dirty = true
+            }
+            if (s.contains("uuid")) {
+                editor.remove("uuid")
+                dirty = true
+            }
         }
-        editor.remove("connect_token").apply()
+
+        if (dirty) editor.apply()
     }
 }
