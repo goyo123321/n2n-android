@@ -7,6 +7,7 @@ import android.content.Intent
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
 import android.view.inputmethod.InputMethodManager
@@ -21,13 +22,17 @@ import org.json.JSONArray
 
 class MainActivity : AppCompatActivity() {
 
+    companion object {
+        private const val TAG = "MainActivity"
+    }
+
     private lateinit var binding: ActivityMainBinding
 
     private var lastPeersJson: String = ""
 
     private val peersTicker = object : Runnable {
         override fun run() {
-            if (isFinishing || isDestroyed) return
+            if (isFinishing || isDestroyed || !::binding.isInitialized) return
             if (N2nController.isRunning()) refreshPeers()
             binding.root.postDelayed(this, 3000)
         }
@@ -35,7 +40,7 @@ class MainActivity : AppCompatActivity() {
 
     private val statusTicker = object : Runnable {
         override fun run() {
-            if (isFinishing || isDestroyed) return
+            if (isFinishing || isDestroyed || !::binding.isInitialized) return
             refreshStatus()
             binding.root.postDelayed(this, 1000)
         }
@@ -44,6 +49,7 @@ class MainActivity : AppCompatActivity() {
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
+        if (isFinishing || isDestroyed) return@registerForActivityResult
         if (result.resultCode == Activity.RESULT_OK) startVpnService()
         else toast(getString(R.string.dialog_vpn_denied))
     }
@@ -98,6 +104,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
+        if (!::binding.isInitialized) return
         binding.root.removeCallbacks(peersTicker)
         binding.root.removeCallbacks(statusTicker)
         binding.root.postDelayed(statusTicker, 1000)
@@ -117,12 +124,22 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStop() {
         super.onStop()
+        if (!::binding.isInitialized) return
         binding.root.removeCallbacks(peersTicker)
         binding.root.removeCallbacks(statusTicker)
     }
 
+    override fun onDestroy() {
+        if (::binding.isInitialized) {
+            binding.root.removeCallbacks(peersTicker)
+            binding.root.removeCallbacks(statusTicker)
+        }
+        super.onDestroy()
+    }
+
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
+        if (!::binding.isInitialized) return
         outState.putString("signalingUrl", binding.etSignalingUrl.text.toString())
         outState.putString("preferredIp", binding.etPreferredIp.text.toString())
         outState.putString("roomId", binding.etRoomId.text.toString())
@@ -194,6 +211,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun checkSignalingUrl() {
+        if (!::binding.isInitialized) return
         val currentUrl = binding.etSignalingUrl.text.toString().trim()
         if (currentUrl.isNotEmpty()) return
 
@@ -201,6 +219,7 @@ class MainActivity : AppCompatActivity() {
             .setTitle(getString(R.string.first_use_title))
             .setMessage(getString(R.string.first_use_message))
             .setPositiveButton(getString(R.string.first_use_fill)) { _, _ ->
+                if (!::binding.isInitialized) return@setPositiveButton
                 binding.etSignalingUrl.requestFocus()
                 binding.etSignalingUrl.setSelection(
                     binding.etSignalingUrl.text?.length ?: 0
@@ -221,6 +240,7 @@ class MainActivity : AppCompatActivity() {
     // ============================================================
 
     private fun loadConfig(savedInstanceState: Bundle?) {
+        if (!::binding.isInitialized) return
         if (savedInstanceState != null) {
             binding.etSignalingUrl.setText(savedInstanceState.getString("signalingUrl", ""))
             binding.etPreferredIp.setText(savedInstanceState.getString("preferredIp", ""))
@@ -240,9 +260,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun handleIntentParams(intent: Intent?) {
+        if (!::binding.isInitialized) return
         intent ?: return
 
-        // 深链：n2n://connect?url=...&token=...&room=...&auto=1
         if (intent.action == Intent.ACTION_VIEW && intent.data != null) {
             val data = intent.data!!
             if (data.scheme == "n2n" && data.host == "connect") {
@@ -261,7 +281,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Intent extra
         val url = intent.getStringExtra(N2nVpnService.EXTRA_SIGNALING_URL)
         val ip = intent.getStringExtra("preferred_ip")
         val room = intent.getStringExtra(N2nVpnService.EXTRA_ROOM_ID)
@@ -279,7 +298,6 @@ class MainActivity : AppCompatActivity() {
 
         if (changed) {
             saveCurrentInput()
-            // ★ 单行改动：硬编码中文 → strings
             toast(getString(R.string.dialog_external_updated))
         }
         if (intent.getBooleanExtra("auto_start", false)) {
@@ -288,17 +306,22 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun saveCurrentInput() {
-        if (binding.etClientId.text.toString().trim().isEmpty()) {
-            binding.etClientId.setText(Prefs.loadOrCreateClientId(this))
+        if (!::binding.isInitialized) return
+        try {
+            if (binding.etClientId.text.toString().trim().isEmpty()) {
+                binding.etClientId.setText(Prefs.loadOrCreateClientId(this))
+            }
+            Prefs.save(this, Prefs.Config(
+                signalingUrl = binding.etSignalingUrl.text.toString().trim(),
+                roomId = binding.etRoomId.text.toString().trim(),
+                clientId = binding.etClientId.text.toString().trim(),
+                nodeName = binding.etNodeName.text.toString().trim(),
+                connectToken = binding.etConnectToken.text.toString().trim(),
+            ))
+            Prefs.savePreferredIp(this, binding.etPreferredIp.text.toString().trim())
+        } catch (t: Throwable) {
+            Log.e(TAG, "saveCurrentInput failed", t)
         }
-        Prefs.save(this, Prefs.Config(
-            signalingUrl = binding.etSignalingUrl.text.toString().trim(),
-            roomId = binding.etRoomId.text.toString().trim(),
-            clientId = binding.etClientId.text.toString().trim(),
-            nodeName = binding.etNodeName.text.toString().trim(),
-            connectToken = binding.etConnectToken.text.toString().trim(),
-        ))
-        Prefs.savePreferredIp(this, binding.etPreferredIp.text.toString().trim())
     }
 
     // ============================================================
@@ -311,6 +334,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun requestVpnPermission() {
+        if (!::binding.isInitialized) return
         val url = binding.etSignalingUrl.text.toString().trim()
 
         if (url.isEmpty()) {
@@ -333,7 +357,6 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // CONNECT_TOKEN 校验（空 = 未启用，跳过）
         val token = binding.etConnectToken.text.toString().trim()
         if (token.isNotEmpty() && !isValidConnectToken(token)) {
             toast(getString(R.string.token_invalid))
@@ -349,7 +372,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // CONNECT_TOKEN 是任意可打印 ASCII 字符串，只做基本校验
     private fun isValidConnectToken(s: String): Boolean {
         if (s.isEmpty()) return true
         if (s.length > 256) return false
@@ -357,30 +379,42 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startVpnService() {
-        val preferredIp = binding.etPreferredIp.text.toString().trim()
-        val token = binding.etConnectToken.text.toString().trim()
+        if (!::binding.isInitialized) return
+        try {
+            val preferredIp = binding.etPreferredIp.text.toString().trim()
+            val token = binding.etConnectToken.text.toString().trim()
 
-        val intent = Intent(this, N2nVpnService::class.java).apply {
-            action = N2nVpnService.ACTION_START
-            putExtra(N2nVpnService.EXTRA_SIGNALING_URL, binding.etSignalingUrl.text.toString().trim())
-            putExtra(N2nVpnService.EXTRA_PREFERRED_IP, preferredIp)
-            putExtra(N2nVpnService.EXTRA_ROOM_ID, binding.etRoomId.text.toString().trim())
-            putExtra(N2nVpnService.EXTRA_CLIENT_ID, binding.etClientId.text.toString().trim())
-            putExtra(N2nVpnService.EXTRA_NODE_NAME, binding.etNodeName.text.toString().trim())
-            putExtra(N2nVpnService.EXTRA_CONNECT_TOKEN, token)
+            val intent = Intent(this, N2nVpnService::class.java).apply {
+                action = N2nVpnService.ACTION_START
+                putExtra(N2nVpnService.EXTRA_SIGNALING_URL, binding.etSignalingUrl.text.toString().trim())
+                putExtra(N2nVpnService.EXTRA_PREFERRED_IP, preferredIp)
+                putExtra(N2nVpnService.EXTRA_ROOM_ID, binding.etRoomId.text.toString().trim())
+                putExtra(N2nVpnService.EXTRA_CLIENT_ID, binding.etClientId.text.toString().trim())
+                putExtra(N2nVpnService.EXTRA_NODE_NAME, binding.etNodeName.text.toString().trim())
+                putExtra(N2nVpnService.EXTRA_CONNECT_TOKEN, token)
+            }
+            startForegroundService(intent)
+            toast(getString(R.string.dialog_starting))
+            binding.root.postDelayed({ refreshStatus() }, 500)
+        } catch (t: Throwable) {
+            Log.e(TAG, "startVpnService failed", t)
+            toast("启动失败: ${t.message}")
         }
-        startForegroundService(intent)
-        toast(getString(R.string.dialog_starting))
-        binding.root.postDelayed({ refreshStatus() }, 500)
     }
 
     private fun stopVpnService() {
-        val intent = Intent(this, N2nVpnService::class.java).apply {
-            action = N2nVpnService.ACTION_STOP
+        try {
+            val intent = Intent(this, N2nVpnService::class.java).apply {
+                action = N2nVpnService.ACTION_STOP
+            }
+            startService(intent)
+            toast(getString(R.string.dialog_stopped))
+            if (::binding.isInitialized) {
+                binding.root.postDelayed({ refreshStatus() }, 500)
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "stopVpnService failed", t)
         }
-        startService(intent)
-        toast(getString(R.string.dialog_stopped))
-        binding.root.postDelayed({ refreshStatus() }, 500)
     }
 
     // ============================================================
@@ -388,142 +422,149 @@ class MainActivity : AppCompatActivity() {
     // ============================================================
 
     private fun refreshStatus() {
-        if (isFinishing || isDestroyed) return
-        val running = N2nController.isRunning()
+        if (isFinishing || isDestroyed || !::binding.isInitialized) return
+        try {
+            val running = N2nController.isRunning()
 
-        if (running) {
-            binding.tvStatus.text = getString(R.string.status_running)
-            binding.tvStatus.setTextColor(getColor(R.color.brand_success))
-            binding.tvVirtualIp.text = "虚拟 IP: ${N2nController.getVirtualIP()}"
-            binding.tvClientId.text = "Client ID: ${N2nController.getClientID()}"
-            binding.tvVirtualIp.visibility = View.VISIBLE
-            binding.tvClientId.visibility = View.VISIBLE
-            binding.cardStatus.setStrokeColor(getColor(R.color.brand_success))
+            if (running) {
+                binding.tvStatus.text = getString(R.string.status_running)
+                binding.tvStatus.setTextColor(getColor(R.color.brand_success))
+                binding.tvVirtualIp.text = "虚拟 IP: ${N2nController.getVirtualIP()}"
+                binding.tvClientId.text = "Client ID: ${N2nController.getClientID()}"
+                binding.tvVirtualIp.visibility = View.VISIBLE
+                binding.tvClientId.visibility = View.VISIBLE
+                binding.cardStatus.setStrokeColor(getColor(R.color.brand_success))
 
-            binding.btnStart.visibility = View.GONE
-            binding.btnStop.visibility = View.VISIBLE
+                binding.btnStart.visibility = View.GONE
+                binding.btnStop.visibility = View.VISIBLE
+                binding.cardPeers.visibility = View.VISIBLE
 
-            // 节点卡片：运行中显示
-            binding.cardPeers.visibility = View.VISIBLE
+                binding.btnSave.isEnabled = false
+                binding.btnSave.alpha = 0.5f
+            } else {
+                binding.tvStatus.text = getString(R.string.status_stopped)
+                binding.tvStatus.setTextColor(getColor(R.color.brand_text_dim))
+                binding.tvVirtualIp.visibility = View.GONE
+                binding.tvClientId.visibility = View.GONE
+                binding.cardStatus.setStrokeColor(getColor(R.color.brand_border))
 
-            // 保存按钮：运行中禁用（改了也不会应用，需要停止后再启动）
-            binding.btnSave.isEnabled = false
-            binding.btnSave.alpha = 0.5f
-        } else {
-            binding.tvStatus.text = getString(R.string.status_stopped)
-            binding.tvStatus.setTextColor(getColor(R.color.brand_text_dim))
-            binding.tvVirtualIp.visibility = View.GONE
-            binding.tvClientId.visibility = View.GONE
+                binding.btnStart.visibility = View.VISIBLE
+                binding.btnStop.visibility = View.GONE
+                binding.cardPeers.visibility = View.GONE
 
-            binding.cardStatus.setStrokeColor(getColor(R.color.brand_border))
-
-            binding.btnStart.visibility = View.VISIBLE
-            binding.btnStop.visibility = View.GONE
-
-            // 节点卡片：未运行隐藏
-            binding.cardPeers.visibility = View.GONE
-
-            // 保存按钮：未运行可用
-            binding.btnSave.isEnabled = true
-            binding.btnSave.alpha = 1.0f
+                binding.btnSave.isEnabled = true
+                binding.btnSave.alpha = 1.0f
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "refreshStatus failed", t)
         }
     }
 
     private fun refreshPeers() {
-        if (isFinishing || isDestroyed) return
+        if (isFinishing || isDestroyed || !::binding.isInitialized) return
+        try {
+            if (!N2nController.isRunning()) {
+                lastPeersJson = ""
+                binding.tvPeerCount.text = ""
+                binding.tvPeersEmpty.visibility = View.VISIBLE
+                binding.peersContainer.removeAllViews()
+                return
+            }
 
-        if (!N2nController.isRunning()) {
-            lastPeersJson = ""
-            binding.tvPeerCount.text = ""
-            binding.tvPeersEmpty.visibility = View.VISIBLE
+            val json = N2nController.getPeersJSON()
+            if (json == lastPeersJson) return
+            lastPeersJson = json
+
+            val peers = try { JSONArray(json) } catch (e: Exception) { JSONArray() }
+
+            binding.tvPeerCount.text = getString(R.string.peer_count_format, peers.length())
+
+            if (peers.length() == 0) {
+                binding.tvPeersEmpty.visibility = View.VISIBLE
+                binding.peersContainer.removeAllViews()
+                return
+            }
+
+            binding.tvPeersEmpty.visibility = View.GONE
+            val inflater = LayoutInflater.from(this)
+            val existing = binding.peersContainer.childCount
+
+            if (existing == peers.length()) {
+                for (i in 0 until peers.length()) {
+                    val p = peers.getJSONObject(i)
+                    val row = binding.peersContainer.getChildAt(i) ?: continue
+
+                    val tvCode = row.findViewById<android.widget.TextView>(R.id.tvPeerCode) ?: continue
+                    val tvVip = row.findViewById<android.widget.TextView>(R.id.tvPeerVip) ?: continue
+                    val tvMeta = row.findViewById<android.widget.TextView>(R.id.tvPeerMeta) ?: continue
+                    val tvBadge = row.findViewById<android.widget.TextView>(R.id.tvPeerBadge) ?: continue
+
+                    tvCode.text = p.optString("code", "?")
+                    tvVip.text = p.optString("vip", "--")
+                    val connType = p.optString("connType", "unknown")
+                    val natType = p.optString("natType", "unknown")
+                    tvMeta.text = natType
+
+                    applyBadge(tvBadge, connType)
+                }
+                return
+            }
+
             binding.peersContainer.removeAllViews()
-            return
-        }
-
-        val json = N2nController.getPeersJSON()
-        if (json == lastPeersJson) return
-        lastPeersJson = json
-
-        val peers = try { JSONArray(json) } catch (e: Exception) { JSONArray() }
-
-        binding.tvPeerCount.text = getString(R.string.peer_count_format, peers.length())
-
-        if (peers.length() == 0) {
-            binding.tvPeersEmpty.visibility = View.VISIBLE
-            binding.peersContainer.removeAllViews()
-            return
-        }
-
-        binding.tvPeersEmpty.visibility = View.GONE
-        val inflater = LayoutInflater.from(this)
-        val existing = binding.peersContainer.childCount
-
-        if (existing == peers.length()) {
             for (i in 0 until peers.length()) {
                 val p = peers.getJSONObject(i)
-                val row = binding.peersContainer.getChildAt(i)
+                val item = ItemPeerBinding.inflate(inflater, binding.peersContainer, false)
 
-                val tvCode = row.findViewById<android.widget.TextView>(R.id.tvPeerCode)
-                val tvVip = row.findViewById<android.widget.TextView>(R.id.tvPeerVip)
-                val tvMeta = row.findViewById<android.widget.TextView>(R.id.tvPeerMeta)
-                val tvBadge = row.findViewById<android.widget.TextView>(R.id.tvPeerBadge)
+                item.tvPeerCode.text = p.optString("code", "?")
+                item.tvPeerVip.text = p.optString("vip", "--")
 
-                tvCode.text = p.optString("code", "?")
-                tvVip.text = p.optString("vip", "--")
                 val connType = p.optString("connType", "unknown")
                 val natType = p.optString("natType", "unknown")
-                tvMeta.text = natType
+                item.tvPeerMeta.text = natType
 
-                applyBadge(tvBadge, connType)
+                applyBadge(item.tvPeerBadge, connType)
+
+                binding.peersContainer.addView(item.root)
             }
-            return
-        }
-
-        binding.peersContainer.removeAllViews()
-        for (i in 0 until peers.length()) {
-            val p = peers.getJSONObject(i)
-            val item = ItemPeerBinding.inflate(inflater, binding.peersContainer, false)
-
-            item.tvPeerCode.text = p.optString("code", "?")
-            item.tvPeerVip.text = p.optString("vip", "--")
-
-            val connType = p.optString("connType", "unknown")
-            val natType = p.optString("natType", "unknown")
-            item.tvPeerMeta.text = natType
-
-            applyBadge(item.tvPeerBadge, connType)
-
-            binding.peersContainer.addView(item.root)
+        } catch (t: Throwable) {
+            Log.e(TAG, "refreshPeers failed", t)
         }
     }
 
-    // 根据连接方式给徽章上色
-    private fun applyBadge(badge: android.widget.TextView, connType: String) {
-        when (connType.lowercase()) {
-            "p2p" -> {
-                badge.text = "P2P"
-                badge.setBackgroundColor(getColor(R.color.badge_p2p_bg))
-                badge.setTextColor(getColor(R.color.badge_p2p_fg))
+    private fun applyBadge(badge: android.widget.TextView?, connType: String) {
+        if (badge == null) return
+        try {
+            when (connType.lowercase()) {
+                "p2p" -> {
+                    badge.text = "P2P"
+                    badge.setBackgroundColor(getColor(R.color.badge_p2p_bg))
+                    badge.setTextColor(getColor(R.color.badge_p2p_fg))
+                }
+                "turn" -> {
+                    badge.text = "TURN"
+                    badge.setBackgroundColor(getColor(R.color.badge_turn_bg))
+                    badge.setTextColor(getColor(R.color.badge_turn_fg))
+                }
+                "relay" -> {
+                    badge.text = "WS"
+                    badge.setBackgroundColor(getColor(R.color.badge_ws_bg))
+                    badge.setTextColor(getColor(R.color.badge_ws_fg))
+                }
+                else -> {
+                    badge.text = "?"
+                    badge.setBackgroundColor(getColor(R.color.brand_surface_2))
+                    badge.setTextColor(getColor(R.color.brand_text_dim))
+                }
             }
-            "turn" -> {
-                badge.text = "TURN"
-                badge.setBackgroundColor(getColor(R.color.badge_turn_bg))
-                badge.setTextColor(getColor(R.color.badge_turn_fg))
-            }
-            "relay" -> {
-                badge.text = "WS"
-                badge.setBackgroundColor(getColor(R.color.badge_ws_bg))
-                badge.setTextColor(getColor(R.color.badge_ws_fg))
-            }
-            else -> {
-                badge.text = "?"
-                badge.setBackgroundColor(getColor(R.color.brand_surface_2))
-                badge.setTextColor(getColor(R.color.brand_text_dim))
-            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "applyBadge failed", t)
         }
     }
 
     private fun toast(msg: String) {
-        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+        if (isFinishing || isDestroyed) return
+        try {
+            Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+        } catch (_: Throwable) {}
     }
 }
