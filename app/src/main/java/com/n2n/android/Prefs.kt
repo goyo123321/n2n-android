@@ -22,7 +22,7 @@ object Prefs {
     private const val DEFAULT_NODE_NAME = "Android"
 
     // ★ 与服务端 DEFAULT_CONNECT_TOKEN 保持一致
-    const val DEFAULT_CONNECT_TOKEN = "2523c510-9ff0-415b-9582-93949bfae7e3"
+    const val DEFAULT_CONNECT_TOKEN = ""
 
     data class Config(
         val signalingUrl: String,
