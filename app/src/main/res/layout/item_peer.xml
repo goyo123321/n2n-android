@@ -1,6 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:gravity="center_vertical"
@@ -8,6 +7,7 @@
     android:paddingHorizontal="4dp"
     android:paddingVertical="10dp">
 
+    <!-- 节点代号 A/B/C -->
     <TextView
         android:id="@+id/tvPeerCode"
         android:layout_width="32dp"
@@ -39,11 +39,22 @@
             android:id="@+id/tvPeerMeta"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="p2p · EasyNAT"
+            android:text="EasyNAT"
             android:textColor="@color/brand_text_dim"
             android:textSize="11sp" />
     </LinearLayout>
 
-    <!-- ★ 删除了 btnOpenShare -->
+    <!-- 连接方式徽章 -->
+    <TextView
+        android:id="@+id/tvPeerBadge"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:background="@color/badge_p2p_bg"
+        android:paddingHorizontal="8dp"
+        android:paddingVertical="3dp"
+        android:text="P2P"
+        android:textColor="@color/badge_p2p_fg"
+        android:textSize="10sp"
+        android:textStyle="bold" />
 
 </LinearLayout>
