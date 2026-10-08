@@ -27,7 +27,7 @@
             android:orientation="vertical"
             android:padding="16dp">
 
-            <!-- 状态卡片 -->
+            <!-- ========== 状态卡片 ========== -->
             <com.google.android.material.card.MaterialCardView
                 android:id="@+id/cardStatus"
                 android:layout_width="match_parent"
@@ -74,7 +74,7 @@
                 </LinearLayout>
             </com.google.android.material.card.MaterialCardView>
 
-            <!-- 服务器卡片 -->
+            <!-- ========== 服务器卡片 ========== -->
             <com.google.android.material.card.MaterialCardView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -97,6 +97,7 @@
                         android:textColor="@color/brand_text"
                         android:textSize="14sp"
                         android:textStyle="bold" />
+
                     <com.google.android.material.textfield.TextInputLayout
                         style="@style/Widget.N2n.TextInputLayout"
                         android:layout_width="match_parent"
@@ -119,7 +120,7 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:layout_marginTop="12dp"
-                        android:hint="优选 IP（可选，如 104.17.128.1 或 104.17.128.1:8443）"
+                        android:hint="@string/hint_preferred_ip"
                         app:boxBackgroundColor="@color/brand_bg">
                         <com.google.android.material.textfield.TextInputEditText
                             android:id="@+id/etPreferredIp"
@@ -132,20 +133,21 @@
                             android:textSize="13sp" />
                     </com.google.android.material.textfield.TextInputLayout>
 
-                    <!-- ★ UUID → CONNECT_TOKEN -->
+                    <!-- ★ CONNECT_TOKEN 带密码切换 -->
                     <com.google.android.material.textfield.TextInputLayout
                         style="@style/Widget.N2n.TextInputLayout"
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:layout_marginTop="12dp"
                         android:hint="@string/hint_connect_token"
-                        app:boxBackgroundColor="@color/brand_bg">
+                        app:boxBackgroundColor="@color/brand_bg"
+                        app:endIconMode="password_toggle">
                         <com.google.android.material.textfield.TextInputEditText
                             android:id="@+id/etConnectToken"
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
                             android:fontFamily="monospace"
-                            android:inputType="text"
+                            android:inputType="textPassword"
                             android:maxLines="1"
                             android:textColor="@color/brand_text"
                             android:textSize="13sp" />
@@ -153,7 +155,7 @@
                 </LinearLayout>
             </com.google.android.material.card.MaterialCardView>
 
-            <!-- 组网卡片 -->
+            <!-- ========== 组网卡片 ========== -->
             <com.google.android.material.card.MaterialCardView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -176,6 +178,7 @@
                         android:textColor="@color/brand_text"
                         android:textSize="14sp"
                         android:textStyle="bold" />
+
                     <com.google.android.material.textfield.TextInputLayout
                         style="@style/Widget.N2n.TextInputLayout"
                         android:layout_width="match_parent"
@@ -192,6 +195,7 @@
                             android:textColor="@color/brand_text"
                             android:textSize="13sp" />
                     </com.google.android.material.textfield.TextInputLayout>
+
                     <com.google.android.material.textfield.TextInputLayout
                         style="@style/Widget.N2n.TextInputLayout"
                         android:layout_width="match_parent"
@@ -208,6 +212,7 @@
                             android:textColor="@color/brand_text"
                             android:textSize="13sp" />
                     </com.google.android.material.textfield.TextInputLayout>
+
                     <com.google.android.material.textfield.TextInputLayout
                         style="@style/Widget.N2n.TextInputLayout"
                         android:layout_width="match_parent"
@@ -228,11 +233,13 @@
                 </LinearLayout>
             </com.google.android.material.card.MaterialCardView>
 
-            <!-- 节点列表卡片 -->
+            <!-- ========== 节点列表卡片（未运行时隐藏） ========== -->
             <com.google.android.material.card.MaterialCardView
+                android:id="@+id/cardPeers"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginBottom="12dp"
+                android:visibility="gone"
                 app:cardBackgroundColor="@color/brand_surface"
                 app:cardCornerRadius="12dp"
                 app:cardElevation="0dp"
@@ -261,7 +268,6 @@
                             android:id="@+id/tvPeerCount"
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
-                            android:text="0"
                             android:textColor="@color/brand_text_dim"
                             android:textSize="12sp" />
                     </LinearLayout>
@@ -285,7 +291,7 @@
         </LinearLayout>
     </androidx.core.widget.NestedScrollView>
 
-    <!-- 底部按钮 -->
+    <!-- ========== 底部按钮 ========== -->
     <FrameLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
