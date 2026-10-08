@@ -2,26 +2,56 @@
     <string name="app_name">n2n 组网</string>
     <string name="title_app">n2n 组网</string>
 
+    <!-- 状态 -->
     <string name="status_stopped">○ 未运行</string>
-    <string name="status_running">● 运行中</string>
     <string name="status_starting">◐ 启动中...</string>
+    <string name="status_running">● 运行中</string>
 
+    <!-- 卡片标题 -->
     <string name="card_server">🌐 服务器</string>
     <string name="card_network">👥 组网</string>
     <string name="card_peers">🌐 已连接节点</string>
 
+    <!-- 输入提示 -->
     <string name="hint_wss">WSS 地址</string>
-    <string name="hint_connect_token">连接密码 CONNECT_TOKEN（可选，留空用默认）</string>
+    <string name="hint_preferred_ip">优选 IP（可选，如 104.17.128.1 或 104.17.128.1:8443）</string>
+    <string name="hint_connect_token">连接密码 CONNECT_TOKEN（Worker 配置了才需要填）</string>
     <string name="hint_room">房间名</string>
     <string name="hint_node_name">显示名</string>
     <string name="hint_client_id">Client ID（可选，留空自动生成）</string>
 
+    <!-- 按钮 -->
     <string name="btn_save">保存</string>
     <string name="btn_start">启动 VPN</string>
     <string name="btn_stop">停止 VPN</string>
 
+    <!-- 其他 -->
     <string name="log_title">运行日志</string>
     <string name="empty_peers">暂无其他节点</string>
+    <string name="peer_count_format">%1$d 台设备</string>
 
-    <string name="token_invalid">连接密码格式错误</string>
+    <!-- 错误 -->
+    <string name="token_invalid">连接密码不能包含空格或中文</string>
+    <string name="wss_required">请先填写 WSS 地址</string>
+    <string name="wss_invalid">WSS 地址必须以 wss:// 或 ws:// 开头</string>
+    <string name="room_required">房间名不能为空</string>
+    <string name="room_invalid">房间名只允许字母/数字/下划线/短横线</string>
+
+    <!-- 确认对话框 -->
+    <string name="dialog_vpn_denied">用户拒绝 VPN 权限</string>
+    <string name="dialog_saved">已保存</string>
+    <string name="dialog_starting">正在启动...</string>
+    <string name="dialog_stopped">已停止</string>
+
+    <!-- 主题选择 -->
+    <string name="theme_title">主题</string>
+    <string name="theme_follow_system">跟随系统</string>
+    <string name="theme_light">浅色</string>
+    <string name="theme_dark">深色</string>
+
+    <!-- 首次使用对话框 -->
+    <string name="first_use_title">首次使用：请填写服务器地址</string>
+    <string name="first_use_message">你需要填写 edge-signal Worker 的 WSS 地址。\n\n如果你已经部署了 edge-signal：\n  • 打开 Cloudflare Dashboard\n  • Workers &amp; Pages → edge-signal\n  • 复制访问地址（形如 wss://xxx.workers.dev）\n\n如果你还没有部署：\n  • 参考 edge-signal 项目文档\n  • 或使用朋友分享给你的地址</string>
+    <string name="first_use_fill">我现在就填</string>
+    <string name="first_use_later">稍后再说</string>
 </resources>
