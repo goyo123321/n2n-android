@@ -12,6 +12,14 @@
     <color name="brand_danger">#DC2626</color>
     <color name="brand_warn">#F59E0B</color>
 
+    <!-- 连接方式徽章 -->
+    <color name="badge_p2p_bg">#D1FAE5</color>
+    <color name="badge_p2p_fg">#047857</color>
+    <color name="badge_turn_bg">#DBEAFE</color>
+    <color name="badge_turn_fg">#1D4ED8</color>
+    <color name="badge_ws_bg">#FEF3C7</color>
+    <color name="badge_ws_fg">#B45309</color>
+
     <color name="ic_launcher_background">#0F172A</color>
     <color name="ic_launcher_foreground">#22D3EE</color>
     <color name="ic_launcher_accent">#60A5FA</color>
