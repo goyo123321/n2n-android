@@ -1,16 +1,13 @@
 package internal
 
 import (
-	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"sync"
 	"time"
@@ -21,10 +18,11 @@ type PeerInfo struct {
 	VirtualIP     string
 	PubIP         string
 	PubPort       int
-	SharePort     int
 	TurnRelayAddr string
 	UDPAddr       *net.UDPAddr
 	lastRecvAt    int64
+	loggedReady   bool
+	hasRealData   bool
 }
 
 type PeerSnapshot struct {
@@ -32,7 +30,6 @@ type PeerSnapshot struct {
 	ClientID  string `json:"clientId"`
 	VirtualIP string `json:"vip"`
 	Online    bool   `json:"online"`
-	SharePort int    `json:"sharePort"`
 	ConnType  string `json:"connType"`
 	NATType   string `json:"natType"`
 }
@@ -58,18 +55,11 @@ type Edge struct {
 	tunWriteCh chan []byte
 	natMeta    *NATMetadata
 
-	netstack   *NetstackHost
-	progress   *ProgressDispatcher
-	wsOutbound *WSOutbound
-	httpProxy  *HTTPProxy
-
 	doneCh  chan struct{}
 	closeMu sync.Mutex
 	closed  bool
-	mu      sync.Mutex // 保护 natMeta / ws / netstack / wsOutbound / httpProxy
+	mu      sync.Mutex
 }
-
-var httpClient = &http.Client{Timeout: 30 * time.Second}
 
 func generateDefaultClientID() string {
 	hostname, _ := os.Hostname()
@@ -252,8 +242,6 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	go e.tunWriteLoop()
 	go e.tunReadLoop()
 
-	e.progress = &ProgressDispatcher{}
-
 	// 9. NAT 探测（异步）
 	go func() {
 		log.Printf("[NAT] 开始异步 STUN 探测...")
@@ -278,9 +266,9 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		}
 	}()
 
-	// 10. TURN + WSOutbound 异步初始化
+	// 10. TURN 异步初始化
 	go func() {
-		time.Sleep(200 * time.Millisecond) // ★ 200ms 足够，让 netstack 先就绪
+		time.Sleep(200 * time.Millisecond)
 		ctx, cancel := contextWithTimeout(30 * time.Second)
 		defer cancel()
 
@@ -294,23 +282,6 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 				"relayAddr": e.turnClient.GetRelayAddr(),
 			})
 		}
-
-		wsOut, err := NewWSOutbound(
-			cfg.SignalingURL, cfg.RoomID, clientId, cfg.UUID,
-			cfg.PreferredIP, cfg.PreferredPort,
-			e.turnClient,
-			cfg.UUID,
-			e.GetVirtualIP(),
-			e.udpPort,
-		)
-		if err != nil {
-			log.Printf("[WSOut] 初始化失败: %v", err)
-			return
-		}
-		e.mu.Lock()
-		e.wsOutbound = wsOut
-		e.mu.Unlock()
-		log.Printf("[WSOut] Workers 出口代理就绪")
 	}()
 
 	log.Printf("[Edge] 已启动 clientId=%s room=%s", clientId, cfg.RoomID)
@@ -338,25 +309,6 @@ func (e *Edge) Stop() {
 	}
 	if e.tun != nil {
 		_ = e.tun.Close()
-	}
-
-	e.mu.Lock()
-	wsOut := e.wsOutbound
-	proxy := e.httpProxy
-	ns := e.netstack
-	e.wsOutbound = nil
-	e.httpProxy = nil
-	e.netstack = nil
-	e.mu.Unlock()
-
-	if wsOut != nil {
-		wsOut.Close()
-	}
-	if proxy != nil {
-		proxy.Close()
-	}
-	if ns != nil {
-		_ = ns.Close()
 	}
 	log.Printf("[Edge] 已停止")
 }
@@ -399,16 +351,11 @@ func (e *Edge) GetPeersJSON() string {
 	for i, item := range list {
 		code := idxToCode(i)
 		connType := string(e.relayMgr.GetState(item.id))
-		sharePort := item.p.SharePort
-		if sharePort <= 0 {
-			sharePort = 9090
-		}
 		snapshots = append(snapshots, PeerSnapshot{
 			Code:      code,
 			ClientID:  item.id,
 			VirtualIP: item.p.VirtualIP,
 			Online:    item.p.UDPAddr != nil || item.p.TurnRelayAddr != "",
-			SharePort: sharePort,
 			ConnType:  connType,
 			NATType:   natType,
 		})
@@ -464,76 +411,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			}
 		}
 
-		e.mu.Lock()
-		nsExisting := e.netstack
-		e.mu.Unlock()
-		if nsExisting == nil && vip != "" {
-			ns, err := NewNetstackHost(vip)
-			if err != nil {
-				log.Printf("[Netstack] 初始化失败: %v", err)
-			} else {
-				ns.progress = e.progress
-
-				// 1. DNS Proxy
-				dnsCache := NewDNSCache()
-				if dp, err := NewDNSProxy(dnsCache, func() *WSOutbound {
-					e.mu.Lock()
-					defer e.mu.Unlock()
-					return e.wsOutbound
-				}); err == nil {
-					ns.SetDNSProxy(dp)
-					log.Printf("[Netstack] DNS Proxy 已挂载（双 DNS）")
-				} else {
-					log.Printf("[Netstack] DNS Proxy 初始化失败: %v", err)
-				}
-
-				// ★ 2. Router（必须挂载，否则所有流量都走 proxy）
-				if router, err := NewRouter(DefaultRoutingConfig()); err == nil {
-					ns.SetRouter(router, dnsCache)
-					log.Printf("[Netstack] Router 已挂载（geoip:cn / geosite:cn 直连）")
-				} else {
-					log.Printf("[Netstack] Router 初始化失败: %v", err)
-				}
-
-				// 3. Proxy Handler（★ 等待 wsOutbound 就绪）
-				ns.SetProxyHandler(func(ip string, port int) (io.ReadWriteCloser, error) {
-					deadline := time.Now().Add(15 * time.Second)
-					for time.Now().Before(deadline) {
-						e.mu.Lock()
-						wsOut := e.wsOutbound
-						e.mu.Unlock()
-						if wsOut != nil {
-							return wsOut.NewStream(ip, port)
-						}
-						select {
-						case <-e.doneCh:
-							return nil, fmt.Errorf("已关闭")
-						case <-time.After(200 * time.Millisecond):
-						}
-					}
-					return nil, fmt.Errorf("wsOutbound 15s 内未就绪")
-				})
-				log.Printf("[Netstack] ProxyHandler 已挂载")
-
-				e.mu.Lock()
-				if e.netstack != nil {
-					e.mu.Unlock()
-					_ = ns.Close()
-				} else {
-					e.netstack = ns
-					e.mu.Unlock()
-
-					go e.netstackReadLoop(ns)
-
-					if e.cfg != nil && e.cfg.ShareDir != "" {
-						if err := ns.StartShareServer(e.cfg.ShareDir); err != nil {
-							log.Printf("[Netstack] 共享盘启动失败: %v", err)
-						}
-					}
-				}
-			}
-		}
-
 		e.reportMetadata()
 
 		if peers, ok := payload["peers"].([]interface{}); ok {
@@ -547,12 +424,11 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 				pip, _ := pm["virtualIp"].(string)
 				pubIP, _ := pm["publicIp"].(string)
 				pubPort := jsonInt(pm["publicPort"])
-				sharePort := jsonInt(pm["sharePort"])
 				relayAddr, _ := pm["turnRelayAddr"].(string)
 				if pid == "" || pip == "" {
 					continue
 				}
-				e.registerPeer(pid, pip, pubIP, pubPort, sharePort)
+				e.registerPeer(pid, pip, pubIP, pubPort)
 				if relayAddr != "" {
 					e.peersMu.Lock()
 					if pi, ok := e.peers[pid]; ok {
@@ -560,7 +436,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 					}
 					e.peersMu.Unlock()
 				}
-				log.Printf("[信令] 已有节点: %s vip=%s pub=%s:%d share=%d", pid, pip, pubIP, pubPort, sharePort)
+				log.Printf("[信令] 已有节点: %s vip=%s pub=%s:%d", pid, pip, pubIP, pubPort)
 			}
 		}
 
@@ -572,13 +448,12 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		pip, _ := payload["virtualIp"].(string)
 		pubIP, _ := payload["publicIp"].(string)
 		pubPort := jsonInt(payload["publicPort"])
-		sharePort := jsonInt(payload["sharePort"])
 		relayAddr, _ := payload["turnRelayAddr"].(string)
 
 		log.Printf("[信令] joined: from=%s vip=%s pub=%s:%d", from, pip, pubIP, pubPort)
 
 		if from != "" && pip != "" {
-			e.registerPeer(from, pip, pubIP, pubPort, sharePort)
+			e.registerPeer(from, pip, pubIP, pubPort)
 			if relayAddr != "" {
 				e.peersMu.Lock()
 				if pi, ok := e.peers[from]; ok {
@@ -652,7 +527,6 @@ func (e *Edge) reportMetadata() {
 	ws := e.ws
 	e.mu.Unlock()
 
-	// ★ 读取网卡信息（LAN IP / 网关），供服务端 LAN 直连判断
 	netInfo := getNetInfo()
 
 	metaPayload := map[string]interface{}{
@@ -661,12 +535,10 @@ func (e *Edge) reportMetadata() {
 		"regularPortsChange": nm.RegularPortsChange,
 		"behavior":           nm.Behavior,
 		"assistedSockets":    nm.AssistedSockets,
-		"sharePort":          9090,
 		"p2pEndpoint":        nm.P2PEndpoint,
-		// ★ LAN 直连必需字段
-		"lanIp":     netInfo.LANIP,
-		"gatewayIp": netInfo.GatewayIP,
-		"udpPort":   e.udpPort,
+		"lanIp":              netInfo.LANIP,
+		"gatewayIp":          netInfo.GatewayIP,
+		"udpPort":            e.udpPort,
 	}
 	if nm.PublicEndpoint != "" {
 		metaPayload["publicEndpoint"] = nm.PublicEndpoint
@@ -684,7 +556,7 @@ func (e *Edge) reportMetadata() {
 	_ = ws.Send(map[string]interface{}{
 		"type": "share_announce",
 		"payload": map[string]interface{}{
-			"name": e.nodeName, "virtualIp": vip, "port": 9090,
+			"name": e.nodeName, "virtualIp": vip, "port": 0,
 		},
 	})
 }
@@ -696,7 +568,7 @@ func jsonInt(v interface{}) int {
 	return 0
 }
 
-func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, sharePort int) {
+func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int) {
 	var udpAddr *net.UDPAddr
 	if pubIP != "" && pubPort > 0 {
 		udpAddr = &net.UDPAddr{IP: net.ParseIP(pubIP), Port: pubPort}
@@ -713,16 +585,13 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, sharePort int) 
 		if pubPort > 0 {
 			p.PubPort = pubPort
 		}
-		if sharePort > 0 {
-			p.SharePort = sharePort
-		}
 		if udpAddr != nil {
 			p.UDPAddr = udpAddr
 		}
 	} else {
 		e.peers[pid] = &PeerInfo{
 			ClientID: pid, VirtualIP: vip, PubIP: pubIP,
-			PubPort: pubPort, SharePort: sharePort, UDPAddr: udpAddr,
+			PubPort: pubPort, UDPAddr: udpAddr,
 		}
 	}
 }
@@ -753,20 +622,37 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 
 func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	res := e.executeNatHole(instr)
+
+	// executeNatHole 返回 nil 表示重复指令，跳过上报
+	if res == nil {
+		return
+	}
+
+	// 先更新状态，再读 p2pStatus
+	if res.State == PunchStateSucceeded {
+		e.relayMgr.MarkP2P(instr.TargetMac)
+	} else if res.State == PunchStateFailed {
+		e.relayMgr.MarkFallback(instr.TargetMac)
+	}
+
+	p2pStatus := 0
+	switch e.relayMgr.GetState(instr.TargetMac) {
+	case ConnP2P:
+		p2pStatus = 3
+	case ConnTURN, ConnRelay:
+		p2pStatus = 2
+	}
+
 	_ = e.ws.Send(map[string]interface{}{
 		"type": "p2p_state_info",
 		"payload": map[string]interface{}{
 			"to": []map[string]interface{}{{
 				"macAddr": instr.TargetMac, "observedRaddr": "",
 				"punchResult": res, "punchResultPeerMac": instr.TargetMac,
+				"p2pStatus": p2pStatus,
 			}},
 		},
 	})
-	if res.State == PunchStateSucceeded {
-		e.relayMgr.MarkP2P(instr.TargetMac)
-	} else {
-		e.relayMgr.MarkFallback(instr.TargetMac)
-	}
 }
 
 // ============ IO ============
@@ -788,7 +674,7 @@ func (e *Edge) udpReadLoop() {
 		}
 		if buf[0] == 'N' && buf[1] == '2' && buf[2] == 'N' && buf[3] == 'P' {
 			if ua, ok := addr.(*net.UDPAddr); ok {
-				e.notePeerTraffic(ua)
+				e.notePeerProbe(ua)
 			}
 			continue
 		}
@@ -801,6 +687,11 @@ func (e *Edge) udpReadLoop() {
 	}
 }
 
+// tunReadLoop 直接从 TUN 读包，转发到对应 peer。
+//
+// 因为 VpnService.Builder 只接管 10.64.0.0/24（对标 PC 端），
+// 所有进入 TUN 的包都是发往组网内 peer 的，理论上 target 一定有。
+// 保留兜底是为了处理虚拟网段配置不一致的边缘情况。
 func (e *Edge) tunReadLoop() {
 	buf := make([]byte, 65535)
 	for {
@@ -818,16 +709,6 @@ func (e *Edge) tunReadLoop() {
 		}
 
 		dstIP := net.IP(buf[16:20]).String()
-		vip := e.GetVirtualIP()
-
-		e.mu.Lock()
-		ns := e.netstack
-		e.mu.Unlock()
-
-		if dstIP == vip && ns != nil {
-			ns.InjectTUNPacket(buf[:n])
-			continue
-		}
 
 		e.peersMu.RLock()
 		var target *PeerInfo
@@ -843,11 +724,6 @@ func (e *Edge) tunReadLoop() {
 			if !e.relayMgr.SendToPeer(target.ClientID, buf[:n], target) {
 				_ = e.ws.SendBinary(buf[:n])
 			}
-			continue
-		}
-
-		if ns != nil {
-			ns.InjectTUNPacket(buf[:n])
 		}
 	}
 }
@@ -865,56 +741,6 @@ func (e *Edge) tunWriteLoop() {
 	}
 }
 
-// netstackReadLoop 阻塞等待 netstack 出包，通过 ctx 感知 Edge 停止。
-func (e *Edge) netstackReadLoop(ns *NetstackHost) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go func() {
-		select {
-		case <-e.doneCh:
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
-
-	for {
-		data, ok := ns.ReadTUNPacketContext(ctx)
-		if !ok {
-			return
-		}
-		e.forwardPacketToPeer(data)
-	}
-}
-
-func (e *Edge) forwardPacketToPeer(data []byte) {
-	if len(data) < 20 || data[0]>>4 != 4 {
-		return
-	}
-	dstIP := net.IP(data[16:20]).String()
-
-	if dstIP == e.GetVirtualIP() {
-		e.enqueueTUN(data)
-		return
-	}
-
-	e.peersMu.RLock()
-	var target *PeerInfo
-	for _, p := range e.peers {
-		if p.VirtualIP == dstIP {
-			target = p
-			break
-		}
-	}
-	e.peersMu.RUnlock()
-
-	if target != nil {
-		if !e.relayMgr.SendToPeer(target.ClientID, data, target) {
-			_ = e.ws.SendBinary(data)
-		}
-	}
-}
-
 func (e *Edge) enqueueTUN(data []byte) {
 	cp := make([]byte, len(data))
 	copy(cp, data)
@@ -924,35 +750,31 @@ func (e *Edge) enqueueTUN(data []byte) {
 	}
 }
 
+// onRemotePacket 处理从 WS/TURN/UDP 收到的组网包。
+//
+// 简单写回 TUN 即可——TUN 只接管 10.64.0.0/24，系统会把包交给我们，
+// 我们写回后由内核 TCP/IP 栈处理。不需要 gVisor。
 func (e *Edge) onRemotePacket(data []byte) {
 	if len(data) < 20 || data[0]>>4 != 4 {
 		return
 	}
-
 	dstIP := net.IP(data[16:20]).String()
 	vip := e.GetVirtualIP()
 	if dstIP != vip {
 		return
 	}
-
-	const sharePort = 9090
-	proto := data[9]
-	if proto == 6 && len(data) >= 24 {
-		dstPort := int(binary.BigEndian.Uint16(data[22:24]))
-		if dstPort == sharePort {
-			e.mu.Lock()
-			ns := e.netstack
-			e.mu.Unlock()
-			if ns != nil {
-				ns.InjectTUNPacket(data)
-			}
-			return
-		}
-	}
 	e.enqueueTUN(data)
 }
 
+func (e *Edge) notePeerProbe(addr *net.UDPAddr) {
+	e.notePeerCommon(addr, false)
+}
+
 func (e *Edge) notePeerTraffic(addr *net.UDPAddr) {
+	e.notePeerCommon(addr, true)
+}
+
+func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool) {
 	now := time.Now().UnixMilli()
 	e.peersMu.Lock()
 	var best *PeerInfo
@@ -975,14 +797,19 @@ func (e *Edge) notePeerTraffic(addr *net.UDPAddr) {
 		return
 	}
 	best.lastRecvAt = now
-	if bestScore == 1 {
-		best.UDPAddr = &net.UDPAddr{IP: addr.IP, Port: addr.Port}
+	if isRealData {
+		best.hasRealData = true
+		if bestScore == 1 {
+			best.UDPAddr = &net.UDPAddr{IP: addr.IP, Port: addr.Port}
+		}
 	}
 	clientID := best.ClientID
+	ip := addr.IP.String()
+	realData := best.hasRealData
 	e.peersMu.Unlock()
 
-	if e.relayMgr.ShouldRelay(clientID) {
-		log.Printf("[P2P] 从 %s 收到 UDP 包，升级为 P2P", clientID)
+	if realData && isRealData && e.relayMgr.ShouldRelay(clientID) {
+		log.Printf("[P2P] 从 %s (%s) 收到真实数据帧，升级为 P2P", clientID, ip)
 		e.relayMgr.MarkP2P(clientID)
 	}
 }
