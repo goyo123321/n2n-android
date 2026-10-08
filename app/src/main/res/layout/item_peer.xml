@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:gravity="center_vertical"
+    android:orientation="horizontal"
+    android:paddingHorizontal="4dp"
+    android:paddingVertical="10dp">
+
+    <TextView
+        android:id="@+id/tvPeerCode"
+        android:layout_width="32dp"
+        android:layout_height="32dp"
+        android:background="@color/brand_surface_2"
+        android:gravity="center"
+        android:text="A"
+        android:textColor="@color/brand_text"
+        android:textSize="14sp"
+        android:textStyle="bold" />
+
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="12dp"
+        android:layout_weight="1"
+        android:orientation="vertical">
+
+        <TextView
+            android:id="@+id/tvPeerVip"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:text="10.64.0.3"
+            android:textColor="@color/brand_text"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/tvPeerMeta"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="p2p · EasyNAT"
+            android:textColor="@color/brand_text_dim"
+            android:textSize="11sp" />
+    </LinearLayout>
+
+    <!-- ★ 删除了 btnOpenShare -->
+
+</LinearLayout>
