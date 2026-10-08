@@ -4,7 +4,10 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"sync"
 	"time"
+
+	"golang.org/x/net/ipv4"
 )
 
 type NatHoleInstruction struct {
@@ -48,7 +51,49 @@ const (
 	PunchStateSucceeded  = 3
 )
 
+var probePrefix = []byte{0x4E, 0x32, 0x4E, 0x50} // "N2NP"
+
+// 同一时刻只允许一个 executeNatHole 在跑。
+// TTL 是 socket 级别的选项（ipv4.PacketConn.SetTTL），并发执行时
+// 各自的 SetTTL 会互相覆盖，导致部分轮次用错 TTL。打洞不是热路径，
+// 串行化代价可以忽略。
+var (
+	natHoleActiveMu sync.Mutex
+	natHoleActive   map[string]bool
+)
+
+func init() {
+	natHoleActive = make(map[string]bool)
+}
+
 func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
+	// 同一 target 已有执行中的指令，返回 nil。
+	//
+	// 返回 nil 而不是 Failed：原指令还在执行，它会发真实结果。
+	// 如果这里返回 Failed，服务端会多记一次假失败，污染 failCounts
+	// 和 analyzer 分数。调用方 runNatHole 看到 nil 时跳过上报。
+	natHoleActiveMu.Lock()
+	if natHoleActive[instr.TargetMac] {
+		natHoleActiveMu.Unlock()
+		log.Printf("[NAT-HOLE] 跳过重复指令 target=%s（已在处理中）", instr.TargetMac)
+		return nil
+	}
+	natHoleActive[instr.TargetMac] = true
+	natHoleActiveMu.Unlock()
+	defer func() {
+		natHoleActiveMu.Lock()
+		delete(natHoleActive, instr.TargetMac)
+		natHoleActiveMu.Unlock()
+	}()
+
+	// 立即上报 InProgress。
+	//
+	// 服务端的 in-flight 窗口默认 10s。ladder 的 rung 7/9 带
+	// sendDelayMs=10000，客户端会 sleep 10s 后才发第一个探测包——
+	// 恰好卡在窗口边界上。不主动上报的话，服务端会在客户端开始
+	// 打洞前就误判为"没有回应"并重新派发指令。
+	e.reportInProgress(instr)
+
 	startAt := time.Now().UnixMilli()
 
 	res := &PunchResult{
@@ -64,9 +109,30 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		return res
 	}
 
-	log.Printf("[NAT-HOLE] 开始打洞 role=%d target=%s:%d rung=%d mode=%d assisted=%d",
+	// TTL 是 socket 的 IP TTL，不是轮次数。
+	// 设置 TTL 让探测包在特定跳数后消亡：
+	//   TTL=7  → 走 7 跳即死，用于让 NAT 在近处分配映射（短路径）
+	//   TTL=4  → 更短
+	//   ttl=0  → 不改 TTL，全路径发送（长路径唯一能用的档位）
+	var prevTTL int = -1
+	if instr.TTL > 0 && e.udpConn != nil {
+		p := ipv4.NewPacketConn(e.udpConn)
+		if cur, err := p.TTL(); err == nil {
+			prevTTL = cur
+		}
+		if err := p.SetTTL(instr.TTL); err != nil {
+			log.Printf("[NAT-HOLE] 设置 TTL=%d 失败: %v", instr.TTL, err)
+		}
+		defer func() {
+			if prevTTL > 0 {
+				_ = p.SetTTL(prevTTL)
+			}
+		}()
+	}
+
+	log.Printf("[NAT-HOLE] 开始打洞 role=%d target=%s:%d rung=%d mode=%d ttl=%d assisted=%d",
 		instr.Role, targetAddr.IP, targetAddr.Port, instr.BehaviorIndex, instr.Mode,
-		len(instr.TargetAssistedEndpoints))
+		instr.TTL, len(instr.TargetAssistedEndpoints))
 
 	var targets []*net.UDPAddr
 	var candidateIPs []net.IP
@@ -101,28 +167,19 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 	probe := buildPunchProbe(e.virtualIP)
 	var attempts uint32
 
-	rounds := 5
-	if instr.TTL > 0 {
-		rounds = instr.TTL * 2
-		if rounds < 5 {
-			rounds = 5
-		}
-		if rounds > 30 {
-			rounds = 30
-		}
-	}
+	const rounds = 5
+	const roundInterval = 200 * time.Millisecond
 
 	for round := 0; round < rounds; round++ {
 		for _, t := range targets {
-			// ★ P3：WriteTo 替代 WriteToUDP（udpConn 类型是 net.PacketConn）
 			if _, err := e.udpConn.WriteTo(probe, t); err == nil {
 				attempts++
 			}
 		}
-		if e.hasPeerTrafficFromAny(candidateIPs, startAt) {
+		if e.hasRealTrafficFromAny(candidateIPs, startAt) {
 			res.State = PunchStateSucceeded
 			res.Attempts = attempts
-			res.Detail = "收到对端流量"
+			res.Detail = "收到对端真实数据帧"
 
 			e.peersMu.Lock()
 			if p, ok := e.peers[instr.TargetMac]; ok {
@@ -138,17 +195,48 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 			}
 			e.peersMu.Unlock()
 
-			log.Printf("[NAT-HOLE] ✅ 成功 role=%d target=%s attempts=%d", instr.Role, targetAddr.IP, attempts)
+			log.Printf("[NAT-HOLE] ✅ 成功 role=%d target=%s attempts=%d",
+				instr.Role, targetAddr.IP, attempts)
 			return res
 		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(roundInterval)
 	}
 
 	res.State = PunchStateFailed
 	res.Attempts = attempts
 	res.Detail = "无响应"
-	log.Printf("[NAT-HOLE] ❌ 失败 role=%d target=%s attempts=%d", instr.Role, targetAddr.IP, attempts)
+	log.Printf("[NAT-HOLE] ❌ 失败 role=%d target=%s attempts=%d",
+		instr.Role, targetAddr.IP, attempts)
 	return res
+}
+
+// 向服务端上报 InProgress。
+//
+// 放在 executeNatHole 开头而不是中途，是因为服务端的 in-flight 窗口
+// 是从"派发时刻"开始计时的，而客户端从"收到指令"到"发出第一个探测包"
+// 之间可能有 sendDelayMs（最长 10s）的延迟。只有客户端一收到就上报，
+// 才能让服务端的窗口跟着延迟重新计时。
+func (e *Edge) reportInProgress(instr *NatHoleInstruction) {
+	if e.ws == nil {
+		return
+	}
+	_ = e.ws.Send(map[string]interface{}{
+		"type": "p2p_state_info",
+		"payload": map[string]interface{}{
+			"to": []map[string]interface{}{
+				{
+					"macAddr": instr.TargetMac,
+					"punchResult": map[string]interface{}{
+						"state":         PunchStateInProgress,
+						"attempts":      0,
+						"detail":        "round started",
+						"behaviorIndex": instr.BehaviorIndex,
+					},
+					"punchResultPeerMac": instr.TargetMac,
+				},
+			},
+		},
+	})
 }
 
 func parseSockAddr(s string) *net.UDPAddr {
@@ -184,14 +272,17 @@ func (e *Edge) resolveTarget(instr *NatHoleInstruction) *net.UDPAddr {
 
 func buildPunchProbe(virtualIP string) []byte {
 	buf := make([]byte, 32)
-	copy(buf[0:4], []byte{0x4e, 0x32, 0x4e, 0x50})
+	copy(buf[0:4], probePrefix)
 	if ip := net.ParseIP(virtualIP); ip != nil && ip.To4() != nil {
 		copy(buf[4:8], ip.To4())
 	}
 	return buf
 }
 
-func (e *Edge) hasPeerTrafficFromAny(ips []net.IP, since int64) bool {
+// 判断候选 IP 中是否有过"真实数据帧"到达。
+// 探测包不算——它是打洞本身产生的，只证明对方在打洞，
+// 不证明数据平面通了。真实数据帧才是 P2P 成功的证据。
+func (e *Edge) hasRealTrafficFromAny(ips []net.IP, since int64) bool {
 	if len(ips) == 0 {
 		return false
 	}
@@ -199,6 +290,9 @@ func (e *Edge) hasPeerTrafficFromAny(ips []net.IP, since int64) bool {
 	defer e.peersMu.RUnlock()
 	for _, p := range e.peers {
 		if p.UDPAddr == nil || p.lastRecvAt < since {
+			continue
+		}
+		if !p.hasRealData {
 			continue
 		}
 		for _, ip := range ips {
