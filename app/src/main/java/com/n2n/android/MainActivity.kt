@@ -279,7 +279,8 @@ class MainActivity : AppCompatActivity() {
 
         if (changed) {
             saveCurrentInput()
-            toast("已从外部参数更新配置")
+            // ★ 单行改动：硬编码中文 → strings
+            toast(getString(R.string.dialog_external_updated))
         }
         if (intent.getBooleanExtra("auto_start", false)) {
             binding.root.postDelayed({ requestVpnPermission() }, 300)
