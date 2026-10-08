@@ -66,11 +66,9 @@ class MainActivity : AppCompatActivity() {
 
         loadConfig(savedInstanceState)
         handleIntentParams(intent)
-        refreshShareDirDisplay()
 
         requestNotifPermissionIfNeeded()
         requestIgnoreBatteryOptimizationIfNeeded()
-        showFirstLaunchDialogIfNeeded()
         checkSignalingUrl()
 
         binding.toolbar.inflateMenu(R.menu.menu_main)
@@ -94,11 +92,6 @@ class MainActivity : AppCompatActivity() {
             saveCurrentInput()
             toast("已保存")
         }
-        binding.btnPickDir.setOnClickListener { showShareDirInfo() }
-        binding.btnManageFiles.setOnClickListener {
-            startActivity(Intent(this, FileManagerActivity::class.java))
-        }
-        binding.btnOpenMyShare.setOnClickListener { openMyShare() }
 
         // 首次刷新（ticker 在 onStart 启动）
         refreshStatus()
@@ -201,30 +194,6 @@ class MainActivity : AppCompatActivity() {
                 startActivity(Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
             } catch (_: Exception) {}
         }
-    }
-
-    private fun showFirstLaunchDialogIfNeeded() {
-        if (!Prefs.isFirstLaunch(this)) return
-        AlertDialog.Builder(this)
-            .setTitle("共享目录位置")
-            .setMessage(
-                """
-                你的共享目录位于：
-                Android/media/com.n2n.android/shared/
-
-                • MT 管理器可直接访问（无需授权）
-                • USB 连电脑可直接拖拽文件
-                • 微信/QQ 能直接选到里面的文件
-                • PC 端可通过 n2n 组网访问
-
-                系统首次访问时会提示"允许访问媒体文件"，请点"允许"以启用外部访问。
-                """.trimIndent()
-            )
-            .setPositiveButton("知道了") { _, _ ->
-                Prefs.setFirstLaunchDone(this)
-            }
-            .setCancelable(false)
-            .show()
     }
 
     private fun checkSignalingUrl() {
@@ -399,7 +368,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startVpnService() {
-        val shareDir = ShareDirManager.getDefaultShareDir(this).absolutePath
         val preferredIp = binding.etPreferredIp.text.toString().trim()
         val uuid = binding.etUuid.text.toString().trim().ifEmpty { Prefs.DEFAULT_UUID }
 
@@ -411,7 +379,6 @@ class MainActivity : AppCompatActivity() {
             putExtra(N2nVpnService.EXTRA_CLIENT_ID, binding.etClientId.text.toString().trim())
             putExtra(N2nVpnService.EXTRA_NODE_NAME, binding.etNodeName.text.toString().trim())
             putExtra(N2nVpnService.EXTRA_UUID, uuid)
-            putExtra(N2nVpnService.EXTRA_SHARE_DIR, shareDir)
         }
         startForegroundService(intent)
         toast("正在启动...")
@@ -440,23 +407,6 @@ class MainActivity : AppCompatActivity() {
             binding.tvClientId.visibility = View.VISIBLE
             binding.cardStatus.setStrokeColor(getColor(R.color.brand_success))
 
-            val vip = N2nController.getVirtualIP()
-            if (vip.isNotEmpty()) {
-                val host = formatHost(vip)
-                binding.tvShareUrl.text = "共享盘: http://$host:9090/"
-                binding.tvShareUrl.visibility = View.VISIBLE
-
-                binding.tvShareVip.text = "http://$host:9090/"
-                binding.tvShareVip.visibility = View.VISIBLE
-                binding.btnOpenMyShare.isEnabled = true
-                binding.btnOpenMyShare.alpha = 1.0f
-            } else {
-                binding.tvShareUrl.visibility = View.GONE
-                binding.tvShareVip.visibility = View.GONE
-                binding.btnOpenMyShare.isEnabled = false
-                binding.btnOpenMyShare.alpha = 0.5f
-            }
-
             binding.btnStart.visibility = View.GONE
             binding.btnStop.visibility = View.VISIBLE
         } else {
@@ -464,11 +414,6 @@ class MainActivity : AppCompatActivity() {
             binding.tvStatus.setTextColor(getColor(R.color.brand_text_dim))
             binding.tvVirtualIp.visibility = View.GONE
             binding.tvClientId.visibility = View.GONE
-            binding.tvShareUrl.visibility = View.GONE
-
-            binding.tvShareVip.visibility = View.GONE
-            binding.btnOpenMyShare.isEnabled = false
-            binding.btnOpenMyShare.alpha = 0.5f
 
             binding.cardStatus.setStrokeColor(getColor(R.color.brand_border))
 
@@ -514,18 +459,12 @@ class MainActivity : AppCompatActivity() {
                 val tvCode = row.findViewById<android.widget.TextView>(R.id.tvPeerCode)
                 val tvVip = row.findViewById<android.widget.TextView>(R.id.tvPeerVip)
                 val tvMeta = row.findViewById<android.widget.TextView>(R.id.tvPeerMeta)
-                val btnOpen = row.findViewById<com.google.android.material.button.MaterialButton>(R.id.btnOpenShare)
 
                 tvCode.text = p.optString("code", "?")
                 tvVip.text = p.optString("vip", "--")
                 val connType = p.optString("connType", "unknown")
                 val natType = p.optString("natType", "unknown")
                 tvMeta.text = "$connType · $natType"
-
-                val vip = p.optString("vip", "")
-                val sharePort = p.optInt("sharePort", 9090)
-                btnOpen.isEnabled = vip.isNotEmpty()
-                btnOpen.setOnClickListener { openShareInBrowser(vip, sharePort) }
             }
             return
         }
@@ -541,76 +480,8 @@ class MainActivity : AppCompatActivity() {
             val natType = p.optString("natType", "unknown")
             item.tvPeerMeta.text = "$connType · $natType"
 
-            val vip = p.optString("vip", "")
-            val sharePort = p.optInt("sharePort", 9090)
-
-            item.btnOpenShare.isEnabled = vip.isNotEmpty()
-            item.btnOpenShare.setOnClickListener {
-                openShareInBrowser(vip, sharePort)
-            }
             binding.peersContainer.addView(item.root)
         }
-    }
-
-    private fun openMyShare() {
-        if (!N2nController.isRunning()) {
-            toast("请先启动 VPN")
-            return
-        }
-        val vip = N2nController.getVirtualIP()
-        if (vip.isEmpty()) {
-            toast("虚拟 IP 未分配，稍后再试")
-            return
-        }
-        val intent = Intent(this, ShareWebActivity::class.java).apply {
-            putExtra(ShareWebActivity.EXTRA_VIP, vip)
-            putExtra(ShareWebActivity.EXTRA_PORT, 9090)
-            putExtra(ShareWebActivity.EXTRA_TITLE, "本机共享盘")
-        }
-        startActivity(intent)
-    }
-
-    private fun openShareInBrowser(vip: String, port: Int) {
-        val intent = Intent(this, ShareWebActivity::class.java).apply {
-            putExtra(ShareWebActivity.EXTRA_VIP, vip)
-            putExtra(ShareWebActivity.EXTRA_PORT, port)
-            putExtra(ShareWebActivity.EXTRA_TITLE, "共享盘 · $vip")
-        }
-        startActivity(intent)
-    }
-
-    private fun refreshShareDirDisplay() {
-        binding.tvShareDir.text = ShareDirManager.getDefaultShareDir(this).absolutePath
-    }
-
-    private fun showShareDirInfo() {
-        val dir = ShareDirManager.getDefaultShareDir(this)
-        val path = dir.absolutePath
-        AlertDialog.Builder(this)
-            .setTitle("共享盘目录")
-            .setMessage(
-                """
-                当前共享盘固定使用以下目录：
-
-                $path
-
-                • MT 管理器 / USB 连电脑可直接访问
-                • 微信/QQ 能直接选到里面的文件
-                • 通过 n2n 组网的其它设备可访问
-
-                如需自定义目录，请在"管理文件"中把文件放进去即可。
-                """.trimIndent()
-            )
-            .setPositiveButton("复制路径") { _, _ ->
-                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                cm.setPrimaryClip(ClipData.newPlainText("n2n share dir", path))
-                toast("已复制路径")
-            }
-            .setNeutralButton("管理文件") { _, _ ->
-                startActivity(Intent(this, FileManagerActivity::class.java))
-            }
-            .setNegativeButton("关闭", null)
-            .show()
     }
 
     private fun toast(msg: String) {
