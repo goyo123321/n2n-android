@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	github.com/gorilla/websocket v1.5.1
 	github.com/pion/stun/v2 v2.0.0
-	golang.org/x/net v0.59.0        // ← nathole_executor.go 用到 ipv4 包
+	golang.org/x/net v0.59.0 // ← nathole_executor.go 用到 ipv4 包
 )
 
 require (
