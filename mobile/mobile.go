@@ -16,8 +16,7 @@ type Config struct {
 	RoomID        string
 	ClientID      string
 	NodeName      string
-	UUID          string // ★ 组网密钥
-	ShareDir      string
+	UUID          string
 	PreferredIP   string
 	PreferredPort int
 }
@@ -85,8 +84,8 @@ func (c *Client) FetchVirtualIP(cfg *Config) (result string) {
 	icfg := &internal.Config{
 		SignalingURL: cfg.SignalingURL, RoomID: cfg.RoomID,
 		ClientID: cfg.ClientID, NodeName: cfg.NodeName,
-		UUID: cfg.UUID, ShareDir: cfg.ShareDir,
-		PreferredIP: cfg.PreferredIP, PreferredPort: cfg.PreferredPort,
+		UUID: cfg.UUID, PreferredIP: cfg.PreferredIP,
+		PreferredPort: cfg.PreferredPort,
 	}
 	return internal.FetchVirtualIP(icfg)
 }
@@ -116,8 +115,8 @@ func (c *Client) Start(cfg *Config) (errMsg string) {
 	icfg := &internal.Config{
 		SignalingURL: cfg.SignalingURL, RoomID: cfg.RoomID,
 		ClientID: cfg.ClientID, NodeName: cfg.NodeName,
-		UUID: cfg.UUID, ShareDir: cfg.ShareDir,
-		PreferredIP: cfg.PreferredIP, PreferredPort: cfg.PreferredPort,
+		UUID: cfg.UUID, PreferredIP: cfg.PreferredIP,
+		PreferredPort: cfg.PreferredPort,
 	}
 
 	edge, err := internal.Start(icfg, tunFd, udpFd, stunFd)
