@@ -6,7 +6,6 @@ type Config struct {
 	ClientID      string
 	NodeName      string
 	UUID          string
-	ShareDir      string
 	PreferredIP   string
 	PreferredPort int
 }
