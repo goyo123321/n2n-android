@@ -82,7 +82,7 @@ func FetchVirtualIP(cfg *Config) string {
 		clientId = generateDefaultClientID()
 	}
 	ws, err := NewWSTransport(
-		cfg.SignalingURL, cfg.RoomID, clientId, cfg.UUID,
+		cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken,
 		cfg.PreferredIP, cfg.PreferredPort,
 	)
 	if err != nil {
@@ -208,7 +208,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 
 	// 4. 信令
 	ws, err := NewWSTransport(
-		cfg.SignalingURL, cfg.RoomID, clientId, cfg.UUID,
+		cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken,
 		cfg.PreferredIP, cfg.PreferredPort,
 	)
 	if err != nil {
@@ -222,7 +222,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	e.ws = ws
 
 	// 5. TURN
-	e.turnClient = NewTURNClient(cfg.SignalingURL, cfg.UUID, e)
+	e.turnClient = NewTURNClient(cfg.SignalingURL, cfg.ConnectToken, e)
 	e.turnClient.onMessage = func(data []byte, addr net.Addr) {
 		e.onRemotePacket(data)
 	}
@@ -484,29 +484,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			e.peersMu.Unlock()
 		}
 
-	case "lan_direct":
-		targetMac, _ := msg["targetMac"].(string)
-		targetLanIP, _ := msg["targetLanIp"].(string)
-		targetUdpPort := jsonInt(msg["targetUdpPort"])
-		if targetMac == "" || targetLanIP == "" {
-			return
-		}
-		log.Printf("[同 WiFi] 直连 %s @ %s:%d", targetMac, targetLanIP, targetUdpPort)
-
-		e.peersMu.Lock()
-		if p, ok := e.peers[targetMac]; ok {
-			p.UDPAddr = &net.UDPAddr{IP: net.ParseIP(targetLanIP), Port: targetUdpPort}
-			p.PubIP = targetLanIP
-			p.PubPort = targetUdpPort
-		} else {
-			e.peers[targetMac] = &PeerInfo{
-				ClientID: targetMac,
-				UDPAddr:  &net.UDPAddr{IP: net.ParseIP(targetLanIP), Port: targetUdpPort},
-			}
-		}
-		e.peersMu.Unlock()
-		e.relayMgr.MarkP2P(targetMac)
-
 	case "pong":
 		return
 
@@ -521,31 +498,32 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	}
 }
 
+// reportMetadata 上报 p2p_metadata + share_announce。
+//
+// 服务端字段（edge-signal/src/room.ts）：name, natType, portsDifference,
+// regularPortsChange, behavior, assistedSockets, p2pEndpoint, publicEndpoint。
+// 不再上报 lanIp / gatewayIp / udpPort —— 服务端已删除 LAN 直连逻辑。
 func (e *Edge) reportMetadata() {
 	e.mu.Lock()
 	nm := e.natMeta
 	ws := e.ws
 	e.mu.Unlock()
 
-	netInfo := getNetInfo()
-
 	metaPayload := map[string]interface{}{
+		"name":               e.nodeName,
 		"natType":            nm.NATType,
 		"portsDifference":    nm.PortsDifference,
 		"regularPortsChange": nm.RegularPortsChange,
 		"behavior":           nm.Behavior,
 		"assistedSockets":    nm.AssistedSockets,
 		"p2pEndpoint":        nm.P2PEndpoint,
-		"lanIp":              netInfo.LANIP,
-		"gatewayIp":          netInfo.GatewayIP,
-		"udpPort":            e.udpPort,
 	}
 	if nm.PublicEndpoint != "" {
 		metaPayload["publicEndpoint"] = nm.PublicEndpoint
 	}
 
-	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%s p2pEndpoint=%s lan=%s gw=%s udp=%d",
-		nm.NATType, nm.PublicEndpoint, nm.P2PEndpoint, netInfo.LANIP, netInfo.GatewayIP, e.udpPort)
+	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%s p2pEndpoint=%s assisted=%d",
+		nm.NATType, nm.PublicEndpoint, nm.P2PEndpoint, len(nm.AssistedSockets))
 
 	if ws == nil {
 		return
@@ -689,9 +667,9 @@ func (e *Edge) udpReadLoop() {
 
 // tunReadLoop 直接从 TUN 读包，转发到对应 peer。
 //
-// 因为 VpnService.Builder 只接管 10.64.0.0/24（对标 PC 端），
-// 所有进入 TUN 的包都是发往组网内 peer 的，理论上 target 一定有。
-// 保留兜底是为了处理虚拟网段配置不一致的边缘情况。
+// VpnService.Builder 只接管 10.64.0.0/24，所以进入 TUN 的包一定是发往
+// 组网内 peer 的。找不到 target 说明虚拟网段配置不一致——直接丢弃，
+// 不走 WS 广播（PC 端也是同样行为）。
 func (e *Edge) tunReadLoop() {
 	buf := make([]byte, 65535)
 	for {
@@ -753,7 +731,7 @@ func (e *Edge) enqueueTUN(data []byte) {
 // onRemotePacket 处理从 WS/TURN/UDP 收到的组网包。
 //
 // 简单写回 TUN 即可——TUN 只接管 10.64.0.0/24，系统会把包交给我们，
-// 我们写回后由内核 TCP/IP 栈处理。不需要 gVisor。
+// 我们写回后由内核 TCP/IP 栈处理。
 func (e *Edge) onRemotePacket(data []byte) {
 	if len(data) < 20 || data[0]>>4 != 4 {
 		return
