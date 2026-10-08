@@ -30,13 +30,15 @@ type WSTransport struct {
 }
 
 // NewWSTransport 建立信令 WebSocket。
-// uuid 用于 URL 认证（服务端按 ?token= 读取），同时可用于日志标识。
-func NewWSTransport(signalingURL, roomId, clientId, uuid, preferredIP string, preferredPort int) (*WSTransport, error) {
+//
+// connectToken 用于 URL 认证（服务端按 ?token= 读取），为空时不加参数。
+// preferredIP / preferredPort 用于 Cloudflare 优选 IP（可选，留空走 DNS）。
+func NewWSTransport(signalingURL, roomId, clientId, connectToken, preferredIP string, preferredPort int) (*WSTransport, error) {
 	base := strings.TrimRight(signalingURL, "/")
 	fullURL := base + "/ws/" + url.PathEscape(roomId) + "?cid=" + url.QueryEscape(clientId)
-	if uuid != "" {
-		// 服务端按 query 参数 "token" 读取（保持向后兼容）
-		fullURL += "&token=" + url.QueryEscape(uuid)
+	if connectToken != "" {
+		// 服务端按 query 参数 "token" 读取
+		fullURL += "&token=" + url.QueryEscape(connectToken)
 	}
 
 	u, err := url.Parse(fullURL)
