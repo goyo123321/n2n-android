@@ -37,6 +37,9 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 OUTPUT_DIR="$PROJECT_ROOT/app/libs"
 OUTPUT_AAR="$OUTPUT_DIR/n2nclient.aar"
 
+# Java 包名（Kotlin 侧 import com.n2n.mobile.*）
+JAVA_PKG="com.n2n"
+
 # ============================================================
 # 1. 检查 Go + 版本校验
 # ============================================================
@@ -145,12 +148,17 @@ if [ -f "$OUTPUT_AAR" ]; then
     log "已删除旧的 AAR"
 fi
 
-log "开始构建 AAR（首次约 3-5 分钟，因为要编译 gVisor）..."
+log "开始构建 AAR（首次约 3-5 分钟）..."
+log "  Java 包名: ${JAVA_PKG}.mobile"
 START_TIME=$(date +%s)
 
+# ★ -javapkg com.n2n：生成的 Java/Kotlin 类包名为 com.n2n.mobile
+#   不加这个参数时 gomobile 会用默认包名（go.<module> 或 mobile），
+#   Kotlin 里的 `import com.n2n.mobile.Client` 会找不到类。
 gomobile bind \
     -target=android \
     -androidapi 26 \
+    -javapkg "$JAVA_PKG" \
     -o "$OUTPUT_AAR" \
     .
 
@@ -166,6 +174,21 @@ if [ ! -f "$OUTPUT_AAR" ]; then
 fi
 
 AAR_SIZE=$(du -h "$OUTPUT_AAR" | cut -f1)
+
+# 验证包名（可选，失败不阻断）
+if command -v unzip >/dev/null 2>&1; then
+    TMP_JAR="$(mktemp -t classes-XXXXXX.jar)"
+    if unzip -p "$OUTPUT_AAR" classes.jar > "$TMP_JAR" 2>/dev/null; then
+        if unzip -l "$TMP_JAR" 2>/dev/null | grep -q "com/n2n/mobile/Client.class"; then
+            ok "AAR 包名验证通过: com.n2n.mobile.Client"
+        else
+            warn "AAR 里未找到 com/n2n/mobile/Client.class"
+            echo "  实际内容前 10 行："
+            unzip -l "$TMP_JAR" 2>/dev/null | head -20 || true
+        fi
+    fi
+    rm -f "$TMP_JAR"
+fi
 
 echo ""
 ok "构建完成！"
