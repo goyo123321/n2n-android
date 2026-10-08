@@ -2,8 +2,6 @@ package com.n2n.android
 
 import android.Manifest
 import android.app.Activity
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.net.VpnService
@@ -47,7 +45,7 @@ class MainActivity : AppCompatActivity() {
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) startVpnService()
-        else toast("用户拒绝 VPN 权限")
+        else toast(getString(R.string.dialog_vpn_denied))
     }
 
     private val notifPermissionLauncher = registerForActivityResult(
@@ -55,9 +53,6 @@ class MainActivity : AppCompatActivity() {
     ) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        // 老用户迁移：connect_token → uuid
-        Prefs.migrateLegacy(this)
-
         applyThemeMode(Prefs.loadThemeMode(this))
         super.onCreate(savedInstanceState)
 
@@ -90,10 +85,9 @@ class MainActivity : AppCompatActivity() {
         binding.btnStop.setOnClickListener { stopVpnService() }
         binding.btnSave.setOnClickListener {
             saveCurrentInput()
-            toast("已保存")
+            toast(getString(R.string.dialog_saved))
         }
 
-        // 首次刷新（ticker 在 onStart 启动）
         refreshStatus()
     }
 
@@ -104,7 +98,6 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
-        // ★ 回前台重启 ticker
         binding.root.removeCallbacks(peersTicker)
         binding.root.removeCallbacks(statusTicker)
         binding.root.postDelayed(statusTicker, 1000)
@@ -124,7 +117,6 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStop() {
         super.onStop()
-        // ★ 切后台立即停 ticker，避免访问已失效的 binding
         binding.root.removeCallbacks(peersTicker)
         binding.root.removeCallbacks(statusTicker)
     }
@@ -136,15 +128,12 @@ class MainActivity : AppCompatActivity() {
         outState.putString("roomId", binding.etRoomId.text.toString())
         outState.putString("clientId", binding.etClientId.text.toString())
         outState.putString("nodeName", binding.etNodeName.text.toString())
-        outState.putString("uuid", binding.etUuid.text.toString())
+        outState.putString("connectToken", binding.etConnectToken.text.toString())
     }
 
-    private fun formatHost(host: String): String {
-        if (host.contains(":") && !host.startsWith("[")) {
-            return "[$host]"
-        }
-        return host
-    }
+    // ============================================================
+    // 主题
+    // ============================================================
 
     private fun applyThemeMode(mode: Int) {
         val nightMode = when (mode) {
@@ -157,9 +146,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun showThemePicker() {
         val current = Prefs.loadThemeMode(this)
-        val options = arrayOf("跟随系统", "浅色", "深色")
+        val options = arrayOf(
+            getString(R.string.theme_follow_system),
+            getString(R.string.theme_light),
+            getString(R.string.theme_dark)
+        )
         AlertDialog.Builder(this)
-            .setTitle("主题")
+            .setTitle(getString(R.string.theme_title))
             .setSingleChoiceItems(options, current) { dialog, which ->
                 Prefs.saveThemeMode(this, which)
                 applyThemeMode(which)
@@ -167,6 +160,10 @@ class MainActivity : AppCompatActivity() {
             }
             .show()
     }
+
+    // ============================================================
+    // 权限
+    // ============================================================
 
     private fun requestNotifPermissionIfNeeded() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -201,22 +198,9 @@ class MainActivity : AppCompatActivity() {
         if (currentUrl.isNotEmpty()) return
 
         AlertDialog.Builder(this)
-            .setTitle("首次使用：请填写服务器地址")
-            .setMessage(
-                """
-                你需要填写 edge-signal Worker 的 WSS 地址。
-
-                如果你已经部署了 edge-signal：
-                  • 打开 Cloudflare Dashboard
-                  • Workers & Pages → edge-signal
-                  • 复制访问地址（形如 wss://xxx.workers.dev）
-
-                如果你还没有部署：
-                  • 参考 edge-signal 项目文档
-                  • 或使用朋友分享给你的地址
-                """.trimIndent()
-            )
-            .setPositiveButton("我现在就填") { _, _ ->
+            .setTitle(getString(R.string.first_use_title))
+            .setMessage(getString(R.string.first_use_message))
+            .setPositiveButton(getString(R.string.first_use_fill)) { _, _ ->
                 binding.etSignalingUrl.requestFocus()
                 binding.etSignalingUrl.setSelection(
                     binding.etSignalingUrl.text?.length ?: 0
@@ -227,10 +211,14 @@ class MainActivity : AppCompatActivity() {
                     InputMethodManager.SHOW_IMPLICIT
                 )
             }
-            .setNegativeButton("稍后再说", null)
+            .setNegativeButton(getString(R.string.first_use_later), null)
             .setCancelable(false)
             .show()
     }
+
+    // ============================================================
+    // 配置加载 / 保存
+    // ============================================================
 
     private fun loadConfig(savedInstanceState: Bundle?) {
         if (savedInstanceState != null) {
@@ -239,7 +227,7 @@ class MainActivity : AppCompatActivity() {
             binding.etRoomId.setText(savedInstanceState.getString("roomId", ""))
             binding.etClientId.setText(savedInstanceState.getString("clientId", ""))
             binding.etNodeName.setText(savedInstanceState.getString("nodeName", ""))
-            binding.etUuid.setText(savedInstanceState.getString("uuid", ""))
+            binding.etConnectToken.setText(savedInstanceState.getString("connectToken", ""))
             return
         }
         val cfg = Prefs.load(this)
@@ -248,13 +236,13 @@ class MainActivity : AppCompatActivity() {
         binding.etRoomId.setText(cfg.roomId)
         binding.etClientId.setText(cfg.clientId)
         binding.etNodeName.setText(cfg.nodeName)
-        binding.etUuid.setText(cfg.uuid)
+        binding.etConnectToken.setText(cfg.connectToken)
     }
 
     private fun handleIntentParams(intent: Intent?) {
         intent ?: return
 
-        // 深链：n2n://connect?url=...&uuid=...&room=...&auto=1
+        // 深链：n2n://connect?url=...&token=...&room=...&auto=1
         if (intent.action == Intent.ACTION_VIEW && intent.data != null) {
             val data = intent.data!!
             if (data.scheme == "n2n" && data.host == "connect") {
@@ -263,11 +251,7 @@ class MainActivity : AppCompatActivity() {
                 data.getQueryParameter("room")?.let { binding.etRoomId.setText(it) }
                 data.getQueryParameter("cid")?.let { binding.etClientId.setText(it) }
                 data.getQueryParameter("name")?.let { binding.etNodeName.setText(it) }
-
-                // ★ 优先读 uuid，兼容旧 token
-                val uuid = data.getQueryParameter("uuid")
-                    ?: data.getQueryParameter("token")
-                uuid?.let { binding.etUuid.setText(it) }
+                data.getQueryParameter("token")?.let { binding.etConnectToken.setText(it) }
 
                 saveCurrentInput()
                 if (data.getQueryParameter("auto") == "1") {
@@ -283,7 +267,7 @@ class MainActivity : AppCompatActivity() {
         val room = intent.getStringExtra(N2nVpnService.EXTRA_ROOM_ID)
         val cid = intent.getStringExtra(N2nVpnService.EXTRA_CLIENT_ID)
         val name = intent.getStringExtra(N2nVpnService.EXTRA_NODE_NAME)
-        val uuid = intent.getStringExtra(N2nVpnService.EXTRA_UUID)
+        val token = intent.getStringExtra(N2nVpnService.EXTRA_CONNECT_TOKEN)
 
         var changed = false
         if (!url.isNullOrEmpty()) { binding.etSignalingUrl.setText(url); changed = true }
@@ -291,7 +275,7 @@ class MainActivity : AppCompatActivity() {
         if (!room.isNullOrEmpty()) { binding.etRoomId.setText(room); changed = true }
         if (!cid.isNullOrEmpty()) { binding.etClientId.setText(cid); changed = true }
         if (!name.isNullOrEmpty()) { binding.etNodeName.setText(name); changed = true }
-        if (!uuid.isNullOrEmpty()) { binding.etUuid.setText(uuid); changed = true }
+        if (!token.isNullOrEmpty()) { binding.etConnectToken.setText(token); changed = true }
 
         if (changed) {
             saveCurrentInput()
@@ -311,10 +295,14 @@ class MainActivity : AppCompatActivity() {
             roomId = binding.etRoomId.text.toString().trim(),
             clientId = binding.etClientId.text.toString().trim(),
             nodeName = binding.etNodeName.text.toString().trim(),
-            uuid = binding.etUuid.text.toString().trim(),
+            connectToken = binding.etConnectToken.text.toString().trim(),
         ))
         Prefs.savePreferredIp(this, binding.etPreferredIp.text.toString().trim())
     }
+
+    // ============================================================
+    // 启动 / 停止
+    // ============================================================
 
     private fun saveThenRequest() {
         saveCurrentInput()
@@ -325,30 +313,30 @@ class MainActivity : AppCompatActivity() {
         val url = binding.etSignalingUrl.text.toString().trim()
 
         if (url.isEmpty()) {
-            toast("请先填写 WSS 地址")
+            toast(getString(R.string.wss_required))
             checkSignalingUrl()
             return
         }
         if (!url.startsWith("wss://") && !url.startsWith("ws://")) {
-            toast("WSS 地址必须以 wss:// 或 ws:// 开头")
+            toast(getString(R.string.wss_invalid))
             return
         }
 
         val room = binding.etRoomId.text.toString().trim()
         if (room.isEmpty()) {
-            toast("房间名不能为空")
+            toast(getString(R.string.room_required))
             return
         }
         if (!room.matches(Regex("^[A-Za-z0-9_-]+$"))) {
-            toast("房间名只允许字母/数字/下划线/短横线")
+            toast(getString(R.string.room_invalid))
             return
         }
 
-        // ★ UUID 校验（允许留空用默认值）
-        val uuid = binding.etUuid.text.toString().trim()
-        if (uuid.isNotEmpty() && !isValidUuid(uuid)) {
-            toast(getString(R.string.uuid_invalid))
-            binding.etUuid.requestFocus()
+        // CONNECT_TOKEN 校验（空 = 未启用，跳过）
+        val token = binding.etConnectToken.text.toString().trim()
+        if (token.isNotEmpty() && !isValidConnectToken(token)) {
+            toast(getString(R.string.token_invalid))
+            binding.etConnectToken.requestFocus()
             return
         }
 
@@ -360,16 +348,16 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ★ 校验 UUID：允许 8-4-4-4-12 带横线格式，也允许 32 位连续 hex
-    private fun isValidUuid(s: String): Boolean {
-        val hex = s.replace("-", "")
-        if (hex.length != 32) return false
-        return hex.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }
+    // CONNECT_TOKEN 是任意可打印 ASCII 字符串，只做基本校验
+    private fun isValidConnectToken(s: String): Boolean {
+        if (s.isEmpty()) return true
+        if (s.length > 256) return false
+        return s.all { it.code in 33..126 }
     }
 
     private fun startVpnService() {
         val preferredIp = binding.etPreferredIp.text.toString().trim()
-        val uuid = binding.etUuid.text.toString().trim().ifEmpty { Prefs.DEFAULT_UUID }
+        val token = binding.etConnectToken.text.toString().trim()
 
         val intent = Intent(this, N2nVpnService::class.java).apply {
             action = N2nVpnService.ACTION_START
@@ -378,10 +366,10 @@ class MainActivity : AppCompatActivity() {
             putExtra(N2nVpnService.EXTRA_ROOM_ID, binding.etRoomId.text.toString().trim())
             putExtra(N2nVpnService.EXTRA_CLIENT_ID, binding.etClientId.text.toString().trim())
             putExtra(N2nVpnService.EXTRA_NODE_NAME, binding.etNodeName.text.toString().trim())
-            putExtra(N2nVpnService.EXTRA_UUID, uuid)
+            putExtra(N2nVpnService.EXTRA_CONNECT_TOKEN, token)
         }
         startForegroundService(intent)
-        toast("正在启动...")
+        toast(getString(R.string.dialog_starting))
         binding.root.postDelayed({ refreshStatus() }, 500)
     }
 
@@ -390,9 +378,13 @@ class MainActivity : AppCompatActivity() {
             action = N2nVpnService.ACTION_STOP
         }
         startService(intent)
-        toast("已停止")
+        toast(getString(R.string.dialog_stopped))
         binding.root.postDelayed({ refreshStatus() }, 500)
     }
+
+    // ============================================================
+    // UI 刷新
+    // ============================================================
 
     private fun refreshStatus() {
         if (isFinishing || isDestroyed) return
@@ -409,6 +401,13 @@ class MainActivity : AppCompatActivity() {
 
             binding.btnStart.visibility = View.GONE
             binding.btnStop.visibility = View.VISIBLE
+
+            // 节点卡片：运行中显示
+            binding.cardPeers.visibility = View.VISIBLE
+
+            // 保存按钮：运行中禁用（改了也不会应用，需要停止后再启动）
+            binding.btnSave.isEnabled = false
+            binding.btnSave.alpha = 0.5f
         } else {
             binding.tvStatus.text = getString(R.string.status_stopped)
             binding.tvStatus.setTextColor(getColor(R.color.brand_text_dim))
@@ -419,6 +418,13 @@ class MainActivity : AppCompatActivity() {
 
             binding.btnStart.visibility = View.VISIBLE
             binding.btnStop.visibility = View.GONE
+
+            // 节点卡片：未运行隐藏
+            binding.cardPeers.visibility = View.GONE
+
+            // 保存按钮：未运行可用
+            binding.btnSave.isEnabled = true
+            binding.btnSave.alpha = 1.0f
         }
     }
 
@@ -427,7 +433,7 @@ class MainActivity : AppCompatActivity() {
 
         if (!N2nController.isRunning()) {
             lastPeersJson = ""
-            binding.tvPeerCount.text = "0"
+            binding.tvPeerCount.text = ""
             binding.tvPeersEmpty.visibility = View.VISIBLE
             binding.peersContainer.removeAllViews()
             return
@@ -439,7 +445,7 @@ class MainActivity : AppCompatActivity() {
 
         val peers = try { JSONArray(json) } catch (e: Exception) { JSONArray() }
 
-        binding.tvPeerCount.text = peers.length().toString()
+        binding.tvPeerCount.text = getString(R.string.peer_count_format, peers.length())
 
         if (peers.length() == 0) {
             binding.tvPeersEmpty.visibility = View.VISIBLE
@@ -459,12 +465,15 @@ class MainActivity : AppCompatActivity() {
                 val tvCode = row.findViewById<android.widget.TextView>(R.id.tvPeerCode)
                 val tvVip = row.findViewById<android.widget.TextView>(R.id.tvPeerVip)
                 val tvMeta = row.findViewById<android.widget.TextView>(R.id.tvPeerMeta)
+                val tvBadge = row.findViewById<android.widget.TextView>(R.id.tvPeerBadge)
 
                 tvCode.text = p.optString("code", "?")
                 tvVip.text = p.optString("vip", "--")
                 val connType = p.optString("connType", "unknown")
                 val natType = p.optString("natType", "unknown")
-                tvMeta.text = "$connType · $natType"
+                tvMeta.text = natType
+
+                applyBadge(tvBadge, connType)
             }
             return
         }
@@ -473,14 +482,43 @@ class MainActivity : AppCompatActivity() {
         for (i in 0 until peers.length()) {
             val p = peers.getJSONObject(i)
             val item = ItemPeerBinding.inflate(inflater, binding.peersContainer, false)
+
             item.tvPeerCode.text = p.optString("code", "?")
             item.tvPeerVip.text = p.optString("vip", "--")
 
             val connType = p.optString("connType", "unknown")
             val natType = p.optString("natType", "unknown")
-            item.tvPeerMeta.text = "$connType · $natType"
+            item.tvPeerMeta.text = natType
+
+            applyBadge(item.tvPeerBadge, connType)
 
             binding.peersContainer.addView(item.root)
+        }
+    }
+
+    // 根据连接方式给徽章上色
+    private fun applyBadge(badge: android.widget.TextView, connType: String) {
+        when (connType.lowercase()) {
+            "p2p" -> {
+                badge.text = "P2P"
+                badge.setBackgroundColor(getColor(R.color.badge_p2p_bg))
+                badge.setTextColor(getColor(R.color.badge_p2p_fg))
+            }
+            "turn" -> {
+                badge.text = "TURN"
+                badge.setBackgroundColor(getColor(R.color.badge_turn_bg))
+                badge.setTextColor(getColor(R.color.badge_turn_fg))
+            }
+            "relay" -> {
+                badge.text = "WS"
+                badge.setBackgroundColor(getColor(R.color.badge_ws_bg))
+                badge.setTextColor(getColor(R.color.badge_ws_fg))
+            }
+            else -> {
+                badge.text = "?"
+                badge.setBackgroundColor(getColor(R.color.brand_surface_2))
+                badge.setTextColor(getColor(R.color.brand_text_dim))
+            }
         }
     }
 
