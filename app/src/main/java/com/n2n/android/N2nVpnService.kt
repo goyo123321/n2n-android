@@ -39,7 +39,7 @@ class N2nVpnService : VpnService() {
         const val EXTRA_ROOM_ID = "room_id"
         const val EXTRA_CLIENT_ID = "client_id"
         const val EXTRA_NODE_NAME = "node_name"
-        const val EXTRA_UUID = "uuid"
+        const val EXTRA_CONNECT_TOKEN = "connect_token"
         const val EXTRA_PREFERRED_IP = "preferred_ip"
     }
 
@@ -147,9 +147,9 @@ class N2nVpnService : VpnService() {
         val roomId = intent.getStringExtra(EXTRA_ROOM_ID) ?: "default-room"
         val clientId = intent.getStringExtra(EXTRA_CLIENT_ID) ?: ""
         val nodeName = intent.getStringExtra(EXTRA_NODE_NAME) ?: "Android"
-        val uuid = intent.getStringExtra(EXTRA_UUID) ?: Prefs.DEFAULT_UUID
+        val connectToken = intent.getStringExtra(EXTRA_CONNECT_TOKEN) ?: ""
 
-        ktLog("参数读取完成 room=$roomId uuid=${uuid.take(8)}...")
+        ktLog("参数读取完成 room=$roomId token=${if (connectToken.isEmpty()) "<empty>" else "***"}")
 
         try {
             startForeground(NOTIF_ID, buildNotification("正在获取虚拟 IP..."))
@@ -168,7 +168,7 @@ class N2nVpnService : VpnService() {
             setRoomID(roomId)
             setClientID(clientId)
             setNodeName(nodeName)
-            setUUID(uuid)
+            setConnectToken(connectToken)
             setPreferredIP(preferredIp)
             setPreferredPort(443)
         }
@@ -351,15 +351,6 @@ class N2nVpnService : VpnService() {
         wifiLock = null
     }
 
-    /**
-     * 建立 TUN，只接管虚拟网段（对标 PC 端）。
-     *
-     * - addAddress：本机虚拟 IP /24
-     * - addRoute：只加 10.64.0.0/24，**不接管全部流量**
-     * - **不设置 DNS**：所有 DNS 查询走系统默认
-     *
-     * 结果：物理流量完全不受影响，只有发往 10.64.0.x 的包进 TUN。
-     */
     private fun buildTunInterface(vip: String): ParcelFileDescriptor? {
         return try {
             ktLog("建立 TUN（仅组网段），绑定 IP: $vip")
