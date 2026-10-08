@@ -51,12 +51,19 @@ const (
 	PunchStateSucceeded  = 3
 )
 
-var probePrefix = []byte{0x4E, 0x32, 0x4E, 0x50} // "N2NP"
+// probePrefix 是打洞探测包的前 4 字节标记 "N2NP"。
+// 收到该前缀的 UDP 包只更新"最近对端活动时间"，不触发 P2P 升级。
+var probePrefix = []byte{0x4E, 0x32, 0x4E, 0x50}
 
 // 同一时刻只允许一个 executeNatHole 在跑。
-// TTL 是 socket 级别的选项（ipv4.PacketConn.SetTTL），并发执行时
-// 各自的 SetTTL 会互相覆盖，导致部分轮次用错 TTL。打洞不是热路径，
-// 串行化代价可以忽略。
+//
+// 原因：TTL 是 socket 级别的选项（ipv4.PacketConn.SetTTL），多个打洞
+// 并发执行时各自的 SetTTL 会互相覆盖，导致部分轮次用错 TTL。串行化
+// 会把这种竞争消掉。打洞不是热路径，串行化代价可以忽略。
+//
+// activeTargets 用于跳过重复指令：服务端在早期版本里会重复下发同一
+// target 的指令，如果每次都起一个 goroutine，多个 executeNatHole 会
+// 同时向同一目标发包。检测到同一 target 已在执行时直接跳过新指令。
 var (
 	natHoleActiveMu sync.Mutex
 	natHoleActive   map[string]bool
@@ -86,12 +93,15 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		natHoleActiveMu.Unlock()
 	}()
 
-	// 立即上报 InProgress。
+	// ★ 立即上报 InProgress。
 	//
 	// 服务端的 in-flight 窗口默认 10s。ladder 的 rung 7/9 带
 	// sendDelayMs=10000，客户端会 sleep 10s 后才发第一个探测包——
 	// 恰好卡在窗口边界上。不主动上报的话，服务端会在客户端开始
-	// 打洞前就误判为"没有回应"并重新派发指令。
+	// 打洞前就误判为"没有回应"并重新派发指令，导致：
+	//   1. 服务端记录一次假失败
+	//   2. failCounts 增加，下次 backoff 更久
+	//   3. analyzer 错误惩罚该 rung
 	e.reportInProgress(instr)
 
 	startAt := time.Now().UnixMilli()
@@ -109,11 +119,16 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		return res
 	}
 
-	// TTL 是 socket 的 IP TTL，不是轮次数。
-	// 设置 TTL 让探测包在特定跳数后消亡：
+	// ★ TTL 是 socket 的 IP TTL，不是轮次数。
+	//
+	// ladder 里的 ttl 是 socket 的 IP TTL，设置 TTL 让探测包在特定跳数
+	// 后消亡：
 	//   TTL=7  → 走 7 跳即死，用于让 NAT 在近处分配映射（短路径）
 	//   TTL=4  → 更短
 	//   ttl=0  → 不改 TTL，全路径发送（长路径唯一能用的档位）
+	//
+	// 早期版本把 ttl 当循环次数，所有梯级的探测包行为几乎一样，
+	// 整个 ladder 失去意义。
 	var prevTTL int = -1
 	if instr.TTL > 0 && e.udpConn != nil {
 		p := ipv4.NewPacketConn(e.udpConn)
@@ -130,10 +145,14 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		}()
 	}
 
-	log.Printf("[NAT-HOLE] 开始打洞 role=%d target=%s:%d rung=%d mode=%d ttl=%d assisted=%d",
-		instr.Role, targetAddr.IP, targetAddr.Port, instr.BehaviorIndex, instr.Mode,
-		instr.TTL, len(instr.TargetAssistedEndpoints))
+	log.Printf(
+		"[NAT-HOLE] 开始打洞 role=%d target=%s:%d rung=%d mode=%d ttl=%d assisted=%d",
+		instr.Role, targetAddr.IP, targetAddr.Port,
+		instr.BehaviorIndex, instr.Mode, instr.TTL,
+		len(instr.TargetAssistedEndpoints),
+	)
 
+	// === 构建目标地址列表 ===
 	var targets []*net.UDPAddr
 	var candidateIPs []net.IP
 
@@ -167,6 +186,8 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 	probe := buildPunchProbe(e.virtualIP)
 	var attempts uint32
 
+	// 固定 5 轮，每轮 200ms。TTL 已经由 ipv4.PacketConn 处理。
+	// 不再把 ttl 当轮次数。
 	const rounds = 5
 	const roundInterval = 200 * time.Millisecond
 
@@ -195,8 +216,10 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 			}
 			e.peersMu.Unlock()
 
-			log.Printf("[NAT-HOLE] ✅ 成功 role=%d target=%s attempts=%d",
-				instr.Role, targetAddr.IP, attempts)
+			log.Printf(
+				"[NAT-HOLE] ✅ 成功 role=%d target=%s attempts=%d",
+				instr.Role, targetAddr.IP, attempts,
+			)
 			return res
 		}
 		time.Sleep(roundInterval)
@@ -205,12 +228,14 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 	res.State = PunchStateFailed
 	res.Attempts = attempts
 	res.Detail = "无响应"
-	log.Printf("[NAT-HOLE] ❌ 失败 role=%d target=%s attempts=%d",
-		instr.Role, targetAddr.IP, attempts)
+	log.Printf(
+		"[NAT-HOLE] ❌ 失败 role=%d target=%s attempts=%d",
+		instr.Role, targetAddr.IP, attempts,
+	)
 	return res
 }
 
-// 向服务端上报 InProgress。
+// ★ 向服务端上报 InProgress。
 //
 // 放在 executeNatHole 开头而不是中途，是因为服务端的 in-flight 窗口
 // 是从"派发时刻"开始计时的，而客户端从"收到指令"到"发出第一个探测包"
@@ -279,7 +304,8 @@ func buildPunchProbe(virtualIP string) []byte {
 	return buf
 }
 
-// 判断候选 IP 中是否有过"真实数据帧"到达。
+// ★ 判断候选 IP 中是否有过"真实数据帧"到达。
+//
 // 探测包不算——它是打洞本身产生的，只证明对方在打洞，
 // 不证明数据平面通了。真实数据帧才是 P2P 成功的证据。
 func (e *Edge) hasRealTrafficFromAny(ips []net.IP, since int64) bool {
