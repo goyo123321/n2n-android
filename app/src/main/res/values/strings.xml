@@ -1,0 +1,27 @@
+<resources>
+    <string name="app_name">n2n 组网</string>
+    <string name="title_app">n2n 组网</string>
+
+    <string name="status_stopped">○ 未运行</string>
+    <string name="status_running">● 运行中</string>
+    <string name="status_starting">◐ 启动中...</string>
+
+    <string name="card_server">🌐 服务器</string>
+    <string name="card_network">👥 组网</string>
+    <string name="card_peers">🌐 已连接节点</string>
+
+    <string name="hint_wss">WSS 地址</string>
+    <string name="hint_uuid">组网密钥 UUID</string>
+    <string name="hint_room">房间名</string>
+    <string name="hint_node_name">显示名</string>
+    <string name="hint_client_id">Client ID（可选，留空自动生成）</string>
+
+    <string name="btn_save">保存</string>
+    <string name="btn_start">启动 VPN</string>
+    <string name="btn_stop">停止 VPN</string>
+
+    <string name="log_title">运行日志</string>
+    <string name="empty_peers">暂无其他节点</string>
+
+    <string name="uuid_invalid">UUID 格式错误（需 32 位十六进制）</string>
+</resources>
