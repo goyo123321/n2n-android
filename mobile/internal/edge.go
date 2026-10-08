@@ -18,6 +18,8 @@ type PeerInfo struct {
 	VirtualIP     string
 	PubIP         string
 	PubPort       int
+	LanIP         string // ★ 新增：对端的局域网 IP
+	LanPort       int    // ★ 新增：对端的本地 UDP 端口
 	TurnRelayAddr string
 	UDPAddr       *net.UDPAddr
 	lastRecvAt    int64
@@ -40,6 +42,10 @@ type Edge struct {
 	nodeName  string
 	virtualIP string
 	roomId    string
+
+	// ★ 本机局域网信息（LAN 直连用）
+	myLanIP     string
+	myGatewayIP string
 
 	ws         *WSTransport
 	relayMgr   *RelayManager
@@ -132,19 +138,25 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		nodeName = "Android"
 	}
 
+	// ★ 先探测本机局域网信息（LAN 直连需要）
+	netInfo := getNetInfo()
+
 	e := &Edge{
-		cfg:        cfg,
-		clientId:   clientId,
-		nodeName:   nodeName,
-		roomId:     cfg.RoomID,
-		peers:      make(map[string]*PeerInfo),
-		tunWriteCh: make(chan []byte, 4096),
-		doneCh:     make(chan struct{}),
+		cfg:         cfg,
+		clientId:    clientId,
+		nodeName:    nodeName,
+		roomId:      cfg.RoomID,
+		myLanIP:     netInfo.LANIP,
+		myGatewayIP: netInfo.GatewayIP,
+		peers:       make(map[string]*PeerInfo),
+		tunWriteCh:  make(chan []byte, 4096),
+		doneCh:      make(chan struct{}),
 		natMeta: &NATMetadata{
 			NATType:  "unknown",
 			Behavior: "BehaviorPortChanged",
 		},
 	}
+	log.Printf("[LAN] 本机局域网: %s, 网关: %s", e.myLanIP, e.myGatewayIP)
 
 	// 1. TUN
 	tun, err := setupTUNFromFD(tunFd)
@@ -424,11 +436,13 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 				pip, _ := pm["virtualIp"].(string)
 				pubIP, _ := pm["publicIp"].(string)
 				pubPort := jsonInt(pm["publicPort"])
+				lanIP, _ := pm["lanIp"].(string)
+				lanPort := jsonInt(pm["lanPort"])
 				relayAddr, _ := pm["turnRelayAddr"].(string)
 				if pid == "" || pip == "" {
 					continue
 				}
-				e.registerPeer(pid, pip, pubIP, pubPort)
+				e.registerPeer(pid, pip, pubIP, pubPort, lanIP, lanPort)
 				if relayAddr != "" {
 					e.peersMu.Lock()
 					if pi, ok := e.peers[pid]; ok {
@@ -436,7 +450,8 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 					}
 					e.peersMu.Unlock()
 				}
-				log.Printf("[信令] 已有节点: %s vip=%s pub=%s:%d", pid, pip, pubIP, pubPort)
+				log.Printf("[信令] 已有节点: %s vip=%s pub=%s:%d lan=%s:%d",
+					pid, pip, pubIP, pubPort, lanIP, lanPort)
 			}
 		}
 
@@ -448,12 +463,15 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		pip, _ := payload["virtualIp"].(string)
 		pubIP, _ := payload["publicIp"].(string)
 		pubPort := jsonInt(payload["publicPort"])
+		lanIP, _ := payload["lanIp"].(string)
+		lanPort := jsonInt(payload["lanPort"])
 		relayAddr, _ := payload["turnRelayAddr"].(string)
 
-		log.Printf("[信令] joined: from=%s vip=%s pub=%s:%d", from, pip, pubIP, pubPort)
+		log.Printf("[信令] joined: from=%s vip=%s pub=%s:%d lan=%s:%d",
+			from, pip, pubIP, pubPort, lanIP, lanPort)
 
 		if from != "" && pip != "" {
-			e.registerPeer(from, pip, pubIP, pubPort)
+			e.registerPeer(from, pip, pubIP, pubPort, lanIP, lanPort)
 			if relayAddr != "" {
 				e.peersMu.Lock()
 				if pi, ok := e.peers[from]; ok {
@@ -500,9 +518,9 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 
 // reportMetadata 上报 p2p_metadata + share_announce。
 //
-// 服务端字段（edge-signal/src/room.ts）：name, natType, portsDifference,
-// regularPortsChange, behavior, assistedSockets, p2pEndpoint, publicEndpoint。
-// 不再上报 lanIp / gatewayIp / udpPort —— 服务端已删除 LAN 直连逻辑。
+// 现在会额外上报 lanIp / udpPort——服务端广播 joined 时把这些字段
+// 带给同房间的其他 peer，对方据此判断是否同局域网，若同网段可直接
+// 走局域网 IP，延迟 < 5ms，无需 STUN / TURN。
 func (e *Edge) reportMetadata() {
 	e.mu.Lock()
 	nm := e.natMeta
@@ -517,13 +535,16 @@ func (e *Edge) reportMetadata() {
 		"behavior":           nm.Behavior,
 		"assistedSockets":    nm.AssistedSockets,
 		"p2pEndpoint":        nm.P2PEndpoint,
+		// ★ LAN 直连字段
+		"lanIp":   e.myLanIP,
+		"udpPort": e.udpPort,
 	}
 	if nm.PublicEndpoint != "" {
 		metaPayload["publicEndpoint"] = nm.PublicEndpoint
 	}
 
-	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%s p2pEndpoint=%s assisted=%d",
-		nm.NATType, nm.PublicEndpoint, nm.P2PEndpoint, len(nm.AssistedSockets))
+	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%s lanIp=%s udpPort=%d",
+		nm.NATType, nm.PublicEndpoint, e.myLanIP, e.udpPort)
 
 	if ws == nil {
 		return
@@ -546,13 +567,26 @@ func jsonInt(v interface{}) int {
 	return 0
 }
 
-func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int) {
+// registerPeer 注册或更新对端。
+//
+// ★ LAN 直连检测：
+//   若对端上报的 lanIp 与本机 lanIp 在同一 /24 子网，直接用局域网地址
+//   作为 UDPAddr，并标记 P2P。同 WiFi 下延迟 < 5ms，无需 STUN/TURN。
+//   若 AP 隔离挡住，后续发送失败会自然降级到 TURN / WS。
+func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, lanIP string, lanPort int) {
 	var udpAddr *net.UDPAddr
 	if pubIP != "" && pubPort > 0 {
 		udpAddr = &net.UDPAddr{IP: net.ParseIP(pubIP), Port: pubPort}
 	}
+
+	// ★ 同网段检测
+	lanPreferred := false
+	if lanIP != "" && lanPort > 0 && e.myLanIP != "" && sameSubnet(e.myLanIP, lanIP) {
+		udpAddr = &net.UDPAddr{IP: net.ParseIP(lanIP), Port: lanPort}
+		lanPreferred = true
+	}
+
 	e.peersMu.Lock()
-	defer e.peersMu.Unlock()
 	if p, ok := e.peers[pid]; ok {
 		if vip != "" {
 			p.VirtualIP = vip
@@ -563,14 +597,28 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int) {
 		if pubPort > 0 {
 			p.PubPort = pubPort
 		}
+		if lanIP != "" {
+			p.LanIP = lanIP
+		}
+		if lanPort > 0 {
+			p.LanPort = lanPort
+		}
 		if udpAddr != nil {
 			p.UDPAddr = udpAddr
 		}
 	} else {
 		e.peers[pid] = &PeerInfo{
 			ClientID: pid, VirtualIP: vip, PubIP: pubIP,
-			PubPort: pubPort, UDPAddr: udpAddr,
+			PubPort: pubPort, LanIP: lanIP, LanPort: lanPort,
+			UDPAddr: udpAddr,
 		}
+	}
+	e.peersMu.Unlock()
+
+	if lanPreferred {
+		log.Printf("[LAN] %s 与我同网段 (%s ↔ %s)，直连 %s:%d",
+			pid, e.myLanIP, lanIP, lanIP, lanPort)
+		e.relayMgr.MarkP2P(pid)
 	}
 }
 
@@ -601,12 +649,10 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	res := e.executeNatHole(instr)
 
-	// executeNatHole 返回 nil 表示重复指令，跳过上报
 	if res == nil {
 		return
 	}
 
-	// 先更新状态，再读 p2pStatus
 	if res.State == PunchStateSucceeded {
 		e.relayMgr.MarkP2P(instr.TargetMac)
 	} else if res.State == PunchStateFailed {
@@ -665,11 +711,6 @@ func (e *Edge) udpReadLoop() {
 	}
 }
 
-// tunReadLoop 直接从 TUN 读包，转发到对应 peer。
-//
-// VpnService.Builder 只接管 10.64.0.0/24，所以进入 TUN 的包一定是发往
-// 组网内 peer 的。找不到 target 说明虚拟网段配置不一致——直接丢弃，
-// 不走 WS 广播（PC 端也是同样行为）。
 func (e *Edge) tunReadLoop() {
 	buf := make([]byte, 65535)
 	for {
@@ -728,10 +769,6 @@ func (e *Edge) enqueueTUN(data []byte) {
 	}
 }
 
-// onRemotePacket 处理从 WS/TURN/UDP 收到的组网包。
-//
-// 简单写回 TUN 即可——TUN 只接管 10.64.0.0/24，系统会把包交给我们，
-// 我们写回后由内核 TCP/IP 栈处理。
 func (e *Edge) onRemotePacket(data []byte) {
 	if len(data) < 20 || data[0]>>4 != 4 {
 		return
