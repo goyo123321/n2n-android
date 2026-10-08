@@ -30,6 +30,16 @@
     <string name="empty_peers">暂无其他节点</string>
     <string name="peer_count_format">%1$d 台设备</string>
 
+    <!-- 日志页 -->
+    <string name="log_empty">(暂无日志)</string>
+    <string name="log_autoscroll_on">🔄 自动滚动已开启</string>
+    <string name="log_autoscroll_off">⏸ 自动滚动已关闭</string>
+    <string name="log_copied">已复制到剪贴板</string>
+    <string name="log_empty_copy">暂无日志可复制</string>
+    <string name="log_cleared">已清空</string>
+    <string name="log_menu_copy">复制</string>
+    <string name="log_menu_clear">清空</string>
+
     <!-- 错误 -->
     <string name="token_invalid">连接密码不能包含空格或中文</string>
     <string name="wss_required">请先填写 WSS 地址</string>
@@ -42,6 +52,7 @@
     <string name="dialog_saved">已保存</string>
     <string name="dialog_starting">正在启动...</string>
     <string name="dialog_stopped">已停止</string>
+    <string name="dialog_external_updated">已从外部参数更新配置</string>
 
     <!-- 主题选择 -->
     <string name="theme_title">主题</string>
@@ -54,4 +65,8 @@
     <string name="first_use_message">你需要填写 edge-signal Worker 的 WSS 地址。\n\n如果你已经部署了 edge-signal：\n  • 打开 Cloudflare Dashboard\n  • Workers &amp; Pages → edge-signal\n  • 复制访问地址（形如 wss://xxx.workers.dev）\n\n如果你还没有部署：\n  • 参考 edge-signal 项目文档\n  • 或使用朋友分享给你的地址</string>
     <string name="first_use_fill">我现在就填</string>
     <string name="first_use_later">稍后再说</string>
+
+    <!-- 菜单 -->
+    <string name="menu_logs">日志</string>
+    <string name="menu_theme">主题</string>
 </resources>
