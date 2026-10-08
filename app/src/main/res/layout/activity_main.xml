@@ -132,15 +132,16 @@
                             android:textSize="13sp" />
                     </com.google.android.material.textfield.TextInputLayout>
 
+                    <!-- ★ UUID → CONNECT_TOKEN -->
                     <com.google.android.material.textfield.TextInputLayout
                         style="@style/Widget.N2n.TextInputLayout"
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:layout_marginTop="12dp"
-                        android:hint="@string/hint_uuid"
+                        android:hint="@string/hint_connect_token"
                         app:boxBackgroundColor="@color/brand_bg">
                         <com.google.android.material.textfield.TextInputEditText
-                            android:id="@+id/etUuid"
+                            android:id="@+id/etConnectToken"
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
                             android:fontFamily="monospace"
@@ -226,8 +227,6 @@
                     </com.google.android.material.textfield.TextInputLayout>
                 </LinearLayout>
             </com.google.android.material.card.MaterialCardView>
-
-            <!-- ★ 共享盘卡片整块删除了 -->
 
             <!-- 节点列表卡片 -->
             <com.google.android.material.card.MaterialCardView
