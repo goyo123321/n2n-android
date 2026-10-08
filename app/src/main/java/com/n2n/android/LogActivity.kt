@@ -43,17 +43,17 @@ class LogActivity : AppCompatActivity() {
                 R.id.action_clear_logs -> {
                     N2nController.clearLogs()
                     refresh()
-                    toast("已清空")
+                    toast(getString(R.string.log_cleared))
                     true
                 }
                 R.id.action_copy_logs -> {
                     val logs = N2nController.getLogs()
                     if (logs.isEmpty()) {
-                        toast("暂无日志可复制")
+                        toast(getString(R.string.log_empty_copy))
                     } else {
                         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                         cm.setPrimaryClip(ClipData.newPlainText("n2n logs", logs))
-                        toast("已复制到剪贴板")
+                        toast(getString(R.string.log_copied))
                     }
                     true
                 }
@@ -63,7 +63,9 @@ class LogActivity : AppCompatActivity() {
 
         // 自动滚动开关
         binding.switchAutoScroll.setOnCheckedChangeListener { _, checked ->
-            binding.tvAutoScroll.text = if (checked) "🔄 自动滚动已开启" else "⏸ 自动滚动已关闭"
+            binding.tvAutoScroll.text = getString(
+                if (checked) R.string.log_autoscroll_on else R.string.log_autoscroll_off
+            )
         }
 
         // 首次刷新（ticker 在 onStart 启动）
@@ -87,7 +89,7 @@ class LogActivity : AppCompatActivity() {
         if (isFinishing || isDestroyed) return
         try {
             val logs = N2nController.getLogs()
-            val text = if (logs.isEmpty()) "(暂无日志)" else logs
+            val text = if (logs.isEmpty()) getString(R.string.log_empty) else logs
             if (binding.tvLogs.text.toString() != text) {
                 binding.tvLogs.text = text
                 if (binding.switchAutoScroll.isChecked) {
