@@ -20,7 +20,7 @@ class LogActivity : AppCompatActivity() {
 
     private val ticker = object : Runnable {
         override fun run() {
-            if (isFinishing || isDestroyed) return
+            if (isFinishing || isDestroyed || !::binding.isInitialized) return
             refresh()
             binding.root.postDelayed(this, 1000)
         }
@@ -31,12 +31,10 @@ class LogActivity : AppCompatActivity() {
         binding = ActivityLogBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        // Toolbar 返回
         binding.toolbar.setNavigationOnClickListener {
             onBackPressedDispatcher.onBackPressed()
         }
 
-        // 菜单
         binding.toolbar.inflateMenu(R.menu.menu_logs)
         binding.toolbar.setOnMenuItemClickListener { item ->
             when (item.itemId) {
@@ -51,9 +49,13 @@ class LogActivity : AppCompatActivity() {
                     if (logs.isEmpty()) {
                         toast(getString(R.string.log_empty_copy))
                     } else {
-                        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                        cm.setPrimaryClip(ClipData.newPlainText("n2n logs", logs))
-                        toast(getString(R.string.log_copied))
+                        try {
+                            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            cm.setPrimaryClip(ClipData.newPlainText("n2n logs", logs))
+                            toast(getString(R.string.log_copied))
+                        } catch (t: Throwable) {
+                            Log.e(TAG, "copy failed", t)
+                        }
                     }
                     true
                 }
@@ -61,32 +63,38 @@ class LogActivity : AppCompatActivity() {
             }
         }
 
-        // 自动滚动开关
         binding.switchAutoScroll.setOnCheckedChangeListener { _, checked ->
+            if (!::binding.isInitialized) return@setOnCheckedChangeListener
             binding.tvAutoScroll.text = getString(
                 if (checked) R.string.log_autoscroll_on else R.string.log_autoscroll_off
             )
         }
 
-        // 首次刷新（ticker 在 onStart 启动）
         refresh()
     }
 
     override fun onStart() {
         super.onStart()
-        // ★ 回前台重启 ticker
+        if (!::binding.isInitialized) return
         binding.root.removeCallbacks(ticker)
         binding.root.postDelayed(ticker, 1000)
     }
 
     override fun onStop() {
         super.onStop()
-        // ★ 切后台立即停 ticker，避免访问已失效的 binding
+        if (!::binding.isInitialized) return
         binding.root.removeCallbacks(ticker)
     }
 
+    override fun onDestroy() {
+        if (::binding.isInitialized) {
+            binding.root.removeCallbacks(ticker)
+        }
+        super.onDestroy()
+    }
+
     private fun refresh() {
-        if (isFinishing || isDestroyed) return
+        if (isFinishing || isDestroyed || !::binding.isInitialized) return
         try {
             val logs = N2nController.getLogs()
             val text = if (logs.isEmpty()) getString(R.string.log_empty) else logs
@@ -94,7 +102,7 @@ class LogActivity : AppCompatActivity() {
                 binding.tvLogs.text = text
                 if (binding.switchAutoScroll.isChecked) {
                     binding.scrollView.post {
-                        if (!isFinishing && !isDestroyed) {
+                        if (!isFinishing && !isDestroyed && ::binding.isInitialized) {
                             binding.scrollView.fullScroll(View.FOCUS_DOWN)
                         }
                     }
@@ -106,6 +114,9 @@ class LogActivity : AppCompatActivity() {
     }
 
     private fun toast(msg: String) {
-        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+        if (isFinishing || isDestroyed) return
+        try {
+            Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+        } catch (_: Throwable) {}
     }
 }
