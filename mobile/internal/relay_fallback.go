@@ -37,7 +37,7 @@ func (rm *RelayManager) MarkP2P(peerId string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 	if rm.states[peerId] != ConnP2P {
-		log.Printf("[连接] %s → P2P", peerId)
+		log.Printf("[连接] %s → P2P 直连", peerId)
 		rm.states[peerId] = ConnP2P
 	}
 }
@@ -50,11 +50,11 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 	}
 	if rm.turnClient != nil && rm.turnClient.IsReady() {
 		rm.states[peerId] = ConnTURN
-		log.Printf("[连接] %s → TURN", peerId)
+		log.Printf("[连接] %s → TURN 中继", peerId)
 		return
 	}
 	rm.states[peerId] = ConnRelay
-	log.Printf("[连接] %s → WS 中继", peerId)
+	log.Printf("[连接] %s → WS 中继（TURN 未就绪）", peerId)
 }
 
 func (rm *RelayManager) UpgradeRelaysToTURN() {
@@ -71,7 +71,7 @@ func (rm *RelayManager) UpgradeRelaysToTURN() {
 		}
 	}
 	if upgraded > 0 {
-		log.Printf("[连接] 升级 %d 个 WS 中继到 TURN", upgraded)
+		log.Printf("[连接] TURN 就绪，升级 %d 个 WS 中继到 TURN", upgraded)
 	}
 }
 
@@ -109,22 +109,18 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 
 	switch state {
 	case ConnP2P:
-		sent := false
-
 		if target != nil && target.UDPAddr != nil {
 			_, err := rm.edge.udpConn.WriteTo(data, target.UDPAddr)
 			if err == nil {
-				sent = true
-			} else {
-				log.Printf("[P2P] UDP 发送到 %s 失败: %v", peerId, err)
+				return true
 			}
+			log.Printf("[P2P] UDP 发送到 %s 失败: %v", peerId, err)
 		}
-
-		if err := rm.ws.SendBinary(data); err == nil {
-			sent = true
-		}
-
-		return sent
+		// 单播失败时不再 WS 双发——保持和 PC 端一致。
+		// 上一版本在这里会 `rm.ws.SendBinary(data)` 兜底，
+		// 结果每包走两条路径（P2P + WS），浪费带宽且让接收端收到重复。
+		// 真正的降级由 MarkFallback 在几次失败后触发，不是每包兜底。
+		return false
 
 	case ConnTURN:
 		if target != nil && target.TurnRelayAddr != "" && rm.turnClient != nil {
@@ -140,17 +136,16 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 		return rm.ws.SendBinary(data) == nil
 
 	case ConnRelay:
-		err := rm.ws.SendBinary(data)
-		return err == nil
+		return rm.ws.SendBinary(data) == nil
 	}
 
 	return false
 }
 
-// Report 定期上报连接状态
+// Report 定期上报连接状态。
 //
-// ★ 通过 rm.edge.doneCh 感知 Edge 停止，避免 goroutine 泄漏
-//   （反复启停 VPN 时若旧 goroutine 不退出，每次会累积一个 + 每 10 秒一次无效网络调用）
+// 通过 rm.edge.doneCh 感知 Edge 停止，避免 goroutine 泄漏
+// （反复启停 VPN 时若旧 goroutine 不退出，每次会累积一个 + 每 10 秒一次无效网络调用）。
 func (rm *RelayManager) Report(interval time.Duration) {
 	go func() {
 		ticker := time.NewTicker(interval)
@@ -172,7 +167,6 @@ func (rm *RelayManager) Report(interval time.Duration) {
 					"payload": map[string]interface{}{"connections": conns},
 				})
 			case <-rm.edge.doneCh:
-				// ★ Edge 停止时退出
 				return
 			}
 		}
