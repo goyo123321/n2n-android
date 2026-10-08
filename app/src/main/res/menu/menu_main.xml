@@ -3,11 +3,11 @@
     xmlns:app="http://schemas.android.com/apk/res-auto">
     <item
         android:id="@+id/action_logs"
-        android:title="日志"
+        android:title="@string/menu_logs"
         app:showAsAction="ifRoom" />
     <item
         android:id="@+id/action_theme"
         android:icon="@drawable/ic_theme"
-        android:title="主题"
+        android:title="@string/menu_theme"
         app:showAsAction="ifRoom" />
 </menu>
