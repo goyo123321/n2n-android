@@ -11,7 +11,7 @@
     <string name="card_peers">🌐 已连接节点</string>
 
     <string name="hint_wss">WSS 地址</string>
-    <string name="hint_uuid">组网密钥 UUID</string>
+    <string name="hint_connect_token">连接密码 CONNECT_TOKEN（可选，留空用默认）</string>
     <string name="hint_room">房间名</string>
     <string name="hint_node_name">显示名</string>
     <string name="hint_client_id">Client ID（可选，留空自动生成）</string>
@@ -23,5 +23,5 @@
     <string name="log_title">运行日志</string>
     <string name="empty_peers">暂无其他节点</string>
 
-    <string name="uuid_invalid">UUID 格式错误（需 32 位十六进制）</string>
+    <string name="token_invalid">连接密码格式错误</string>
 </resources>
