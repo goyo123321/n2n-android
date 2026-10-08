@@ -40,21 +40,14 @@
             </intent-filter>
         </activity>
 
-        <activity
-            android:name=".FileManagerActivity"
-            android:exported="false"
-            android:label="@string/file_manager_title"
-            android:parentActivityName=".MainActivity" />
+        <!-- ★ 删除了 FileManagerActivity -->
+        <!-- ★ 删除了 ShareWebActivity -->
+        <!-- ★ 删除了 FileProvider -->
 
         <activity
             android:name=".LogActivity"
             android:exported="false"
             android:label="@string/log_title"
-            android:parentActivityName=".MainActivity" />
-
-        <activity
-            android:name=".ShareWebActivity"
-            android:exported="false"
             android:parentActivityName=".MainActivity" />
 
         <service
@@ -70,14 +63,5 @@
                 android:value="n2n P2P VPN tunnel" />
         </service>
 
-        <provider
-            android:name="androidx.core.content.FileProvider"
-            android:authorities="com.n2n.android.fileprovider"
-            android:exported="false"
-            android:grantUriPermissions="true">
-            <meta-data
-                android:name="android.support.FILE_PROVIDER_PATHS"
-                android:resource="@xml/file_paths" />
-        </provider>
     </application>
 </manifest>
