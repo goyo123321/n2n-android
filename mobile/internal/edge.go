@@ -62,6 +62,10 @@ type Edge struct {
 	tunWriteCh chan []byte
 	natMeta    *NATMetadata
 
+	// ★ 超时降级定时器：peerID → Timer
+	fallbackTimers   map[string]*time.Timer
+	fallbackTimersMu sync.Mutex
+
 	doneCh  chan struct{}
 	closeMu sync.Mutex
 	closed  bool
@@ -81,9 +85,6 @@ func safeGo(name string, fn func()) {
 }
 
 // isTransientReadError 判断是否为可重试的临时错误（EAGAIN/EINTR）。
-//
-// Android 的 TUN fd 在某些情况下会返回 EAGAIN/EINTR，不是致命错误，
-// 但之前的代码直接 return，导致读循环死掉，之后所有包都进不来。
 func isTransientReadError(err error) bool {
 	if err == nil {
 		return false
@@ -176,14 +177,15 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	lanIPs := getAllLanIPs()
 
 	e := &Edge{
-		cfg:        cfg,
-		clientId:   clientId,
-		nodeName:   nodeName,
-		roomId:     cfg.RoomID,
-		myLanIPs:   lanIPs,
-		peers:      make(map[string]*PeerInfo),
-		tunWriteCh: make(chan []byte, 4096),
-		doneCh:     make(chan struct{}),
+		cfg:            cfg,
+		clientId:       clientId,
+		nodeName:       nodeName,
+		roomId:         cfg.RoomID,
+		myLanIPs:       lanIPs,
+		peers:          make(map[string]*PeerInfo),
+		fallbackTimers: make(map[string]*time.Timer),
+		tunWriteCh:     make(chan []byte, 4096),
+		doneCh:         make(chan struct{}),
 		natMeta: &NATMetadata{
 			NATType:  "unknown",
 			Behavior: "BehaviorPortChanged",
@@ -391,6 +393,14 @@ func (e *Edge) Stop() {
 	close(e.doneCh)
 	e.closeMu.Unlock()
 
+	// ★ 清理所有 fallback 定时器
+	e.fallbackTimersMu.Lock()
+	for _, t := range e.fallbackTimers {
+		t.Stop()
+	}
+	e.fallbackTimers = make(map[string]*time.Timer)
+	e.fallbackTimersMu.Unlock()
+
 	if e.ws != nil {
 		_ = e.ws.Close()
 	}
@@ -588,6 +598,33 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		instrCopy := instr
 		safeGo("nat-hole", func() { e.runNatHole(&instrCopy) })
 
+	case "force_fallback":
+		// ★ 服务端主动要求降级（同 CGNAT IP 等场景）
+		payload, _ := msg["payload"].(map[string]interface{})
+		if payload == nil {
+			return
+		}
+		peersRaw, _ := payload["peers"].([]interface{})
+		reason, _ := payload["reason"].(string)
+		if reason == "" {
+			reason = "server-forced"
+		}
+		log.Printf("[信令] 收到 force_fallback: %d 个 peer, reason=%s", len(peersRaw), reason)
+		for _, pRaw := range peersRaw {
+			peerID, _ := pRaw.(string)
+			if peerID == "" {
+				continue
+			}
+			if e.relayMgr == nil {
+				continue
+			}
+			if e.relayMgr.GetState(peerID) == ConnP2P {
+				continue
+			}
+			e.relayMgr.MarkFallback(peerID)
+		}
+		return
+
 	case "turn_peer_info":
 		edgeMac, _ := msg["edgeMac"].(string)
 		relayAddr, _ := msg["relayAddr"].(string)
@@ -607,6 +644,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		e.peersMu.Lock()
 		delete(e.peers, from)
 		e.peersMu.Unlock()
+		e.cancelFallbackTimer(from)
 
 	case "connection_status":
 		return
@@ -614,8 +652,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 }
 
 // reportMetadata 上报 p2p_metadata + share_announce。
-// 合并 myLanIPs 与 natMeta.AssistedSockets 中的 IP；
-// 实时判断 CGNAT 池化，不依赖 NAT 探测时序。
 func (e *Edge) reportMetadata() {
 	e.mu.Lock()
 	nm := e.natMeta
@@ -627,7 +663,7 @@ func (e *Edge) reportMetadata() {
 		nm = &NATMetadata{NATType: "unknown", Behavior: "BehaviorPortChanged"}
 	}
 
-	// ★ 每次上报时实时判断 CGNAT 池化
+	// 实时判断 CGNAT 池化
 	if serverSeenIP != "" && nm.PublicEndpoint != "" {
 		stunIP := extractIPFromEndpoint(nm.PublicEndpoint)
 		if stunIP != "" && stunIP != serverSeenIP {
@@ -637,7 +673,6 @@ func (e *Edge) reportMetadata() {
 		}
 	}
 
-	// 合并 myLanIPs 与 AssistedSockets
 	merged := make(map[string]bool)
 	var lanIPs []string
 	addIP := func(ip string) {
@@ -724,8 +759,9 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int) {
 	}
 
 	e.peersMu.Lock()
-	defer e.peersMu.Unlock()
-	if p, ok := e.peers[pid]; ok {
+	_, existed := e.peers[pid]
+	if existed {
+		p := e.peers[pid]
 		if vip != "" {
 			p.VirtualIP = vip
 		}
@@ -743,6 +779,63 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int) {
 			ClientID: pid, VirtualIP: vip, PubIP: pubIP,
 			PubPort: pubPort, UDPAddr: udpAddr,
 		}
+	}
+	e.peersMu.Unlock()
+
+	// ★ 新 peer 且尚未有连接状态 → 启动超时降级定时器
+	if !existed {
+		e.scheduleFallbackTimer(pid)
+	}
+}
+
+// scheduleFallbackTimer 8 秒后如果 peer 仍是 ConnUnknown，主动降级。
+//
+// 解决"服务端同 CGNAT IP 静默跳过"场景：服务端不下发任何指令，
+// 客户端一直等，relayMgr.states 空，connType 显示 --，数据面不通。
+//
+// 8 秒窗口足够：打洞指令下发 (<1s) + 执行 (3~5s) + P2P probe 往返 (<100ms)。
+func (e *Edge) scheduleFallbackTimer(peerID string) {
+	if e.relayMgr == nil {
+		return
+	}
+
+	e.fallbackTimersMu.Lock()
+	if t, ok := e.fallbackTimers[peerID]; ok {
+		t.Stop()
+	}
+	t := time.AfterFunc(8*time.Second, func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[fallback-timer] panic: %v", r)
+			}
+		}()
+
+		e.fallbackTimersMu.Lock()
+		delete(e.fallbackTimers, peerID)
+		e.fallbackTimersMu.Unlock()
+
+		if e.relayMgr == nil {
+			return
+		}
+		state := e.relayMgr.GetState(peerID)
+		if state != ConnUnknown {
+			log.Printf("[fallback-timer] %s 已有状态 %s，跳过降级", peerID, state)
+			return
+		}
+		log.Printf("[fallback-timer] %s 8s 内未收到打洞指令，主动降级", peerID)
+		e.relayMgr.MarkFallback(peerID)
+	})
+	e.fallbackTimers[peerID] = t
+	e.fallbackTimersMu.Unlock()
+}
+
+// cancelFallbackTimer 取消 peer 的超时降级定时器。
+func (e *Edge) cancelFallbackTimer(peerID string) {
+	e.fallbackTimersMu.Lock()
+	defer e.fallbackTimersMu.Unlock()
+	if t, ok := e.fallbackTimers[peerID]; ok {
+		t.Stop()
+		delete(e.fallbackTimers, peerID)
 	}
 }
 
@@ -897,7 +990,6 @@ func (e *Edge) tunReadLoop() {
 			if e.relayMgr != nil {
 				sent = e.relayMgr.SendToPeer(target.ClientID, buf[:n], target)
 			}
-			// ★ 调试日志：确认 TUN 是否收到包、往哪个 peer、走了哪条路
 			if n >= 10 {
 				log.Printf("[TUN] → %s dst=%s len=%d proto=%d sent=%v state=%s",
 					target.ClientID, dstIP, n, buf[9], sent, state)
@@ -955,9 +1047,7 @@ func (e *Edge) notePeerTraffic(addr *net.UDPAddr) {
 
 // notePeerCommon 记录 peer 收到 UDP 包的时间。
 //
-// ★ 关键修复：probe（N2NP 前缀）到达也触发 P2P 升级。
-//   之前只认 isRealData，导致 probe 阶段双方互相收到探测包但永不升级，
-//   打洞永远失败（LAN 直连场景尤为明显）。
+// ★ probe（N2NP 前缀）到达也触发 P2P 升级。
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool) {
 	now := time.Now().UnixMilli()
 	e.peersMu.Lock()
@@ -995,7 +1085,6 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool) {
 		return
 	}
 
-	// ★ probe 到达 = UDP 双向通道可用，直接升级
 	if e.relayMgr.ShouldRelay(clientID) {
 		if isRealData {
 			log.Printf("[P2P] 从 %s (%s) 收到真实数据帧，升级为 P2P", clientID, ip)
@@ -1007,8 +1096,6 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool) {
 }
 
 // hasTrafficFromAny 检查是否有来自指定 IP 列表的 UDP 包。
-//
-// ★ 不再要求 hasRealData：收到 probe 也算通道可用。
 func (e *Edge) hasTrafficFromAny(ips []net.IP, since int64) bool {
 	if len(ips) == 0 {
 		return false
