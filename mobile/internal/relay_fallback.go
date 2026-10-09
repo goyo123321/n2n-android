@@ -42,19 +42,40 @@ func (rm *RelayManager) MarkP2P(peerId string) {
 	}
 }
 
+// MarkFallback P2P 失败时降级。
+//
+// TURN 就绪 → TURN；未就绪 → 暂时 WS，并启动 5s 延迟升级 goroutine。
+// 这样即使首次判定时 TURN 未就绪，TURN 就绪后也能自动升级，
+// 避免出现 A-ws-B / B-turn-A 的不对称状态。
 func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.mu.Lock()
-	defer rm.mu.Unlock()
 	if rm.states[peerId] == ConnTURN || rm.states[peerId] == ConnRelay {
+		rm.mu.Unlock()
 		return
 	}
 	if rm.turnClient != nil && rm.turnClient.IsReady() {
 		rm.states[peerId] = ConnTURN
+		rm.mu.Unlock()
 		log.Printf("[连接] %s → TURN 中继", peerId)
 		return
 	}
 	rm.states[peerId] = ConnRelay
-	log.Printf("[连接] %s → WS 中继（TURN 未就绪）", peerId)
+	rm.mu.Unlock()
+	log.Printf("[连接] %s → WS 中继（TURN 未就绪，5s 内 TURN 就绪则自动升级）", peerId)
+
+	// ★ 延迟升级：5s 后如果 TURN 已就绪，从 WS 升级到 TURN
+	safeGo("relay-upgrade-retry", func() {
+		time.Sleep(5 * time.Second)
+		rm.mu.Lock()
+		defer rm.mu.Unlock()
+		if rm.states[peerId] != ConnRelay {
+			return
+		}
+		if rm.turnClient != nil && rm.turnClient.IsReady() {
+			rm.states[peerId] = ConnTURN
+			log.Printf("[连接] %s → TURN 中继（延迟升级）", peerId)
+		}
+	})
 }
 
 func (rm *RelayManager) UpgradeRelaysToTURN() {
@@ -103,7 +124,6 @@ func (rm *RelayManager) GetState(peerId string) ConnType {
 	return ConnUnknown
 }
 
-// SendToPeer 三级降级：P2P → TURN → WS
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
 	state := rm.GetState(peerId)
 
@@ -144,10 +164,6 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 	return false
 }
 
-// Report 定期上报连接状态。
-//
-// 用 safeGo 包裹整个循环：panic 时只记录日志，不让整个进程崩溃。
-// 通过 rm.edge.doneCh 感知 Edge 停止，避免 goroutine 泄漏。
 func (rm *RelayManager) Report(interval time.Duration) {
 	if rm.edge == nil {
 		return
