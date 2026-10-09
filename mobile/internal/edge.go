@@ -9,6 +9,8 @@ import (
 	"log"
 	"net"
 	"os"
+	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 )
@@ -41,10 +43,7 @@ type Edge struct {
 	virtualIP string
 	roomId    string
 
-	// ★ 本机所有局域网 IP（多网卡）
-	myLanIPs []string
-
-	// ★ 服务端（WS 连接）看到的源 IP
+	myLanIPs     []string
 	serverSeenIP string
 
 	ws         *WSTransport
@@ -65,6 +64,18 @@ type Edge struct {
 	closeMu sync.Mutex
 	closed  bool
 	mu      sync.Mutex
+}
+
+// safeGo 在 goroutine 里执行 fn，panic 时只记录日志，不让整个进程崩溃。
+func safeGo(name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[panic] %s: %v\n%s", name, r, debug.Stack())
+			}
+		}()
+		fn()
+	}()
 }
 
 func generateDefaultClientID() string {
@@ -137,7 +148,6 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		nodeName = "Android"
 	}
 
-	// ★ 收集所有局域网 IP
 	lanIPs := getAllLanIPs()
 
 	e := &Edge{
@@ -163,7 +173,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	}
 	e.tun = tun
 
-	// 2. UDP（P2P 打洞，protected）
+	// 2. UDP
 	var udpConn net.PacketConn
 	if udpFd > 0 {
 		file := os.NewFile(uintptr(udpFd), "protected-udp")
@@ -197,7 +207,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	}
 	log.Printf("[P2P] UDP 监听端口 %d", e.udpPort)
 
-	// 3. STUN socket（protected）
+	// 3. STUN socket
 	var stunConn net.PacketConn
 	if stunFd > 0 {
 		file := os.NewFile(uintptr(stunFd), "protected-stun")
@@ -231,6 +241,24 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	}
 	e.ws = ws
 
+	// ★ WS 建立后，从 socket 本地地址反推 LAN IP，补充 net.Interfaces 的不足
+	socketIPs := collectLanIPsFromSockets(ws)
+	if len(socketIPs) > 0 {
+		seen := make(map[string]bool)
+		for _, ip := range e.myLanIPs {
+			seen[ip] = true
+		}
+		for _, ip := range socketIPs {
+			if !seen[ip] {
+				e.myLanIPs = append(e.myLanIPs, ip)
+				seen[ip] = true
+			}
+		}
+		log.Printf("[LAN] socket 出口补充后: %v", e.myLanIPs)
+	} else if len(e.myLanIPs) == 0 {
+		log.Printf("[LAN] ⚠️ 无法获取任何局域网 IP")
+	}
+
 	// 5. TURN
 	e.turnClient = NewTURNClient(cfg.SignalingURL, cfg.ConnectToken, e)
 	e.turnClient.onMessage = func(data []byte, addr net.Addr) {
@@ -247,13 +275,13 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		e.onRemotePacket(data)
 	}
 
-	// 8. 后台协程
-	go e.udpReadLoop()
-	go e.tunWriteLoop()
-	go e.tunReadLoop()
+	// 8. 后台协程（全部 safeGo）
+	safeGo("udpReadLoop", e.udpReadLoop)
+	safeGo("tunWriteLoop", e.tunWriteLoop)
+	safeGo("tunReadLoop", e.tunReadLoop)
 
-	// 9. NAT 探测（异步）+ WS/STUN 出口对比
-	go func() {
+	// 9. NAT 探测
+	safeGo("nat-probe", func() {
 		log.Printf("[NAT] 开始异步 STUN 探测...")
 		var meta *NATMetadata
 		if stunConn != nil {
@@ -262,8 +290,10 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		} else {
 			meta = probeNAT(e.udpPort, nil)
 		}
+		if meta == nil {
+			meta = &NATMetadata{NATType: "unknown", Behavior: "BehaviorPortChanged"}
+		}
 
-		// WS/STUN 出口对比
 		e.mu.Lock()
 		serverIP := e.serverSeenIP
 		e.mu.Unlock()
@@ -295,25 +325,32 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 			e.reportMetadata()
 			log.Printf("[NAT] 已重新上报 p2p_metadata")
 		}
-	}()
+	})
 
 	// 10. TURN 异步初始化
-	go func() {
+	safeGo("turn-init", func() {
 		time.Sleep(200 * time.Millisecond)
 		ctx, cancel := contextWithTimeout(30 * time.Second)
 		defer cancel()
 
+		if e.turnClient == nil {
+			return
+		}
 		if err := e.turnClient.FetchAndSetup(ctx); err != nil {
 			log.Printf("[TURN] 初始化失败: %v", err)
-		} else {
-			log.Printf("[TURN] 就绪: %s", e.turnClient.GetRelayAddr())
+			return
+		}
+		log.Printf("[TURN] 就绪: %s", e.turnClient.GetRelayAddr())
+		if e.relayMgr != nil {
 			e.relayMgr.UpgradeRelaysToTURN()
+		}
+		if e.ws != nil {
 			_ = e.ws.Send(map[string]interface{}{
 				"type":      "turn_relay_info",
 				"relayAddr": e.turnClient.GetRelayAddr(),
 			})
 		}
-	}()
+	})
 
 	log.Printf("[Edge] 已启动 clientId=%s room=%s", clientId, cfg.RoomID)
 	return e, nil
@@ -354,15 +391,21 @@ func (e *Edge) GetVirtualIP() string {
 
 func (e *Edge) GetClientID() string { return e.clientId }
 
+// GetPeersJSON 在锁内快照，锁外序列化，避免 data race。
 func (e *Edge) GetPeersJSON() string {
 	e.peersMu.RLock()
 	type pair struct {
-		id string
-		p  *PeerInfo
+		id     string
+		vip    string
+		online bool
 	}
 	var list []pair
 	for id, p := range e.peers {
-		list = append(list, pair{id, p})
+		list = append(list, pair{
+			id:     id,
+			vip:    p.VirtualIP,
+			online: p.UDPAddr != nil || p.TurnRelayAddr != "",
+		})
 	}
 	e.peersMu.RUnlock()
 
@@ -375,18 +418,23 @@ func (e *Edge) GetPeersJSON() string {
 	}
 
 	e.mu.Lock()
-	natType := e.natMeta.NATType
+	natType := "unknown"
+	if e.natMeta != nil {
+		natType = e.natMeta.NATType
+	}
 	e.mu.Unlock()
 
-	var snapshots []PeerSnapshot
+	snapshots := make([]PeerSnapshot, 0, len(list))
 	for i, item := range list {
-		code := idxToCode(i)
-		connType := string(e.relayMgr.GetState(item.id))
+		connType := "unknown"
+		if e.relayMgr != nil {
+			connType = string(e.relayMgr.GetState(item.id))
+		}
 		snapshots = append(snapshots, PeerSnapshot{
-			Code:      code,
+			Code:      idxToCode(i),
 			ClientID:  item.id,
-			VirtualIP: item.p.VirtualIP,
-			Online:    item.p.UDPAddr != nil || item.p.TurnRelayAddr != "",
+			VirtualIP: item.vip,
+			Online:    item.online,
 			ConnType:  connType,
 			NATType:   natType,
 		})
@@ -405,7 +453,6 @@ func idxToCode(i int) string {
 	return string(rune('A'+first)) + string(rune('A'+second))
 }
 
-// extractIPFromEndpoint 从 "1.2.3.4:5678" 提取 "1.2.3.4"
 func extractIPFromEndpoint(ep string) string {
 	if ep == "" {
 		return ""
@@ -447,29 +494,17 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		e.peersMu.Unlock()
 		log.Printf("[信令] 分配虚拟 IP: %s", vip)
 
-		// 保存服务端看到的源 IP（WS 出口）
+		// 服务端看到的源 IP 是 WS/TCP 出口，仅用于 CGNAT 池化判断
 		if serverIP, ok := payload["yourPublicIp"].(string); ok && serverIP != "" {
 			e.mu.Lock()
 			e.serverSeenIP = serverIP
 			e.mu.Unlock()
-			log.Printf("[信令] 服务端看到的本机出口 IP: %s", serverIP)
+			log.Printf("[信令] 服务端看到的本机出口 IP: %s（WS/TCP 出口，仅参考）", serverIP)
 		}
 
-		e.mu.Lock()
-		needFallback := e.natMeta.PublicEndpoint == ""
-		e.mu.Unlock()
-
-		if needFallback {
-			if serverSeenIp, ok := payload["yourPublicIp"].(string); ok && serverSeenIp != "" {
-				endpoint := fmt.Sprintf("%s:%d", serverSeenIp, e.udpPort)
-				e.mu.Lock()
-				e.natMeta.PublicEndpoint = endpoint
-				e.natMeta.P2PEndpoint = endpoint
-				e.natMeta.NATType = "EasyNAT"
-				e.mu.Unlock()
-				log.Printf("[NAT] STUN 未完成，用服务端 IP 兜底: %s", endpoint)
-			}
-		}
+		// ★ 不再用 WS 出口 IP 兜底 publicEndpoint。
+		//   CGNAT 池化下 WS 出口 ≠ UDP 出口，用错 IP 打洞必失败。
+		//   等 STUN 探测完成后 reportMetadata 上报真正的 UDP 出口。
 
 		e.reportMetadata()
 
@@ -531,7 +566,8 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			return
 		}
 		e.ensureTargetPeer(&instr)
-		go e.runNatHole(&instr)
+		instrCopy := instr
+		safeGo("nat-hole", func() { e.runNatHole(&instrCopy) })
 
 	case "turn_peer_info":
 		edgeMac, _ := msg["edgeMac"].(string)
@@ -559,14 +595,54 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 }
 
 // reportMetadata 上报 p2p_metadata + share_announce。
-//
-// 上报 lanIps（数组）+ udpPort + multiExit，服务端在下发打洞指令时
-// 会把对方 LAN 地址塞进 TargetLanEndpoints，客户端优先尝试。
+// 合并 myLanIPs 与 natMeta.AssistedSockets 中的 IP。
 func (e *Edge) reportMetadata() {
 	e.mu.Lock()
 	nm := e.natMeta
 	ws := e.ws
+	serverSeenIP := e.serverSeenIP
 	e.mu.Unlock()
+
+	// 合并 myLanIPs 与 AssistedSockets
+	merged := make(map[string]bool)
+	var lanIPs []string
+	addIP := func(ip string) {
+		if ip == "" || ip == "0.0.0.0" {
+			return
+		}
+		if merged[ip] {
+			return
+		}
+		parsed := net.ParseIP(ip)
+		if parsed == nil {
+			return
+		}
+		ip4 := parsed.To4()
+		if ip4 == nil {
+			return
+		}
+		if ip4[0] == 10 && ip4[1] == 64 {
+			return
+		}
+		if !isPrivateIP(ip4) {
+			return
+		}
+		merged[ip] = true
+		lanIPs = append(lanIPs, ip)
+	}
+
+	for _, ip := range e.myLanIPs {
+		addIP(ip)
+	}
+	if nm != nil {
+		for _, sock := range nm.AssistedSockets {
+			host := sock
+			if i := strings.LastIndex(sock, ":"); i > 0 {
+				host = sock[:i]
+			}
+			addIP(host)
+		}
+	}
 
 	metaPayload := map[string]interface{}{
 		"name":               e.nodeName,
@@ -576,16 +652,17 @@ func (e *Edge) reportMetadata() {
 		"behavior":           nm.Behavior,
 		"assistedSockets":    nm.AssistedSockets,
 		"p2pEndpoint":        nm.P2PEndpoint,
-		"lanIps":             e.myLanIPs,
+		"lanIps":             lanIPs,
 		"udpPort":            e.udpPort,
 		"multiExit":          nm.MultiExit,
+		"wsPublicIp":         serverSeenIP,
 	}
 	if nm.PublicEndpoint != "" {
 		metaPayload["publicEndpoint"] = nm.PublicEndpoint
 	}
 
-	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%s lanIps=%v udpPort=%d multiExit=%v",
-		nm.NATType, nm.PublicEndpoint, e.myLanIPs, e.udpPort, nm.MultiExit)
+	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%q wsPublicIp=%q lanIps=%v udpPort=%d multiExit=%v",
+		nm.NATType, nm.PublicEndpoint, serverSeenIP, lanIPs, e.udpPort, nm.MultiExit)
 
 	if ws == nil {
 		return
@@ -608,11 +685,6 @@ func jsonInt(v interface{}) int {
 	return 0
 }
 
-// registerPeer 只记录对端信息，不做同网段判断。
-//
-// 同网段判断由服务端在生成 nat_hole_instruction 时完成——服务端
-// 把对端的 LAN endpoints 填进 TargetLanEndpoints，客户端按指令顺序
-// 尝试即可。
 func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int) {
 	var udpAddr *net.UDPAddr
 	if pubIP != "" && pubPort > 0 {
