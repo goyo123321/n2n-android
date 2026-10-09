@@ -293,7 +293,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		e.onRemotePacket(data)
 	}
 
-	// 6. 中继（必须在 SetHandlers 之前初始化，因为 handleSignaling 会用到）
+	// 6. 中继（必须在 SetHandlers 之前初始化）
 	e.relayMgr = NewRelayManager(ws, e.turnClient, e)
 	e.relayMgr.Report(10 * time.Second)
 
@@ -795,8 +795,6 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int) {
 }
 
 // scheduleFallbackTimer 8 秒后如果 peer 仍是 ConnUnknown，主动降级。
-//
-// 解决"服务端同 CGNAT IP 静默跳过 / 指令丢失"场景。
 func (e *Edge) scheduleFallbackTimer(peerID string) {
 	if e.relayMgr == nil || peerID == "" {
 		return
@@ -876,6 +874,7 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	if res.State == PunchStateSucceeded {
 		e.relayMgr.MarkP2P(instr.TargetMac)
 	} else if res.State == PunchStateFailed {
+		// ★ MarkFallback 内部已判断 P2P，不会误降级
 		e.relayMgr.MarkFallback(instr.TargetMac)
 	}
 
@@ -1049,7 +1048,10 @@ func (e *Edge) notePeerTraffic(addr *net.UDPAddr) {
 }
 
 // notePeerCommon 记录 peer 收到 UDP 包的时间。
-// ★ probe（N2NP 前缀）到达也触发 P2P 升级。
+//
+// ★ 区分 probe 和真实数据帧：
+//   - 真实数据帧到达 → 无条件升级 P2P（最高优先级）
+//   - probe 到达 → 只在当前不是 P2P 时升级（避免重复日志刷屏）
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool) {
 	now := time.Now().UnixMilli()
 	e.peersMu.Lock()
@@ -1087,12 +1089,18 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool) {
 		return
 	}
 
-	if e.relayMgr.ShouldRelay(clientID) {
-		if isRealData {
+	if isRealData {
+		// ★ 真实数据帧 → 无条件升级（MarkP2P 内部会判重）
+		if e.relayMgr.GetState(clientID) != ConnP2P {
 			log.Printf("[P2P] 从 %s (%s) 收到真实数据帧，升级为 P2P", clientID, ip)
-		} else {
-			log.Printf("[P2P] 从 %s (%s) 收到打洞探测，UDP 通道可用，升级为 P2P", clientID, ip)
+			e.relayMgr.MarkP2P(clientID)
 		}
+		return
+	}
+
+	// ★ probe → 只在当前不是 P2P 时升级（避免重复日志）
+	if e.relayMgr.GetState(clientID) != ConnP2P {
+		log.Printf("[P2P] 从 %s (%s) 收到打洞探测，UDP 通道可用，升级为 P2P", clientID, ip)
 		e.relayMgr.MarkP2P(clientID)
 	}
 }
