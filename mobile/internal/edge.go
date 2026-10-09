@@ -135,7 +135,8 @@ func FetchVirtualIP(cfg *Config) string {
 	defer ws.Close()
 
 	done := make(chan string, 1)
-	ws.onMessage = func(msg map[string]interface{}) {
+	// ★ 用 SetHandlers（会重放早期消息），而非直接赋值 onMessage
+	ws.SetHandlers(func(msg map[string]interface{}) {
 		t, _ := msg["type"].(string)
 		if t == "ready" {
 			payload, _ := msg["payload"].(map[string]interface{})
@@ -145,7 +146,7 @@ func FetchVirtualIP(cfg *Config) string {
 			default:
 			}
 		}
-	}
+	}, nil)
 
 	select {
 	case vip := <-done:
@@ -292,15 +293,17 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		e.onRemotePacket(data)
 	}
 
-	// 6. 中继
+	// 6. 中继（必须在 SetHandlers 之前初始化，因为 handleSignaling 会用到）
 	e.relayMgr = NewRelayManager(ws, e.turnClient, e)
 	e.relayMgr.Report(10 * time.Second)
 
-	// 7. 回调
-	ws.onMessage = e.handleSignaling
-	ws.onBinary = func(data []byte) {
-		e.onRemotePacket(data)
-	}
+	// 7. 回调（★ 用 SetHandlers，会重放 ready 等早期消息）
+	ws.SetHandlers(
+		e.handleSignaling,
+		func(data []byte) {
+			e.onRemotePacket(data)
+		},
+	)
 
 	// 8. 后台协程
 	safeGo("udpReadLoop", e.udpReadLoop)
@@ -595,6 +598,9 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			return
 		}
 		e.ensureTargetPeer(&instr)
+		// ★ 兜底：确保 fallback timer 已启动
+		//   （ready 丢失时 registerPeer 没被调，timer 没启动）
+		e.scheduleFallbackTimer(instr.TargetMac)
 		instrCopy := instr
 		safeGo("nat-hole", func() { e.runNatHole(&instrCopy) })
 
@@ -790,12 +796,9 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int) {
 
 // scheduleFallbackTimer 8 秒后如果 peer 仍是 ConnUnknown，主动降级。
 //
-// 解决"服务端同 CGNAT IP 静默跳过"场景：服务端不下发任何指令，
-// 客户端一直等，relayMgr.states 空，connType 显示 --，数据面不通。
-//
-// 8 秒窗口足够：打洞指令下发 (<1s) + 执行 (3~5s) + P2P probe 往返 (<100ms)。
+// 解决"服务端同 CGNAT IP 静默跳过 / 指令丢失"场景。
 func (e *Edge) scheduleFallbackTimer(peerID string) {
-	if e.relayMgr == nil {
+	if e.relayMgr == nil || peerID == "" {
 		return
 	}
 
@@ -1046,7 +1049,6 @@ func (e *Edge) notePeerTraffic(addr *net.UDPAddr) {
 }
 
 // notePeerCommon 记录 peer 收到 UDP 包的时间。
-//
 // ★ probe（N2NP 前缀）到达也触发 P2P 升级。
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool) {
 	now := time.Now().UnixMilli()
