@@ -17,17 +17,60 @@ import (
 
 type WSTransport struct {
 	conn      *websocket.Conn
-	mu        sync.Mutex // 保护 conn 字段本身
-	writeMu   sync.Mutex // ★ 串行化所有写操作，gorilla/websocket 禁止并发写
+	mu        sync.Mutex
+	writeMu   sync.Mutex
 	clientId  string
 	onMessage func(map[string]interface{})
 	onBinary  func([]byte)
+
+	// ★ 早期消息缓冲：onMessage / onBinary 未设置前收到的消息暂存这里
+	//   修复 "ready 消息在 handler 设置前到达被丢弃" 的问题
+	earlyText   []map[string]interface{}
+	earlyBinary [][]byte
+	handlersSet bool
 
 	fullURL     string
 	dialer      *websocket.Dialer
 	stopCh      chan struct{}
 	reconnectMu sync.Mutex
 	stopping    bool
+}
+
+// SetHandlers 设置 onMessage / onBinary 回调，并重放缓冲消息。
+//
+// ★ 替换原来直接赋值 ws.onMessage = xxx 的写法。
+//   必须在 WS 建立后尽快调用，重放前收到的消息都在缓冲区里。
+//   这是修复"ready 丢失导致 VIP / serverSeenIP 拿不到"的关键。
+func (ws *WSTransport) SetHandlers(
+	onMessage func(map[string]interface{}),
+	onBinary func([]byte),
+) {
+	ws.mu.Lock()
+	ws.onMessage = onMessage
+	ws.onBinary = onBinary
+	ws.handlersSet = true
+	textBuf := ws.earlyText
+	binBuf := ws.earlyBinary
+	ws.earlyText = nil
+	ws.earlyBinary = nil
+	ws.mu.Unlock()
+
+	if len(textBuf) > 0 {
+		log.Printf("[WS] 重放 %d 条早期文本消息", len(textBuf))
+		for _, msg := range textBuf {
+			if onMessage != nil {
+				onMessage(msg)
+			}
+		}
+	}
+	if len(binBuf) > 0 {
+		log.Printf("[WS] 重放 %d 条早期二进制消息", len(binBuf))
+		for _, data := range binBuf {
+			if onBinary != nil {
+				onBinary(data)
+			}
+		}
+	}
 }
 
 func NewWSTransport(signalingURL, roomId, clientId, connectToken, preferredIP string, preferredPort int) (*WSTransport, error) {
@@ -132,12 +175,28 @@ func (ws *WSTransport) readLoop(conn *websocket.Conn) {
 			if err := json.Unmarshal(data, &msg); err != nil {
 				continue
 			}
-			if ws.onMessage != nil {
-				ws.onMessage(msg)
+			ws.mu.Lock()
+			if ws.handlersSet && ws.onMessage != nil {
+				handler := ws.onMessage
+				ws.mu.Unlock()
+				handler(msg)
+			} else {
+				// ★ 缓冲早期消息（handler 还没设置）
+				ws.earlyText = append(ws.earlyText, msg)
+				ws.mu.Unlock()
 			}
 		} else if msgType == websocket.BinaryMessage {
-			if ws.onBinary != nil {
-				ws.onBinary(data)
+			ws.mu.Lock()
+			if ws.handlersSet && ws.onBinary != nil {
+				handler := ws.onBinary
+				ws.mu.Unlock()
+				handler(data)
+			} else {
+				// ★ 缓冲早期二进制消息
+				cp := make([]byte, len(data))
+				copy(cp, data)
+				ws.earlyBinary = append(ws.earlyBinary, cp)
+				ws.mu.Unlock()
 			}
 		}
 	}
@@ -166,12 +225,13 @@ func (ws *WSTransport) tryReconnect() {
 		}
 		ws.mu.Lock()
 		ws.conn = conn
+		handler := ws.onMessage
 		ws.mu.Unlock()
 		log.Printf("[WS] ✅ 重连成功")
 		go ws.readLoop(conn)
 		go ws.heartbeat(20 * time.Second)
-		if ws.onMessage != nil {
-			ws.onMessage(map[string]interface{}{"type": "_reconnected"})
+		if handler != nil {
+			handler(map[string]interface{}{"type": "_reconnected"})
 		}
 		return
 	}
@@ -197,7 +257,6 @@ func (ws *WSTransport) heartbeat(interval time.Duration) {
 	}
 }
 
-// Send 发文本消息。writeMu 串行化所有写操作。
 func (ws *WSTransport) Send(msg map[string]interface{}) error {
 	data, err := json.Marshal(msg)
 	if err != nil {
