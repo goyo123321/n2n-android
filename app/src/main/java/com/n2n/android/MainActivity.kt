@@ -158,7 +158,10 @@ class MainActivity : AppCompatActivity() {
             2 -> AppCompatDelegate.MODE_NIGHT_YES
             else -> AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM
         }
-        AppCompatDelegate.setDefaultNightMode(nightMode)
+        // ★ 同一模式跳过：避免 onCreate 里重复触发 recreate
+        if (AppCompatDelegate.getDefaultNightMode() != nightMode) {
+            AppCompatDelegate.setDefaultNightMode(nightMode)
+        }
     }
 
     private fun showThemePicker() {
@@ -191,22 +194,25 @@ class MainActivity : AppCompatActivity() {
     @android.annotation.SuppressLint("BatteryLife")
     private fun requestIgnoreBatteryOptimizationIfNeeded() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
-        val pm = getSystemService(Context.POWER_SERVICE)
-            as android.os.PowerManager
-        val pkg = packageName
-        if (pm.isIgnoringBatteryOptimizations(pkg)) return
-
         try {
-            val intent = Intent(
-                android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
-            ).apply {
-                data = android.net.Uri.parse("package:$pkg")
-            }
-            startActivity(intent)
-        } catch (e: Exception) {
+            val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+            val pkg = packageName
+            if (pm.isIgnoringBatteryOptimizations(pkg)) return
+
             try {
-                startActivity(Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
-            } catch (_: Exception) {}
+                val intent = Intent(
+                    android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
+                ).apply {
+                    data = android.net.Uri.parse("package:$pkg")
+                }
+                startActivity(intent)
+            } catch (t: Throwable) {
+                try {
+                    startActivity(Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                } catch (_: Throwable) {}
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "requestIgnoreBatteryOptimization failed", t)
         }
     }
 
@@ -224,11 +230,13 @@ class MainActivity : AppCompatActivity() {
                 binding.etSignalingUrl.setSelection(
                     binding.etSignalingUrl.text?.length ?: 0
                 )
-                val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
-                imm.showSoftInput(
-                    binding.etSignalingUrl,
-                    InputMethodManager.SHOW_IMPLICIT
-                )
+                try {
+                    val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
+                    imm.showSoftInput(
+                        binding.etSignalingUrl,
+                        InputMethodManager.SHOW_IMPLICIT
+                    )
+                } catch (_: Throwable) {}
             }
             .setNegativeButton(getString(R.string.first_use_later), null)
             .setCancelable(false)
@@ -241,67 +249,75 @@ class MainActivity : AppCompatActivity() {
 
     private fun loadConfig(savedInstanceState: Bundle?) {
         if (!::binding.isInitialized) return
-        if (savedInstanceState != null) {
-            binding.etSignalingUrl.setText(savedInstanceState.getString("signalingUrl", ""))
-            binding.etPreferredIp.setText(savedInstanceState.getString("preferredIp", ""))
-            binding.etRoomId.setText(savedInstanceState.getString("roomId", ""))
-            binding.etClientId.setText(savedInstanceState.getString("clientId", ""))
-            binding.etNodeName.setText(savedInstanceState.getString("nodeName", ""))
-            binding.etConnectToken.setText(savedInstanceState.getString("connectToken", ""))
-            return
+        try {
+            if (savedInstanceState != null) {
+                binding.etSignalingUrl.setText(savedInstanceState.getString("signalingUrl", ""))
+                binding.etPreferredIp.setText(savedInstanceState.getString("preferredIp", ""))
+                binding.etRoomId.setText(savedInstanceState.getString("roomId", ""))
+                binding.etClientId.setText(savedInstanceState.getString("clientId", ""))
+                binding.etNodeName.setText(savedInstanceState.getString("nodeName", ""))
+                binding.etConnectToken.setText(savedInstanceState.getString("connectToken", ""))
+                return
+            }
+            val cfg = Prefs.load(this)
+            binding.etSignalingUrl.setText(cfg.signalingUrl)
+            binding.etPreferredIp.setText(Prefs.loadPreferredIp(this))
+            binding.etRoomId.setText(cfg.roomId)
+            binding.etClientId.setText(cfg.clientId)
+            binding.etNodeName.setText(cfg.nodeName)
+            binding.etConnectToken.setText(cfg.connectToken)
+        } catch (t: Throwable) {
+            Log.e(TAG, "loadConfig failed", t)
         }
-        val cfg = Prefs.load(this)
-        binding.etSignalingUrl.setText(cfg.signalingUrl)
-        binding.etPreferredIp.setText(Prefs.loadPreferredIp(this))
-        binding.etRoomId.setText(cfg.roomId)
-        binding.etClientId.setText(cfg.clientId)
-        binding.etNodeName.setText(cfg.nodeName)
-        binding.etConnectToken.setText(cfg.connectToken)
     }
 
     private fun handleIntentParams(intent: Intent?) {
         if (!::binding.isInitialized) return
         intent ?: return
 
-        if (intent.action == Intent.ACTION_VIEW && intent.data != null) {
-            val data = intent.data!!
-            if (data.scheme == "n2n" && data.host == "connect") {
-                data.getQueryParameter("url")?.let { binding.etSignalingUrl.setText(it) }
-                data.getQueryParameter("ip")?.let { binding.etPreferredIp.setText(it) }
-                data.getQueryParameter("room")?.let { binding.etRoomId.setText(it) }
-                data.getQueryParameter("cid")?.let { binding.etClientId.setText(it) }
-                data.getQueryParameter("name")?.let { binding.etNodeName.setText(it) }
-                data.getQueryParameter("token")?.let { binding.etConnectToken.setText(it) }
+        try {
+            if (intent.action == Intent.ACTION_VIEW && intent.data != null) {
+                val data = intent.data!!
+                if (data.scheme == "n2n" && data.host == "connect") {
+                    data.getQueryParameter("url")?.let { binding.etSignalingUrl.setText(it) }
+                    data.getQueryParameter("ip")?.let { binding.etPreferredIp.setText(it) }
+                    data.getQueryParameter("room")?.let { binding.etRoomId.setText(it) }
+                    data.getQueryParameter("cid")?.let { binding.etClientId.setText(it) }
+                    data.getQueryParameter("name")?.let { binding.etNodeName.setText(it) }
+                    data.getQueryParameter("token")?.let { binding.etConnectToken.setText(it) }
 
-                saveCurrentInput()
-                if (data.getQueryParameter("auto") == "1") {
-                    binding.root.postDelayed({ requestVpnPermission() }, 300)
+                    saveCurrentInput()
+                    if (data.getQueryParameter("auto") == "1") {
+                        binding.root.postDelayed({ requestVpnPermission() }, 300)
+                    }
+                    return
                 }
-                return
             }
-        }
 
-        val url = intent.getStringExtra(N2nVpnService.EXTRA_SIGNALING_URL)
-        val ip = intent.getStringExtra("preferred_ip")
-        val room = intent.getStringExtra(N2nVpnService.EXTRA_ROOM_ID)
-        val cid = intent.getStringExtra(N2nVpnService.EXTRA_CLIENT_ID)
-        val name = intent.getStringExtra(N2nVpnService.EXTRA_NODE_NAME)
-        val token = intent.getStringExtra(N2nVpnService.EXTRA_CONNECT_TOKEN)
+            val url = intent.getStringExtra(N2nVpnService.EXTRA_SIGNALING_URL)
+            val ip = intent.getStringExtra("preferred_ip")
+            val room = intent.getStringExtra(N2nVpnService.EXTRA_ROOM_ID)
+            val cid = intent.getStringExtra(N2nVpnService.EXTRA_CLIENT_ID)
+            val name = intent.getStringExtra(N2nVpnService.EXTRA_NODE_NAME)
+            val token = intent.getStringExtra(N2nVpnService.EXTRA_CONNECT_TOKEN)
 
-        var changed = false
-        if (!url.isNullOrEmpty()) { binding.etSignalingUrl.setText(url); changed = true }
-        if (!ip.isNullOrEmpty()) { binding.etPreferredIp.setText(ip); changed = true }
-        if (!room.isNullOrEmpty()) { binding.etRoomId.setText(room); changed = true }
-        if (!cid.isNullOrEmpty()) { binding.etClientId.setText(cid); changed = true }
-        if (!name.isNullOrEmpty()) { binding.etNodeName.setText(name); changed = true }
-        if (!token.isNullOrEmpty()) { binding.etConnectToken.setText(token); changed = true }
+            var changed = false
+            if (!url.isNullOrEmpty()) { binding.etSignalingUrl.setText(url); changed = true }
+            if (!ip.isNullOrEmpty()) { binding.etPreferredIp.setText(ip); changed = true }
+            if (!room.isNullOrEmpty()) { binding.etRoomId.setText(room); changed = true }
+            if (!cid.isNullOrEmpty()) { binding.etClientId.setText(cid); changed = true }
+            if (!name.isNullOrEmpty()) { binding.etNodeName.setText(name); changed = true }
+            if (!token.isNullOrEmpty()) { binding.etConnectToken.setText(token); changed = true }
 
-        if (changed) {
-            saveCurrentInput()
-            toast(getString(R.string.dialog_external_updated))
-        }
-        if (intent.getBooleanExtra("auto_start", false)) {
-            binding.root.postDelayed({ requestVpnPermission() }, 300)
+            if (changed) {
+                saveCurrentInput()
+                toast(getString(R.string.dialog_external_updated))
+            }
+            if (intent.getBooleanExtra("auto_start", false)) {
+                binding.root.postDelayed({ requestVpnPermission() }, 300)
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "handleIntentParams failed", t)
         }
     }
 
@@ -364,11 +380,16 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        val intent = VpnService.prepare(this)
-        if (intent != null) {
-            vpnPermissionLauncher.launch(intent)
-        } else {
-            startVpnService()
+        try {
+            val intent = VpnService.prepare(this)
+            if (intent != null) {
+                vpnPermissionLauncher.launch(intent)
+            } else {
+                startVpnService()
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "VpnService.prepare failed", t)
+            toast("VPN 权限请求失败: ${t.message}")
         }
     }
 
@@ -475,7 +496,7 @@ class MainActivity : AppCompatActivity() {
             if (json == lastPeersJson) return
             lastPeersJson = json
 
-            val peers = try { JSONArray(json) } catch (e: Exception) { JSONArray() }
+            val peers = try { JSONArray(json) } catch (t: Throwable) { JSONArray() }
 
             binding.tvPeerCount.text = getString(R.string.peer_count_format, peers.length())
 
@@ -490,40 +511,37 @@ class MainActivity : AppCompatActivity() {
             val existing = binding.peersContainer.childCount
 
             if (existing == peers.length()) {
+                var needRebuild = false
                 for (i in 0 until peers.length()) {
-                    val p = peers.getJSONObject(i)
+                    val p = peers.optJSONObject(i) ?: continue
                     val row = binding.peersContainer.getChildAt(i) ?: continue
 
-                    val tvCode = row.findViewById<android.widget.TextView>(R.id.tvPeerCode) ?: continue
-                    val tvVip = row.findViewById<android.widget.TextView>(R.id.tvPeerVip) ?: continue
-                    val tvMeta = row.findViewById<android.widget.TextView>(R.id.tvPeerMeta) ?: continue
-                    val tvBadge = row.findViewById<android.widget.TextView>(R.id.tvPeerBadge) ?: continue
+                    val tvCode = row.findViewById<android.widget.TextView>(R.id.tvPeerCode)
+                    val tvVip = row.findViewById<android.widget.TextView>(R.id.tvPeerVip)
+                    val tvMeta = row.findViewById<android.widget.TextView>(R.id.tvPeerMeta)
+                    val tvBadge = row.findViewById<android.widget.TextView>(R.id.tvPeerBadge)
+
+                    if (tvCode == null || tvVip == null || tvMeta == null || tvBadge == null) {
+                        needRebuild = true
+                        break
+                    }
 
                     tvCode.text = p.optString("code", "?")
                     tvVip.text = p.optString("vip", "--")
-                    val connType = p.optString("connType", "unknown")
-                    val natType = p.optString("natType", "unknown")
-                    tvMeta.text = natType
-
-                    applyBadge(tvBadge, connType)
+                    tvMeta.text = p.optString("natType", "unknown")
+                    applyBadge(tvBadge, p.optString("connType", "unknown"))
                 }
-                return
+                if (!needRebuild) return
             }
 
             binding.peersContainer.removeAllViews()
             for (i in 0 until peers.length()) {
-                val p = peers.getJSONObject(i)
+                val p = peers.optJSONObject(i) ?: continue
                 val item = ItemPeerBinding.inflate(inflater, binding.peersContainer, false)
-
                 item.tvPeerCode.text = p.optString("code", "?")
                 item.tvPeerVip.text = p.optString("vip", "--")
-
-                val connType = p.optString("connType", "unknown")
-                val natType = p.optString("natType", "unknown")
-                item.tvPeerMeta.text = natType
-
-                applyBadge(item.tvPeerBadge, connType)
-
+                item.tvPeerMeta.text = p.optString("natType", "unknown")
+                applyBadge(item.tvPeerBadge, p.optString("connType", "unknown"))
                 binding.peersContainer.addView(item.root)
             }
         } catch (t: Throwable) {
