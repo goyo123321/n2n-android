@@ -322,6 +322,9 @@ func (t *TURNTCPAllocation) Dial(targetIP string, targetPort int) (io.ReadWriteC
 	return dataConn, nil
 }
 
+// refreshLoop 每 60 秒刷新 RFC 6062 TCP allocation。
+//
+// ★ 438 Stale Nonce 是 TURN 服务器的正常行为，静默重试，不打日志。
 func (t *TURNTCPAllocation) refreshLoop() {
 	ticker := time.NewTicker(turnRefreshInterval)
 	defer ticker.Stop()
@@ -337,26 +340,29 @@ func (t *TURNTCPAllocation) refreshLoop() {
 				log.Printf("[TURN-TCP] Refresh 失败: %v", err)
 				continue
 			}
-			// ★ 438 Stale Nonce：更新 nonce 后重试一次
-			if resp.msgType != msgRefreshSuccess {
-				code := parseErrorCode(resp.attrs[attrErrorCode])
-				if code == 438 {
-					newNonce := resp.attrs[attrNonce]
-					if len(newNonce) > 0 {
-						t.mu.Lock()
-						t.nonce = newNonce
-						t.mu.Unlock()
-						log.Printf("[TURN-TCP] 438 刷新 nonce，重试 Refresh")
-						_, err2 := t.sendRequest(msgRefreshRequest, []stunAttr{
-							{typ: attrLifetime, value: uint32ToBytes(turnDefaultLifetime)},
-						}, true)
-						if err2 != nil {
-							log.Printf("[TURN-TCP] 438 重试失败: %v", err2)
-						}
+			if resp.msgType == msgRefreshSuccess {
+				continue
+			}
+
+			code := parseErrorCode(resp.attrs[attrErrorCode])
+			if code == 438 {
+				// ★ 静默重试
+				newNonce := resp.attrs[attrNonce]
+				if len(newNonce) > 0 {
+					t.mu.Lock()
+					t.nonce = newNonce
+					t.mu.Unlock()
+					_, err2 := t.sendRequest(msgRefreshRequest, []stunAttr{
+						{typ: attrLifetime, value: uint32ToBytes(turnDefaultLifetime)},
+					}, true)
+					if err2 != nil {
+						log.Printf("[TURN-TCP] 438 重试失败: %v", err2)
 					}
 				} else {
-					log.Printf("[TURN-TCP] Refresh 被拒: code=%d", code)
+					log.Printf("[TURN-TCP] 438 但响应无 nonce")
 				}
+			} else {
+				log.Printf("[TURN-TCP] Refresh 被拒: code=%d", code)
 			}
 		}
 	}
