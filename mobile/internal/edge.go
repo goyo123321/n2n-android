@@ -62,7 +62,6 @@ type Edge struct {
 	tunWriteCh chan []byte
 	natMeta    *NATMetadata
 
-	// ★ 超时降级定时器：peerID → Timer
 	fallbackTimers   map[string]*time.Timer
 	fallbackTimersMu sync.Mutex
 
@@ -84,7 +83,6 @@ func safeGo(name string, fn func()) {
 	}()
 }
 
-// isTransientReadError 判断是否为可重试的临时错误（EAGAIN/EINTR）。
 func isTransientReadError(err error) bool {
 	if err == nil {
 		return false
@@ -116,6 +114,94 @@ func generateDefaultClientID() string {
 	return fmt.Sprintf("%s-%s", hostname, hex.EncodeToString(b[:]))
 }
 
+// ============ UDP 保活 ============
+
+// keepaliveInterval UDP 保活间隔。
+//
+// CGNAT 的 UDP 映射 TTL 通常 30 秒~几分钟。空闲超时后映射被回收，
+// 从同一 socket 出去的包会被分给新端口——这就是为什么"上报的 pubSocket
+// 端口"和"打洞时实际端口"会差 840。
+//
+// 每 5 秒刷一次，确保映射持续活跃。
+const keepaliveInterval = 5 * time.Second
+
+// keepaliveServers 保活用的 STUN 服务器（硬编码 IP，不依赖 DNS）。
+var keepaliveServers = []string{
+	"74.125.250.129:19302", // stun.l.google.com (anycast)
+	"162.159.207.0:3478",   // stun.cloudflare.com
+	"74.125.204.127:19302", // stun.l.google.com 备用
+}
+
+// buildSTUNBindingRequest 构造一个 20 字节的 STUN Binding Request。
+//
+// 保活只需要"出方向的包"让 CGNAT 刷新映射，不需要读响应。
+// 响应会被 udpReadLoop 收到并丢弃。
+func buildSTUNBindingRequest() []byte {
+	buf := make([]byte, 20)
+	buf[0] = 0x00
+	buf[1] = 0x01 // Binding Request
+	buf[2] = 0x00
+	buf[3] = 0x00 // no attributes
+	buf[4] = 0x21
+	buf[5] = 0x12
+	buf[6] = 0xA4
+	buf[7] = 0x42 // magic cookie
+	if _, err := rand.Read(buf[8:20]); err != nil {
+		binary.BigEndian.PutUint64(buf[8:16], uint64(time.Now().UnixNano()))
+	}
+	return buf
+}
+
+// startKeepalive 启动 UDP 保活协程。
+//
+// ★ 必须用 e.udpConn（P2P 打洞用的那个 socket），
+//   而不是新建一个 socket —— 只有同一个 socket 的映射才需要保活。
+func (e *Edge) startKeepalive() {
+	if e.udpConn == nil {
+		return
+	}
+
+	var addrs []*net.UDPAddr
+	for _, s := range keepaliveServers {
+		if a, err := net.ResolveUDPAddr("udp4", s); err == nil {
+			addrs = append(addrs, a)
+		}
+	}
+	if len(addrs) == 0 {
+		log.Printf("[Keepalive] ⚠️ 无可用 STUN 服务器，跳过保活")
+		return
+	}
+
+	log.Printf("[Keepalive] 启动，每 %v 刷新 %d 个 STUN 服务器", keepaliveInterval, len(addrs))
+
+	safeGo("keepalive", func() {
+		// ★ 启动立即发一次
+		for _, addr := range addrs {
+			probe := buildSTUNBindingRequest()
+			_, _ = e.udpConn.WriteTo(probe, addr)
+		}
+
+		ticker := time.NewTicker(keepaliveInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-e.doneCh:
+				log.Printf("[Keepalive] 已停止")
+				return
+			case <-ticker.C:
+				for _, addr := range addrs {
+					probe := buildSTUNBindingRequest()
+					if _, err := e.udpConn.WriteTo(probe, addr); err != nil {
+						continue
+					}
+				}
+			}
+		}
+	})
+}
+
+// ============ 主流程 ============
+
 func FetchVirtualIP(cfg *Config) string {
 	if cfg.SignalingURL == "" {
 		return ""
@@ -135,7 +221,6 @@ func FetchVirtualIP(cfg *Config) string {
 	defer ws.Close()
 
 	done := make(chan string, 1)
-	// ★ 用 SetHandlers（会重放早期消息），而非直接赋值 onMessage
 	ws.SetHandlers(func(msg map[string]interface{}) {
 		t, _ := msg["type"].(string)
 		if t == "ready" {
@@ -269,7 +354,6 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	}
 	e.ws = ws
 
-	// ★ WS 建立后，从 socket 本地地址反推 LAN IP
 	socketIPs := collectLanIPsFromSockets(ws)
 	if len(socketIPs) > 0 {
 		seen := make(map[string]bool)
@@ -293,11 +377,11 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		e.onRemotePacket(data)
 	}
 
-	// 6. 中继（必须在 SetHandlers 之前初始化）
+	// 6. 中继
 	e.relayMgr = NewRelayManager(ws, e.turnClient, e)
 	e.relayMgr.Report(10 * time.Second)
 
-	// 7. 回调（★ 用 SetHandlers，会重放 ready 等早期消息）
+	// 7. 回调
 	ws.SetHandlers(
 		e.handleSignaling,
 		func(data []byte) {
@@ -309,6 +393,9 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	safeGo("udpReadLoop", e.udpReadLoop)
 	safeGo("tunWriteLoop", e.tunWriteLoop)
 	safeGo("tunReadLoop", e.tunReadLoop)
+
+	// ★ 启动 UDP 保活（保持 CGNAT 映射新鲜）
+	e.startKeepalive()
 
 	// 9. NAT 探测
 	safeGo("nat-probe", func() {
@@ -396,7 +483,6 @@ func (e *Edge) Stop() {
 	close(e.doneCh)
 	e.closeMu.Unlock()
 
-	// ★ 清理所有 fallback 定时器
 	e.fallbackTimersMu.Lock()
 	for _, t := range e.fallbackTimers {
 		t.Stop()
@@ -598,13 +684,11 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			return
 		}
 		e.ensureTargetPeer(&instr)
-		// ★ 兜底：确保 fallback timer 已启动
 		e.scheduleFallbackTimer(instr.TargetMac)
 		instrCopy := instr
 		safeGo("nat-hole", func() { e.runNatHole(&instrCopy) })
 
 	case "force_fallback":
-		// ★ 服务端主动要求降级（同 CGNAT IP 等场景）
 		payload, _ := msg["payload"].(map[string]interface{})
 		if payload == nil {
 			return
@@ -656,7 +740,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	}
 }
 
-// reportMetadata 上报 p2p_metadata + share_announce。
 func (e *Edge) reportMetadata() {
 	e.mu.Lock()
 	nm := e.natMeta
@@ -668,7 +751,6 @@ func (e *Edge) reportMetadata() {
 		nm = &NATMetadata{NATType: "unknown", Behavior: "BehaviorPortChanged"}
 	}
 
-	// 实时判断 CGNAT 池化
 	if serverSeenIP != "" && nm.PublicEndpoint != "" {
 		stunIP := extractIPFromEndpoint(nm.PublicEndpoint)
 		if stunIP != "" && stunIP != serverSeenIP {
@@ -787,13 +869,11 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int) {
 	}
 	e.peersMu.Unlock()
 
-	// ★ 新 peer 且尚未有连接状态 → 启动超时降级定时器
 	if !existed {
 		e.scheduleFallbackTimer(pid)
 	}
 }
 
-// scheduleFallbackTimer 8 秒后如果 peer 仍是 ConnUnknown，主动降级。
 func (e *Edge) scheduleFallbackTimer(peerID string) {
 	if e.relayMgr == nil || peerID == "" {
 		return
@@ -829,7 +909,6 @@ func (e *Edge) scheduleFallbackTimer(peerID string) {
 	e.fallbackTimersMu.Unlock()
 }
 
-// cancelFallbackTimer 取消 peer 的超时降级定时器。
 func (e *Edge) cancelFallbackTimer(peerID string) {
 	e.fallbackTimersMu.Lock()
 	defer e.fallbackTimersMu.Unlock()
@@ -873,7 +952,6 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	if res.State == PunchStateSucceeded {
 		e.relayMgr.MarkP2P(instr.TargetMac)
 	} else if res.State == PunchStateFailed {
-		// ★ MarkFallback 内部已判断 P2P，不会误降级
 		e.relayMgr.MarkFallback(instr.TargetMac)
 	}
 
@@ -940,6 +1018,7 @@ func (e *Edge) udpReadLoop() {
 			}
 			e.onRemotePacket(buf[:n])
 		}
+		// ★ STUN Binding Response（0x01 开头）落到这里，静默丢弃
 	}
 }
 
@@ -1046,13 +1125,6 @@ func (e *Edge) notePeerTraffic(addr *net.UDPAddr) {
 	e.notePeerCommon(addr, true)
 }
 
-// notePeerCommon 记录 peer 收到 UDP 包的时间。
-//
-// ★ 收到 probe 立即回发（连发 5 次）：
-//   对方 probe 的源地址（addr）就是其 NAT 后的真实映射，
-//   直接回发一定命中，让对方也能升级 P2P。
-//   修复"单向打洞成功"——A 收到 B 的 probe 升级 P2P，
-//   但 B 没收到 A 的 probe 走 TURN，状态不一致。
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool) {
 	now := time.Now().UnixMilli()
 	e.peersMu.Lock()
@@ -1079,8 +1151,6 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool) {
 	if isRealData {
 		best.hasRealData = true
 	}
-	// ★ 用对端 probe 的实际源地址更新 UDPAddr
-	//   （NAT 映射的真实端口，比服务端下发的 pubSocket 更准）
 	best.UDPAddr = &net.UDPAddr{IP: addr.IP, Port: addr.Port}
 	clientID := best.ClientID
 	ip := addr.IP.String()
@@ -1090,7 +1160,6 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool) {
 		return
 	}
 
-	// ★ probe 回发：确保对方也能收到我们的 probe
 	if !isRealData {
 		e.sendProbeTo(addr)
 	}
@@ -1110,16 +1179,10 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool) {
 	}
 }
 
-// sendProbeTo 向指定地址发送打洞探测包。
-//
-// ★ 异步连发 5 次（每次间隔 100ms），覆盖瞬时丢包。
-//   之前只发一次，撞上丢包就对端永远升不了 P2P，造成"单向打洞"。
-//   连发 5 次后，单方向失败率从 ~20% 降到 ~0.03%。
 func (e *Edge) sendProbeTo(addr *net.UDPAddr) {
 	if e.udpConn == nil || addr == nil {
 		return
 	}
-	// 复制地址（防止外部修改）
 	target := &net.UDPAddr{IP: addr.IP, Port: addr.Port}
 	vip := e.GetVirtualIP()
 
