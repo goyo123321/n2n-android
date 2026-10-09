@@ -39,13 +39,17 @@ class LogActivity : AppCompatActivity() {
         binding.toolbar.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 R.id.action_clear_logs -> {
-                    N2nController.clearLogs()
+                    try { N2nController.clearLogs() } catch (t: Throwable) {
+                        Log.e(TAG, "clearLogs failed", t)
+                    }
                     refresh()
                     toast(getString(R.string.log_cleared))
                     true
                 }
                 R.id.action_copy_logs -> {
-                    val logs = N2nController.getLogs()
+                    val logs = try { N2nController.getLogs() } catch (t: Throwable) {
+                        Log.e(TAG, "getLogs failed", t); ""
+                    }
                     if (logs.isEmpty()) {
                         toast(getString(R.string.log_empty_copy))
                     } else {
@@ -103,7 +107,9 @@ class LogActivity : AppCompatActivity() {
                 if (binding.switchAutoScroll.isChecked) {
                     binding.scrollView.post {
                         if (!isFinishing && !isDestroyed && ::binding.isInitialized) {
-                            binding.scrollView.fullScroll(View.FOCUS_DOWN)
+                            try {
+                                binding.scrollView.fullScroll(View.FOCUS_DOWN)
+                            } catch (_: Throwable) {}
                         }
                     }
                 }
