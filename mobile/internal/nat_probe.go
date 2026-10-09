@@ -17,6 +17,7 @@ type NATMetadata struct {
 	RegularPortsChange bool
 	Behavior           string
 	AssistedSockets    []string
+	MultiExit          bool // ★ 新增
 }
 
 // ★ 硬编码 STUN IP：不依赖 DNS，纯 VPN 场景也能工作。
