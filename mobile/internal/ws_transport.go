@@ -17,7 +17,8 @@ import (
 
 type WSTransport struct {
 	conn      *websocket.Conn
-	mu        sync.Mutex
+	mu        sync.Mutex // 保护 conn 字段本身
+	writeMu   sync.Mutex // ★ 串行化所有写操作，gorilla/websocket 禁止并发写
 	clientId  string
 	onMessage func(map[string]interface{})
 	onBinary  func([]byte)
@@ -29,15 +30,10 @@ type WSTransport struct {
 	stopping    bool
 }
 
-// NewWSTransport 建立信令 WebSocket。
-//
-// connectToken 用于 URL 认证（服务端按 ?token= 读取），为空时不加参数。
-// preferredIP / preferredPort 用于 Cloudflare 优选 IP（可选，留空走 DNS）。
 func NewWSTransport(signalingURL, roomId, clientId, connectToken, preferredIP string, preferredPort int) (*WSTransport, error) {
 	base := strings.TrimRight(signalingURL, "/")
 	fullURL := base + "/ws/" + url.PathEscape(roomId) + "?cid=" + url.QueryEscape(clientId)
 	if connectToken != "" {
-		// 服务端按 query 参数 "token" 读取
 		fullURL += "&token=" + url.QueryEscape(connectToken)
 	}
 
@@ -201,8 +197,16 @@ func (ws *WSTransport) heartbeat(interval time.Duration) {
 	}
 }
 
+// Send 发文本消息。writeMu 串行化所有写操作。
 func (ws *WSTransport) Send(msg map[string]interface{}) error {
-	data, _ := json.Marshal(msg)
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+
+	ws.writeMu.Lock()
+	defer ws.writeMu.Unlock()
+
 	ws.mu.Lock()
 	conn := ws.conn
 	ws.mu.Unlock()
@@ -213,6 +217,9 @@ func (ws *WSTransport) Send(msg map[string]interface{}) error {
 }
 
 func (ws *WSTransport) SendBinary(data []byte) error {
+	ws.writeMu.Lock()
+	defer ws.writeMu.Unlock()
+
 	ws.mu.Lock()
 	conn := ws.conn
 	ws.mu.Unlock()
