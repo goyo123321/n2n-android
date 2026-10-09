@@ -1,98 +1,108 @@
 package internal
 
 import (
-	"bufio"
 	"log"
 	"net"
-	"os"
-	"strconv"
 	"strings"
 )
 
+// NetInfo 本机网络信息。
+//
+// 收集本机所有可用的局域网 IPv4——包括 WiFi / 蜂窝 / 以太网。
+// 手机可能同时有多个出口（WiFi + 4G），全部上报，
+// 让对端能匹配到任意一个。
 type NetInfo struct {
-	LANIP     string
-	GatewayIP string
+	LANIPs []string
+}
+
+// vpnIfacePrefixes 要排除的接口名前缀。
+//
+// 这些接口都不是物理网络出口：
+//   - tun/tap/ppp/utun: 其他 VPN 客户端
+//   - ipsec: 系统 IPSec
+//   - n2n: 我们自己的 TUN（绝对要排除，否则会递归）
+//   - wg: WireGuard
+var vpnIfacePrefixes = []string{
+	"tun", "tap", "ppp", "utun", "ipsec", "n2n", "wg",
 }
 
 func getNetInfo() *NetInfo {
 	info := &NetInfo{}
 
-	gw := getDefaultGateway()
-
-	priorities := []string{"wlan0", "wlan1", "eth0"}
-
 	ifaces, err := net.Interfaces()
 	if err != nil {
+		log.Printf("[NetInfo] 枚举接口失败: %v", err)
 		return info
 	}
 
-	for _, want := range priorities {
-		for _, iface := range ifaces {
-			if iface.Name != want || iface.Flags&net.FlagUp == 0 {
-				continue
-			}
-			if fillNetInfo(info, &iface, gw) {
-				log.Printf("[NetInfo] %s LAN=%s GW=%s", iface.Name, info.LANIP, info.GatewayIP)
-				return info
-			}
-		}
-	}
-
 	for _, iface := range ifaces {
+		// 跳过 loopback 和未启动
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
 		}
-		if fillNetInfo(info, &iface, gw) {
-			log.Printf("[NetInfo] %s LAN=%s GW=%s (fallback)", iface.Name, info.LANIP, info.GatewayIP)
-			return info
+		// 跳过 VPN 接口
+		if isVPNInterface(iface.Name) {
+			log.Printf("[NetInfo] 跳过 VPN 接口: %s", iface.Name)
+			continue
+		}
+		// 收集该接口的所有私有 IPv4
+		addrs, _ := iface.Addrs()
+		for _, a := range addrs {
+			ipnet, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip4 := ipnet.IP.To4()
+			if ip4 == nil {
+				continue
+			}
+			// 跳过我们的虚拟网段 10.64.0.0/24
+			if ip4[0] == 10 && ip4[1] == 64 {
+				continue
+			}
+			if !isPrivateIP(ip4) {
+				continue
+			}
+			ipStr := ip4.String()
+			if !containsString(info.LANIPs, ipStr) {
+				info.LANIPs = append(info.LANIPs, ipStr)
+			}
 		}
 	}
+
+	log.Printf("[NetInfo] 可用局域网出口: %v", info.LANIPs)
 	return info
 }
 
-func fillNetInfo(info *NetInfo, iface *net.Interface, gateway string) bool {
-	addrs, _ := iface.Addrs()
-	for _, a := range addrs {
-		ipnet, ok := a.(*net.IPNet)
-		if !ok {
-			continue
+func isVPNInterface(name string) bool {
+	lower := strings.ToLower(name)
+	for _, prefix := range vpnIfacePrefixes {
+		if strings.HasPrefix(lower, prefix) {
+			return true
 		}
-		ip4 := ipnet.IP.To4()
-		if ip4 == nil {
-			continue
-		}
-		// 跳过 n2n 虚拟网段 10.64.0.0/24
-		if ip4[0] == 10 && ip4[1] == 64 {
-			continue
-		}
-		if !isPrivateIP(ip4) {
-			continue
-		}
-		info.LANIP = ip4.String()
-
-		if gateway != "" {
-			info.GatewayIP = gateway
-		} else {
-			gw := make(net.IP, 4)
-			copy(gw, ip4)
-			gw[3] = 1
-			info.GatewayIP = gw.String()
-		}
-		return true
 	}
 	return false
 }
 
 func isPrivateIP(ip net.IP) bool {
+	if len(ip) < 4 {
+		return false
+	}
 	return ip[0] == 10 ||
 		(ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31) ||
 		(ip[0] == 192 && ip[1] == 168)
 }
 
+func containsString(list []string, s string) bool {
+	for _, x := range list {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
 // sameSubnet 判断两个 IPv4 是否在同一 /24 子网。
-//
-// 假设 /24 覆盖了绝大多数家庭 / 办公室 WiFi 场景。
-// 更严格的做法是拿到本机子网掩码精确判断，但收益很小。
 func sameSubnet(a, b string) bool {
 	ipA := net.ParseIP(a).To4()
 	ipB := net.ParseIP(b).To4()
@@ -102,44 +112,12 @@ func sameSubnet(a, b string) bool {
 	return ipA[0] == ipB[0] && ipA[1] == ipB[1] && ipA[2] == ipB[2]
 }
 
-func getDefaultGateway() string {
-	f, err := os.Open("/proc/net/route")
-	if err != nil {
-		return ""
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	if !scanner.Scan() {
-		return ""
-	}
-
-	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-		if len(fields) < 3 {
-			continue
-		}
-		if fields[1] != "00000000" {
-			continue
-		}
-		if ip := hexLEToIP(fields[2]); ip != nil {
-			return ip.String()
+// anySameSubnet 判断 mine 列表里是否有 IP 与 other 同子网。
+func anySameSubnet(mine []string, other string) bool {
+	for _, m := range mine {
+		if sameSubnet(m, other) {
+			return true
 		}
 	}
-	return ""
-}
-
-func hexLEToIP(hexStr string) net.IP {
-	if len(hexStr) != 8 {
-		return nil
-	}
-	var b [4]byte
-	for i := 0; i < 4; i++ {
-		v, err := strconv.ParseUint(hexStr[i*2:i*2+2], 16, 8)
-		if err != nil {
-			return nil
-		}
-		b[3-i] = byte(v)
-	}
-	return net.IPv4(b[0], b[1], b[2], b[3])
+	return false
 }
