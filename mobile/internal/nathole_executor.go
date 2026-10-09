@@ -74,6 +74,20 @@ func init() {
 }
 
 func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
+	// ★ 已 P2P 就跳过。
+	//
+	// 场景 1：LAN 直连 —— registerPeer 检测到同网段就直接 MarkP2P，
+	//   服务端不知道这件事还会继续下发打洞指令。
+	// 场景 2：上次打洞已成功 —— 服务端 punchState 可能已经清理，
+	//   或者报文的 in-flight 窗口过期了，又下发一条。
+	//
+	// 无论哪种情况，直接跳过。返回 nil 让上层不上报，
+	// 避免污染服务端的 failCounts 和 analyzer 分数。
+	if e.relayMgr != nil && e.relayMgr.GetState(instr.TargetMac) == ConnP2P {
+		log.Printf("[NAT-HOLE] 跳过指令 target=%s（已 P2P）", instr.TargetMac)
+		return nil
+	}
+
 	// 同一 target 已有执行中的指令，返回 nil。
 	//
 	// 返回 nil 而不是 Failed：原指令还在执行，它会发真实结果。
@@ -153,6 +167,10 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 	)
 
 	// === 构建目标地址列表 ===
+	//
+	// 服务端已把对端的 lanIps + assistedSockets 放在 TargetAssistedEndpoints
+	// 最前面（见 coordinator.js 的 buildAssistedList）。
+	// 这里按顺序 append —— 局域网地址先打，公网地址后打。
 	var targets []*net.UDPAddr
 	var candidateIPs []net.IP
 
