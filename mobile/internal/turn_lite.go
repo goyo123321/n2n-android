@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -108,6 +109,37 @@ func NewTURNLiteWithTCP(serverAddr, username, password string, useTCP bool) *TUR
 		pending:     make(map[[12]byte]chan *stunMessage),
 		stopCh:      make(chan struct{}),
 	}
+}
+
+// ============ 辅助 ============
+
+// isNetworkUnreachable 判断错误是否为"网络不可达"。
+//
+// 网络接口切换（WiFi ↔ 4G / 换了网段）后，已绑定旧 IP 的
+// connected socket 会永远返回 network is unreachable。
+// 遇到这种情况应该主动关闭 socket，让上层重建。
+func isNetworkUnreachable(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "network is unreachable") ||
+		strings.Contains(s, "no route to host") ||
+		strings.Contains(s, "network is down")
+}
+
+// IsAlive 返回 TURNLite 是否还在工作。
+//
+// 与 TURNClient.IsReady 的区别：
+//   - IsReady 只看 lite 指针是否非空
+//   - IsAlive 看 lite 内部 stopped 状态
+//
+// 网络切换后 lite.Close() 被调用，stopped=true，
+// 但 TURNClient.lite 指针仍非空。上层应该用 IsAlive 判断。
+func (t *TURNLite) IsAlive() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return !t.stopped
 }
 
 // ============ STUN 编解码 ============
@@ -281,6 +313,11 @@ func (t *TURNLite) sendRequest(msgType uint16, attrs []stunAttr, withAuth bool) 
 	}()
 
 	if _, err := t.conn.Write(msg); err != nil {
+		// ★ 网络切换后 socket 失效，主动关闭自己，让上层重建
+		if isNetworkUnreachable(err) {
+			log.Printf("[TURN-Lite] socket 失效（网络变化），关闭等待重建")
+			go t.Close()
+		}
 		return nil, fmt.Errorf("发送失败: %w", err)
 	}
 
@@ -484,6 +521,12 @@ func (t *TURNLite) readLoopUDP() {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue
 			}
+			// ★ 网络不可达 → 关闭自己
+			if isNetworkUnreachable(err) {
+				log.Printf("[TURN-Lite] 读 socket 失效（网络变化），关闭")
+				go t.Close()
+				return
+			}
 			select {
 			case <-t.stopCh:
 				return
@@ -509,6 +552,11 @@ func (t *TURNLite) readLoopTCP() {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue
 			}
+			if isNetworkUnreachable(err) {
+				log.Printf("[TURN-Lite] TCP 读 socket 失效（网络变化），关闭")
+				go t.Close()
+				return
+			}
 			select {
 			case <-t.stopCh:
 				return
@@ -521,7 +569,7 @@ func (t *TURNLite) readLoopTCP() {
 	}
 }
 
-// ★ readTCPPacket 定义在 turn_lite_tcp.go（按文件名归属）
+// ★ readTCPPacket 定义在 turn_lite_tcp.go
 
 func (t *TURNLite) handleIncoming(data []byte) {
 	if len(data) < 4 {
@@ -557,9 +605,8 @@ func (t *TURNLite) handleIncoming(data []byte) {
 
 // refreshLoop 每 60 秒刷新 TURN allocation。
 //
-// ★ 438 Stale Nonce 是 TURN 服务器的**正常行为**（nonce 会轮换），
-//   遇到 438 时静默重试，不打日志，避免每 60 秒刷屏。
-//   只有真正的失败（非 438 错误 / 网络错误 / 重试也失败）才打日志。
+// ★ 438 Stale Nonce 是 TURN 服务器的正常行为，静默重试。
+// ★ 网络不可达时已在 sendRequest 里 Close，不再打日志。
 func (t *TURNLite) refreshLoop() {
 	ticker := time.NewTicker(turnRefreshInterval)
 	defer ticker.Stop()
@@ -568,10 +615,19 @@ func (t *TURNLite) refreshLoop() {
 		case <-t.stopCh:
 			return
 		case <-ticker.C:
+			// ★ 已关闭就不用刷
+			if !t.IsAlive() {
+				return
+			}
+
 			resp, err := t.sendRequest(msgRefreshRequest, []stunAttr{
 				{typ: attrLifetime, value: uint32ToBytes(turnDefaultLifetime)},
 			}, true)
 			if err != nil {
+				// ★ network unreachable 时已在 sendRequest 里 Close，不再打日志
+				if isNetworkUnreachable(err) {
+					return
+				}
 				log.Printf("[TURN-Lite] Refresh 失败: %v", err)
 				continue
 			}
@@ -581,7 +637,6 @@ func (t *TURNLite) refreshLoop() {
 
 			code := parseErrorCode(resp.attrs[attrErrorCode])
 			if code == 438 {
-				// ★ 438 Stale Nonce：更新 nonce 后静默重试
 				newNonce := resp.attrs[attrNonce]
 				if len(newNonce) > 0 {
 					t.mu.Lock()
@@ -590,10 +645,9 @@ func (t *TURNLite) refreshLoop() {
 					_, err2 := t.sendRequest(msgRefreshRequest, []stunAttr{
 						{typ: attrLifetime, value: uint32ToBytes(turnDefaultLifetime)},
 					}, true)
-					if err2 != nil {
+					if err2 != nil && !isNetworkUnreachable(err2) {
 						log.Printf("[TURN-Lite] 438 重试失败: %v", err2)
 					}
-					// 成功则静默
 				} else {
 					log.Printf("[TURN-Lite] 438 但响应无 nonce")
 				}
