@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"strconv"
@@ -11,31 +12,31 @@ import (
 )
 
 type NatHoleInstruction struct {
-	Role                      int      `json:"role"`
-	TTL                       int      `json:"ttl"`
-	SendDelayMs               int      `json:"sendDelayMs"`
-	PortsRangeFrom            uint32   `json:"portsRangeFrom"`
-	PortsRangeTo              uint32   `json:"portsRangeTo"`
-	TargetMac                 string   `json:"targetMac"`
-	TargetVirtualIp           string   `json:"targetVirtualIp"`
-	TargetPubSocket           string   `json:"targetPubSocket"`
-	TargetAssistedEndpoints   []string `json:"targetAssistedEndpoints"`
-	TargetLanEndpoints        []string `json:"targetLanEndpoints"`
-	SenderMac                 string   `json:"senderMac"`
-	SenderP2PEndpoint         string   `json:"senderP2pEndpoint"`
-	SenderPubSocket           string   `json:"senderPubSocket"`
-	SenderNatType             string   `json:"senderNatType"`
-	SenderBehavior            string   `json:"senderBehavior"`
-	SenderAssistedEndpoints   []string `json:"senderAssistedEndpoints"`
+	Role                    int      `json:"role"`
+	TTL                     int      `json:"ttl"`
+	SendDelayMs             int      `json:"sendDelayMs"`
+	PortsRangeFrom          uint32   `json:"portsRangeFrom"`
+	PortsRangeTo            uint32   `json:"portsRangeTo"`
+	TargetMac               string   `json:"targetMac"`
+	TargetVirtualIp         string   `json:"targetVirtualIp"`
+	TargetPubSocket         string   `json:"targetPubSocket"`
+	TargetAssistedEndpoints []string `json:"targetAssistedEndpoints"`
+	TargetLanEndpoints      []string `json:"targetLanEndpoints"`
+	SenderMac               string   `json:"senderMac"`
+	SenderP2PEndpoint       string   `json:"senderP2pEndpoint"`
+	SenderPubSocket         string   `json:"senderPubSocket"`
+	SenderNatType           string   `json:"senderNatType"`
+	SenderBehavior          string   `json:"senderBehavior"`
+	SenderAssistedEndpoints []string `json:"senderAssistedEndpoints"`
 	ReceiverMac               string   `json:"receiverMac"`
 	ReceiverP2PEndpoint       string   `json:"receiverP2pEndpoint"`
 	ReceiverPubSocket         string   `json:"receiverPubSocket"`
 	ReceiverNatType           string   `json:"receiverNatType"`
 	ReceiverAssistedEndpoints []string `json:"receiverAssistedEndpoints"`
-	PortsDifference           int      `json:"portsDifference"`
-	RegularPortsChange        bool     `json:"regularPortsChange"`
-	Mode                      int      `json:"mode"`
-	BehaviorIndex             int      `json:"behaviorIndex"`
+	PortsDifference    int  `json:"portsDifference"`
+	RegularPortsChange bool `json:"regularPortsChange"`
+	Mode               int  `json:"mode"`
+	BehaviorIndex      int  `json:"behaviorIndex"`
 }
 
 type PunchResult struct {
@@ -52,16 +53,23 @@ const (
 	PunchStateSucceeded  = 3
 )
 
+// ★ 同一 target 连续失败 N 次后，跳过后续指令
+const maxConsecutiveFails = 5
+
 var probePrefix = []byte{0x4E, 0x32, 0x4E, 0x50} // "N2NP"
 
 var (
 	natHoleActiveMu sync.Mutex
 	natHoleActive   map[string]bool
+	failCounts      map[string]int  // ★ target → 连续失败次数
 )
 
 func init() {
 	natHoleActive = make(map[string]bool)
+	failCounts = make(map[string]int)
 }
+
+var scanTiers = []int{3, 10, 20, 30, 60, 100}
 
 func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 	if e.relayMgr != nil && e.relayMgr.GetState(instr.TargetMac) == ConnP2P {
@@ -69,7 +77,15 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		return nil
 	}
 
+	// ★ 连续失败 N 次后跳过
 	natHoleActiveMu.Lock()
+	fc := failCounts[instr.TargetMac]
+	if fc >= maxConsecutiveFails {
+		natHoleActiveMu.Unlock()
+		log.Printf("[NAT-HOLE] 跳过指令 target=%s（已连续失败 %d 次）", instr.TargetMac, fc)
+		return nil
+	}
+
 	if natHoleActive[instr.TargetMac] {
 		natHoleActiveMu.Unlock()
 		log.Printf("[NAT-HOLE] 跳过重复指令 target=%s（已在处理中）", instr.TargetMac)
@@ -124,13 +140,9 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		len(instr.TargetLanEndpoints),
 	)
 
-	// === 分类目标 ===
 	var lanTargets []*net.UDPAddr
-	var publicTargets []*net.UDPAddr
 	var lanIPs []net.IP
-	var publicIPs []net.IP
 
-	// 1. LAN endpoints（优先）
 	for _, ep := range instr.TargetLanEndpoints {
 		if addr := parseSockAddr(ep); addr != nil {
 			lanTargets = append(lanTargets, addr)
@@ -138,36 +150,18 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		}
 	}
 
-	// 2. assisted endpoints
+	var assistedTargets []*net.UDPAddr
+	var publicIPs []net.IP
+	publicIPs = append(publicIPs, targetAddr.IP)
 	for _, ep := range instr.TargetAssistedEndpoints {
 		if addr := parseSockAddr(ep); addr != nil {
-			publicTargets = append(publicTargets, addr)
+			assistedTargets = append(assistedTargets, addr)
 			publicIPs = append(publicIPs, addr.IP)
 		}
 	}
 
-	// 3. 端口扫描范围 或 单点
-	if instr.PortsRangeFrom > 0 && instr.PortsRangeTo >= instr.PortsRangeFrom {
-		count := int(instr.PortsRangeTo - instr.PortsRangeFrom + 1)
-		if count > 100 {
-			count = 100
-		}
-		for i := 0; i < count; i++ {
-			publicTargets = append(publicTargets, &net.UDPAddr{
-				IP:   targetAddr.IP,
-				Port: int(instr.PortsRangeFrom) + i,
-			})
-		}
-	} else {
-		publicTargets = append(publicTargets, targetAddr)
-	}
-	publicIPs = append(publicIPs, targetAddr.IP)
-
 	if len(lanTargets) > 0 {
 		log.Printf("[NAT-HOLE] LAN 候选 %d 个（阶段 1）", len(lanTargets))
-	}
-	if len(publicTargets) > 0 {
-		log.Printf("[NAT-HOLE] 公网候选 %d 个（阶段 2）", len(publicTargets))
 	}
 
 	if instr.Role == 0 && instr.SendDelayMs > 0 {
@@ -177,12 +171,8 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 	probe := buildPunchProbe(e.virtualIP)
 	var attempts uint32
 
-	// === 阶段 1：LAN 候选，100ms 间隔，最多 3 轮 ===
-	// LAN 延迟 <5ms，不需要长间隔。
 	if len(lanTargets) > 0 {
-		const lanRounds = 3
-		const lanInterval = 100 * time.Millisecond
-		for i := 0; i < lanRounds; i++ {
+		for i := 0; i < 3; i++ {
 			for _, t := range lanTargets {
 				if _, err := e.udpConn.WriteTo(probe, t); err == nil {
 					attempts++
@@ -193,52 +183,100 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 				res.Attempts = attempts
 				res.Detail = "LAN 直连成功"
 				e.recordP2PSuccess(instr, targetAddr)
-				log.Printf(
-					"[NAT-HOLE] ✅ 成功 (LAN) role=%d target=%s attempts=%d",
-					instr.Role, targetAddr.IP, attempts,
-				)
+				log.Printf("[NAT-HOLE] ✅ 成功 (LAN) role=%d target=%s attempts=%d",
+					instr.Role, targetAddr.IP, attempts)
+				e.resetFailCount(instr.TargetMac)
 				return res
 			}
-			time.Sleep(lanInterval)
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
 
-	// === 阶段 2：公网端口扫描，200ms 间隔，最多 5 轮 ===
-	if len(publicTargets) > 0 {
-		const pubRounds = 5
-		const pubInterval = 200 * time.Millisecond
-		for round := 0; round < pubRounds; round++ {
-			for _, t := range publicTargets {
-				if _, err := e.udpConn.WriteTo(probe, t); err == nil {
-					attempts++
+	if targetAddr != nil {
+		lastHalf := 0
+		receiverPort := targetAddr.Port
+
+		log.Printf("[NAT-HOLE] 阶段 2：分阶段扫描，目标 %s:%d，分级 %v",
+			targetAddr.IP, receiverPort, scanTiers)
+
+		for _, half := range scanTiers {
+			var tierTargets []*net.UDPAddr
+			for port := receiverPort - half; port <= receiverPort+half; port++ {
+				if port < 1 || port > 65535 {
+					continue
 				}
+				if port >= receiverPort-lastHalf && port <= receiverPort+lastHalf {
+					continue
+				}
+				tierTargets = append(tierTargets, &net.UDPAddr{
+					IP:   targetAddr.IP,
+					Port: port,
+				})
 			}
-			if e.hasTrafficFromAny(publicIPs, startAt) {
+
+			if lastHalf == 0 && len(assistedTargets) > 0 {
+				tierTargets = append(tierTargets, assistedTargets...)
+			}
+
+			const tierRounds = 3
+			const tierInterval = 100 * time.Millisecond
+
+			success := false
+			for r := 0; r < tierRounds; r++ {
+				for _, t := range tierTargets {
+					if _, err := e.udpConn.WriteTo(probe, t); err == nil {
+						attempts++
+					}
+				}
+				if e.hasTrafficFromAny(publicIPs, startAt) {
+					success = true
+					break
+				}
+				time.Sleep(tierInterval)
+			}
+
+			if success {
 				res.State = PunchStateSucceeded
 				res.Attempts = attempts
-				res.Detail = "公网端口扫描成功"
+				res.Detail = fmt.Sprintf("公网端口扫描成功 (tier=±%d)", half)
 				e.recordP2PSuccess(instr, targetAddr)
-				log.Printf(
-					"[NAT-HOLE] ✅ 成功 (公网) role=%d target=%s attempts=%d",
-					instr.Role, targetAddr.IP, attempts,
-				)
+				log.Printf("[NAT-HOLE] ✅ 成功 (公网) role=%d target=%s attempts=%d tier=±%d",
+					instr.Role, targetAddr.IP, attempts, half)
+				e.resetFailCount(instr.TargetMac)
 				return res
 			}
-			time.Sleep(pubInterval)
+
+			log.Printf("[NAT-HOLE] 阶段 2 tier=±%d 未命中（本轮 %d 个），扩大范围（累计 attempts=%d）",
+				half, len(tierTargets), attempts)
+			lastHalf = half
 		}
 	}
 
 	res.State = PunchStateFailed
 	res.Attempts = attempts
 	res.Detail = "无响应"
-	log.Printf(
-		"[NAT-HOLE] ❌ 失败 role=%d target=%s attempts=%d",
-		instr.Role, targetAddr.IP, attempts,
-	)
+	log.Printf("[NAT-HOLE] ❌ 失败 role=%d target=%s attempts=%d",
+		instr.Role, targetAddr.IP, attempts)
+
+	// ★ 累计失败次数
+	natHoleActiveMu.Lock()
+	failCounts[instr.TargetMac]++
+	newFc := failCounts[instr.TargetMac]
+	natHoleActiveMu.Unlock()
+	if newFc >= maxConsecutiveFails {
+		log.Printf("[NAT-HOLE] target=%s 连续失败 %d 次，后续指令将跳过（改用中继）",
+			instr.TargetMac, newFc)
+	}
+
 	return res
 }
 
-// recordP2PSuccess 打洞成功后记录 peer 的 UDP 地址。
+func (e *Edge) resetFailCount(peerID string) {
+	natHoleActiveMu.Lock()
+	delete(failCounts, peerID)
+	natHoleActiveMu.Unlock()
+}
+
 func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAddr) {
 	e.peersMu.Lock()
 	if p, ok := e.peers[instr.TargetMac]; ok {
@@ -316,4 +354,23 @@ func buildPunchProbe(virtualIP string) []byte {
 		copy(buf[4:8], ip.To4())
 	}
 	return buf
+}
+
+func (e *Edge) hasTrafficFromAny(ips []net.IP, since int64) bool {
+	if len(ips) == 0 {
+		return false
+	}
+	e.peersMu.RLock()
+	defer e.peersMu.RUnlock()
+	for _, p := range e.peers {
+		if p.UDPAddr == nil || p.lastRecvAt < since {
+			continue
+		}
+		for _, ip := range ips {
+			if p.UDPAddr.IP.Equal(ip) {
+				return true
+			}
+		}
+	}
+	return false
 }
