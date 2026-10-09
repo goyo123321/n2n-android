@@ -11,14 +11,46 @@ import (
 	"time"
 )
 
-const maxLogLines = 500
+// ============ 配置 ============
+
+const logRetentionDuration = 3 * time.Minute
+const maxLogLines = 3000
+const logRewriteEvery = 500
+
+// ============ 内部状态 ============
+
+type logEntry struct {
+	ts   time.Time
+	line string
+}
 
 var (
-	logBuffer   []string
+	logBuffer   []logEntry
 	logBufferMu sync.RWMutex
+
 	logFilePath string
 	logFileMu   sync.Mutex
+
+	appendCounter int
+	counterMu     sync.Mutex
 )
+
+// ============ 时间戳解析 ============
+
+func parseLogTimestamp(line string) time.Time {
+	if len(line) < 10 || line[0] != '[' || line[9] != ']' {
+		return time.Time{}
+	}
+	now := time.Now()
+	t, err := time.ParseInLocation("15:04:05", line[1:9], now.Location())
+	if err != nil {
+		return time.Time{}
+	}
+	return time.Date(now.Year(), now.Month(), now.Day(),
+		t.Hour(), t.Minute(), t.Second(), 0, now.Location())
+}
+
+// ============ 文件路径设置 ============
 
 func setLogFilePath(path string) {
 	logFileMu.Lock()
@@ -29,27 +61,47 @@ func setLogFilePath(path string) {
 		return
 	}
 
-	// 读回历史日志
 	if data, err := os.ReadFile(path); err == nil {
 		content := strings.TrimRight(string(data), "\n")
 		if content == "" {
 			return
 		}
 		lines := strings.Split(content, "\n")
-		if len(lines) > maxLogLines {
-			lines = lines[len(lines)-maxLogLines:]
+		cutoff := time.Now().Add(-logRetentionDuration)
+		entries := make([]logEntry, 0, len(lines))
+		for _, line := range lines {
+			ts := parseLogTimestamp(line)
+			if ts.IsZero() || ts.Before(cutoff) {
+				continue
+			}
+			entries = append(entries, logEntry{ts: ts, line: line})
+		}
+		if len(entries) > maxLogLines {
+			entries = entries[len(entries)-maxLogLines:]
 		}
 		logBufferMu.Lock()
-		logBuffer = lines
+		logBuffer = entries
 		logBufferMu.Unlock()
 	}
 }
 
-// AppendLog 追加一行日志（带时间戳），同步写文件
+// ============ 追加 ============
+
 func AppendLog(msg string) {
+	now := time.Now()
+	line := fmt.Sprintf("[%s] %s", now.Format("15:04:05"), msg)
+
 	logBufferMu.Lock()
-	line := fmt.Sprintf("[%s] %s", time.Now().Format("15:04:05"), msg)
-	logBuffer = append(logBuffer, line)
+	logBuffer = append(logBuffer, logEntry{ts: now, line: line})
+
+	cutoff := now.Add(-logRetentionDuration)
+	drop := 0
+	for drop < len(logBuffer) && logBuffer[drop].ts.Before(cutoff) {
+		drop++
+	}
+	if drop > 0 {
+		logBuffer = logBuffer[drop:]
+	}
 	if len(logBuffer) > maxLogLines {
 		logBuffer = logBuffer[len(logBuffer)-maxLogLines:]
 	}
@@ -59,16 +111,61 @@ func AppendLog(msg string) {
 	path := logFilePath
 	logFileMu.Unlock()
 
-	if path != "" {
-		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err == nil {
-			_, _ = f.WriteString(line + "\n")
-			_ = f.Close()
-		}
+	if path == "" {
+		return
+	}
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err == nil {
+		_, _ = f.WriteString(line + "\n")
+		_ = f.Close()
+	}
+
+	counterMu.Lock()
+	appendCounter++
+	needRewrite := appendCounter >= logRewriteEvery
+	if needRewrite {
+		appendCounter = 0
+	}
+	counterMu.Unlock()
+
+	if needRewrite {
+		rewriteLogFile(path)
 	}
 }
 
-// GetLogs 每次从文件重读，这样 Kotlin ktLog 写的内容也能被看到
+func rewriteLogFile(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	content := strings.TrimRight(string(data), "\n")
+	if content == "" {
+		return
+	}
+	lines := strings.Split(content, "\n")
+	cutoff := time.Now().Add(-logRetentionDuration)
+	kept := make([]string, 0, len(lines))
+	for _, line := range lines {
+		ts := parseLogTimestamp(line)
+		if ts.IsZero() || ts.Before(cutoff) {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	if len(kept) > maxLogLines {
+		kept = kept[len(kept)-maxLogLines:]
+	}
+
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, []byte(strings.Join(kept, "\n")+"\n"), 0644); err != nil {
+		return
+	}
+	_ = os.Rename(tmpPath, path)
+}
+
+// ============ 读取 ============
+
 func GetLogs() string {
 	logFileMu.Lock()
 	path := logFilePath
@@ -79,11 +176,20 @@ func GetLogs() string {
 			content := strings.TrimRight(string(data), "\n")
 			if content != "" {
 				lines := strings.Split(content, "\n")
-				if len(lines) > maxLogLines {
-					lines = lines[len(lines)-maxLogLines:]
+				cutoff := time.Now().Add(-logRetentionDuration)
+				entries := make([]logEntry, 0, len(lines))
+				for _, line := range lines {
+					ts := parseLogTimestamp(line)
+					if ts.IsZero() || ts.Before(cutoff) {
+						continue
+					}
+					entries = append(entries, logEntry{ts: ts, line: line})
+				}
+				if len(entries) > maxLogLines {
+					entries = entries[len(entries)-maxLogLines:]
 				}
 				logBufferMu.Lock()
-				logBuffer = lines
+				logBuffer = entries
 				logBufferMu.Unlock()
 			}
 		}
@@ -94,10 +200,19 @@ func GetLogs() string {
 	if len(logBuffer) == 0 {
 		return ""
 	}
-	return strings.Join(logBuffer, "\n")
+	var sb strings.Builder
+	sb.Grow(len(logBuffer) * 60)
+	for i, e := range logBuffer {
+		if i > 0 {
+			sb.WriteByte('\n')
+		}
+		sb.WriteString(e.line)
+	}
+	return sb.String()
 }
 
-// ClearLogs 清空日志（含文件）
+// ============ 清空 ============
+
 func ClearLogs() {
 	logBufferMu.Lock()
 	logBuffer = nil
@@ -109,8 +224,11 @@ func ClearLogs() {
 
 	if path != "" {
 		_ = os.Remove(path)
+		_ = os.Remove(path + ".tmp")
 	}
 }
+
+// ============ 标准库 log 重定向 ============
 
 type logWriter struct{}
 
@@ -126,9 +244,8 @@ func initLogRedirection() {
 	log.SetFlags(0)
 }
 
-// ★ init 尝试多个候选路径
-//   优先 /data/user/0/（Android 7+ 真实路径，SELinux 上下文更可能正确）
-//   fallback /data/data/（旧版本或符号链接可用时）
+// ============ 初始化 ============
+
 func init() {
 	initLogRedirection()
 
@@ -145,7 +262,6 @@ func init() {
 			continue
 		}
 
-		// 写入测试
 		testFile := filepath.Join(dir, ".write_test")
 		f, err := os.Create(testFile)
 		if err != nil {
@@ -154,7 +270,6 @@ func init() {
 		_ = f.Close()
 		_ = os.Remove(testFile)
 
-		// 可用，选它
 		setLogFilePath(p)
 		return
 	}
