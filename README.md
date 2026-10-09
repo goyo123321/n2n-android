@@ -11,7 +11,9 @@
 - **同 WiFi 直连** — 检测到同子网直接用局域网 IP，延迟 < 5ms
 - **多出口上报** — 同时上报 WiFi / 蜂窝 / 以太网所有局域网 IP
 - **P2P 直连** — STUN 探测 + NAT 打洞，延迟低至 5ms
-- **TURN 中继** — UDP (RFC 5766) + TCP (RFC 6062) 双栈，支持 Cloudflare TURN 和自建 coturn
+- **CGNAT hairpin** — 同 STUN 出口 IP 时尝试端口扫描 + probe 回发
+- **UDP 保活** — 每 5 秒刷新 STUN 映射，防止 CGNAT 端口漂移
+- **TURN 中继** — UDP transport 双栈中继，支持 Cloudflare TURN 和自建 coturn
 - **WS 中继兜底** — TURN 不可用时自动降级到 Worker 转发
 - **优选 IP** — 支持 Cloudflare 优选 IP，绕过 DNS 解析加速信令
 - **断线重连** — WebSocket 指数退避重连
@@ -50,7 +52,7 @@
             ├─ 优先级 1: LAN 直连（同子网，延迟 < 5ms）
             │  A ←──────────────→ B
             │
-            ├─ 优先级 2: P2P 打洞（零服务器带宽）
+            ├─ 优先级 2: P2P 打洞（含 CGNAT hairpin）
             │  A ←──────────────→ B
             │
             ├─ 优先级 3: TURN 中继（少量服务器带宽）
@@ -59,6 +61,38 @@
             └─ 优先级 4: WebSocket 中继（最后兜底）
                A ──→ Worker ──→ B
 ```
+
+## 🔥 保活机制
+
+### 为什么需要保活
+
+CGNAT（运营商级 NAT）的 UDP 映射**不是永久的**。手机上的 socket 空闲一段时间后，CGNAT 会**回收映射**。之后从同一 socket 出去的包会被分给**新端口**——这就是"上报的 `pubSocket` 端口和实际打洞端口差 840"的原因。
+
+打洞成功后，P2P 通道也依赖这个映射。如果映射被回收：
+- P2P 通道断裂
+- 之后发往对端的数据落入黑洞
+
+### 两层保活
+
+| 层 | 间隔 | 目标 | 作用 |
+|:---|:---|:---|:---|
+| **UDP 保活** | 5 秒 | 3 个 STUN 服务器 | 保 socket 的 CGNAT 映射 |
+| **P2P 通道保活** | 15 秒 | 每个 P2P 对端 | 保 A→B 会话 |
+
+**两者互补**：
+
+- **UDP 保活**：让 CGNAT 认为"这个 socket 活跃"，不回收端口
+- **P2P 通道保活**：覆盖"CGNAT 维护独立会话超时"的场景（手机息屏后 CGNAT 通常 TTL 更短）
+
+**流量代价**：
+- UDP 保活：每设备每 5 秒 3 个 20 字节包 → 一天 ~50 MB
+- P2P 保活：每 P2P 对端每 15 秒 1 个 32 字节包 → 一天 ~180 KB × 对端数
+
+**电量代价**：几乎可忽略。
+
+### 数据流优先
+
+**真实数据帧天然刷新 CGNAT 映射**（最强保活）。保活机制只在**空闲时**起兜底作用。
 
 ## 🚀 快速开始
 
@@ -181,15 +215,24 @@ val intent = Intent(context, MainActivity::class.java).apply {
 1. LAN 直连 —— 同子网时用局域网 IP，延迟 < 5ms
    ↓ 失败（AP 隔离 / 不同网段）
 2. P2P 打洞 —— STUN + NAT 打洞，延迟 10~50ms
-   ↓ 失败（对称 NAT / CGNAT 池化）
-3. TURN 中继 —— UDP / TCP 双栈中继，延迟 30~100ms
+   ↓ 失败（对称 NAT / CGNAT 池化 hairpin 不支持）
+3. TURN 中继 —— UDP transport 中继，延迟 30~100ms
    ↓ 失败（TURN 未配置或不可达）
 4. WS 中继 —— 走 Cloudflare Worker，延迟 100~300ms
 ```
 
 ### LAN 直连原理
 
-**客户端启动时收集本机所有局域网 IP**（WiFi / 蜂窝 / 以太网），通过 `p2p_metadata` 上报。服务端广播 `joined` 时带上对端的 `lanIps`。
+**客户端启动时收集本机所有局域网 IP**（WiFi / 蜂窝 / 以太网）：
+
+- 优先尝试 `net.Interfaces()`（桌面 / 部分 ROM 可用）
+- 失败时从 **WS TCP LocalAddr** 反推（`192.168.10.2`）
+- 再失败从 **STUN UDP Dial LocalAddr** 反推
+- 最后从 `/proc/net/route` 默认路由反推
+
+**Android 10+ 上 `net.Interfaces()` 会被 SELinux 拒绝**（`netlinkrib: permission denied`），此时靠 **socket 反推** 兜底。
+
+**LAN IP 通过 `p2p_metadata` 上报**，服务端广播 `joined` 时带对端的 `lanIps`。
 
 **收到 `joined` 后**：客户端本地对比 `sameSubnet(myLanIPs, peerLanIPs)`：
 
@@ -206,6 +249,7 @@ val intent = Intent(context, MainActivity::class.java).apply {
 VpnService.Builder
   .addAddress("10.64.0.2", 24)
   .addRoute("10.64.0.0", 24)   ← 只接管虚拟网段
+  .addDisallowedApplication(packageName)  ← 自己绕过 VPN
 ```
 
 **效果**：微信、Chrome、系统更新等流量**完全不受影响**，只有发往 `10.64.0.x` 的包进入 VPN。
@@ -214,7 +258,7 @@ VpnService.Builder
 
 Android 一旦 VPN 启动，**所有 socket 默认走 VPN**——包括 P2P 打洞的 UDP socket 和 STUN socket。这会形成死循环（自己的 UDP 包被自己的 TUN 捕获）。
 
-**解决**：所有 P2P 相关的 socket 创建后立即 `protect(fd)`，让它们走物理网络。
+**解决**：所有 P2P 相关的 socket 创建后立即 `protect(fd)`，让它们走物理网络。fd 从 `DatagramSocket` 内部结构反射提取（`ParcelFileDescriptor.fromDatagramSocket` 在部分 ROM 不可用）。
 
 ## 📋 启动日志
 
@@ -222,35 +266,52 @@ Android 一旦 VPN 启动，**所有 socket 默认走 VPN**——包括 P2P 打�
 
 ```
 n2n-go-client 启动
-[LAN] 本机局域网出口: [192.168.10.2]
-[P2P] 使用 protected UDP fd=97（绕过 VPN）
-[P2P] UDP 监听端口 49918
-[NAT] 使用 protected STUN socket fd=105
+[LAN] 本机局域网 IP: []
+[NetInfo] 枚举网卡失败: route ip+net: netlinkrib: permission denied
+[NetInfo] WS 本地出口: 192.168.10.2
+[NetInfo] STUN Dial 本地出口: 192.168.10.2 (→74.125.250.129:19302)
+[LAN] socket 出口补充后: [192.168.10.2]
+[P2P] 使用 protected UDP fd=93（绕过 VPN）
+[P2P] UDP 监听端口 42529
+[NAT] 使用 protected STUN socket fd=107
 [WS] 优选 IP: 23.227.38.65:443 (SNI=url.jyce.kdns.fr)
 [WS] 连接 wss://url.jyce.kdns.fr/ws/default-room?cid=android-xxx
-分配虚拟 IP: 10.64.0.3
-[信令] 服务端看到的本机出口 IP: 120.229.199.61
-[信令] 上报 p2p_metadata: natType=EasyNAT publicEndpoint=120.239.134.13:18899 lanIps=[192.168.10.2] udpPort=49918 multiExit=false
-[TURN] ✅ UDP 就绪: 111.171.194.230:62755
-[TURN] ✅ RFC 6062 TCP allocation 就绪: 111.171.194.230:49493
-[NAT] EasyNAT pub=120.239.134.13:18899
+[WS] 重放 1 条早期文本消息
+[信令] 分配虚拟 IP: 10.64.0.3
+[信令] 服务端看到的本机出口 IP: 120.229.199.61（WS/TCP 出口，仅参考）
+[信令] 上报 p2p_metadata: natType=unknown publicEndpoint="" wsPublicIp="120.229.199.61" lanIps=[192.168.10.2] udpPort=42529 multiExit=false
+[信令] ready: 返回 1 个已有节点
+[信令] 已有节点: android-yyy vip=10.64.0.2 pub=120.239.134.13:18883
+[TURN] 获取到 custom TURN: turn:111.171.194.230:3478
+[TURN] 尝试 UDP transport: 111.171.194.230:3478
+[TURN-Lite] ✅ Allocation 成功: relay=111.171.194.230:58277
+[TURN] ✅ UDP transport 就绪: 111.171.194.230:58277
+[Keepalive] 启动，每 5s 刷新 3 个 STUN 服务器
+[NAT] STUN 74.125.250.129:19302 → 120.239.134.13:19190
+[NAT] ⚠️ WS/STUN 出口不一致：WS=120.229.199.61 STUN=120.239.134.13 —— CGNAT 池化，打洞大概率失败
+[NAT] 探测完成: HardNAT pub=120.239.134.13:19190 multiExit=true
+[信令] 上报 p2p_metadata: natType=HardNAT publicEndpoint="120.239.134.13:19190" wsPublicIp="120.229.199.61" lanIps=[192.168.10.2] udpPort=42529 multiExit=true
 [Edge] 已启动 clientId=android-xxx room=default-room
 ```
 
 其他节点上线时：
 
 ```
-[信令] joined: from=android-yyy vip=10.64.0.4 lanIPs=[192.168.10.3] lanPort=54321
-[LAN] android-yyy 与我同网段，直连 192.168.10.3:54321
-[连接] android-yyy → P2P 直连
+[信令] joined: from=android-yyy vip=10.64.0.2 pub=120.239.134.13:18883
+[NAT-HOLE] 开始打洞 role=1 target=120.239.134.13:18883 rung=0 mode=3 ttl=7 assisted=0 lan=1
+[NAT-HOLE] LAN 候选 1 个（阶段 1）
+[NAT-HOLE] 公网候选 13 个（阶段 2）
+[P2P] 从 android-yyy (120.239.134.13) 收到打洞探测，UDP 通道可用，升级为 P2P
+[连接] android-yyy → P2P 直连（prev=turn）
+[NAT-HOLE] ✅ 成功 (公网) role=1 target=120.239.134.13 attempts=29
 ```
 
-**LAN 直连时**：从 `joined` 到 P2P 建立大约 100ms（本地判断，无需打洞）。
+**LAN 直连时**：从 `joined` 到 P2P 建立大约 **100ms**（本地判断，无需打洞）。
 
 **走 TURN 时**：
 
 ```
-[NAT-HOLE] ❌ 失败 role=0 target=120.230.253.98 attempts=5
+[NAT-HOLE] ❌ 失败 role=1 target=... attempts=308
 [连接] android-yyy → TURN 中继
 ```
 
@@ -296,14 +357,14 @@ n2n-android/
 ├── mobile/                      # Go 客户端（gomobile 目标）
 │   ├── mobile.go               # gomobile 桥接层
 │   ├── internal/
-│   │   ├── edge.go             # 客户端主控制器
+│   │   ├── edge.go             # 客户端主控制器（含 UDP 保活）
 │   │   ├── config.go           # 配置结构
-│   │   ├── ws_transport.go     # 信令 WebSocket（含断线重连）
+│   │   ├── ws_transport.go     # 信令 WebSocket（含断线重连 + 早期消息缓冲）
 │   │   ├── turn_client.go      # TURN 客户端主控
-│   │   ├── turn_lite.go        # TURN UDP (RFC 5766)
-│   │   ├── turn_lite_tcp.go    # TURN TCP (RFC 6062)
+│   │   ├── turn_lite.go        # TURN 协议实现（UDP/TCP transport）
+│   │   ├── turn_lite_tcp.go    # TURN over TCP 分帧读取
 │   │   ├── nat_probe.go        # STUN NAT 探测
-│   │   ├── nathole_executor.go # 打洞指令执行
+│   │   ├── nathole_executor.go # 打洞指令执行（分阶段扫描）
 │   │   ├── netinfo.go          # 局域网出口探测
 │   │   ├── relay_fallback.go   # 四级降级管理器
 │   │   ├── tun.go              # TUN fd 包装
@@ -343,7 +404,7 @@ n2n-android/
 | App 启动 | 读取 Prefs，恢复上次配置 |
 | 点击启动 | FetchVirtualIP → 建立 TUN → 起 Go Edge |
 | 客户端断开 | 服务端标记 `online: false`，虚拟 IP 保留 30 分钟 |
-| App 停止 VPN | 关闭 TUN / UDP / STUN socket，停 Go Edge |
+| App 停止 VPN | 关闭 TUN / UDP / STUN socket，停 Go Edge，停 Keepalive |
 | App 卸载 | 清理所有本地文件（含日志） |
 
 ## 🔐 权限说明
@@ -383,34 +444,84 @@ n2n-android/
 
 ### Q: 打洞一直失败？
 
-1. **先确认是不是同 WiFi** —— 同 WiFi 下应该走 LAN 直连，日志里会有 `[LAN] xxx 与我同网段`。如果没看到，检查两端是否真的在同一子网。
-2. **不同 WiFi 时**，看日志里的 `[NAT]` 行：
-   - `EasyNAT` → 正常情况下能打洞
-   - `HardNAT` + `multiExit=true` → CGNAT 池化，打洞大概率失败，靠 TURN 兜底
-3. **两台都在对称 NAT 后** → 只能靠 TURN / WS 中继
-
-### Q: 同 WiFi 下为什么还走 TURN？
-
-**检查日志**：
+**先看日志里有没有这几行关键信息**：
 
 ```
-[LAN] 本机局域网出口: [192.168.10.2]   ← 是否为空？
-[信令] joined: from=xxx lanIPs=[...]    ← 对端是否上报了？
+[信令] 上报 p2p_metadata: natType=? publicEndpoint=? wsPublicIp=?
+[NAT-HOLE] 公网候选 ? 个（阶段 2）
 ```
 
-- **本机 lanIps 为空** → `/proc/net/route` 或 `net.Interfaces()` 没读到，可能是 ROM 限制
-- **对端 lanIps 为空** → 同上
-- **两者都有但仍走 TURN** → 可能是路由器 AP 隔离（同网段但不通），或子网不是 /24（如 /16 大网段）
+1. **`wsPublicIp` 为空** → `ready` 消息丢失，AAR 太旧。重新 `./build-aar.sh` 并装最新 APK。
+2. **`natType=EasyNAT`（单样本）** → `nat_probe.go` 太旧，会误判。应显示 `HardNAT` 或 `unknown`。
+3. **`公网候选 7 个`** → 服务端 `coordinator.js` 太旧，`halfWidth` 还在用旧的窄范围。
+4. **`公网候选 13/21/41/61 个`** → 分阶段扫描，正常。
+5. **端口差 > 100** → CGNAT 映射漂移严重，保活没生效。
+
+### Q: 面板显示 `EasyNAT` 一端、`HardNAT` 另一端？
+
+**两端判定不一致**，说明一端 AAR 太旧（单样本判 EasyNAT）。
+
+**修复**：重新 `./build-aar.sh`，装**同一版本** APK 到两端。
+
+### Q: 面板 `连接状态` 显示 `--`？
+
+**客户端 `relayMgr.states` 为空**。可能：
+
+1. 服务端 `coordinator.js` 没部署最新（缺 `force_fallback` 下发）
+2. 客户端 AAR 太旧（缺 `scheduleFallbackTimer` 8 秒兜底）
+
+**修复**：两端 AAR + 服务端 `coordinator.js` 全部升级到最新。
+
+### Q: 面板显示 B 端 `p2p-A`，A 端显示 `TURN-B`（单向 P2P）？
+
+**A 的 probe 命中了 B，但 B 回发给 A 的 probe 丢包了**。
+
+**修复**：客户端 `sendProbeTo` 改成**连发 5 次**（每次 100ms），覆盖瞬时丢包。这已在最新版本实现。
+
+### Q: P2P 建立后过一段时间断了？
+
+**CGNAT 映射或会话被回收**。检查：
+
+1. **日志里 `[Keepalive] 启动` 有没有？**
+   - 没有 → `startKeepalive()` 没被调用（AAR 太旧）
+2. **端口是不是又漂移了？**
+   - `[信令] 上报 p2p_metadata` 的 `publicEndpoint` 变了 → 保活无效
+   - STUN 服务器被封 → 换国内 STUN
+3. **P2P 通道保活生效了吗？**
+   - 每 15 秒会往对端发 1 个 probe
+   - 太旧的版本可能没有
 
 ### Q: 连接后无法访问外网？
 
 **正常行为**。TUN 只接管 `10.64.0.0/24`——外网流量走系统默认。如果外网也断了，说明有**其他 VPN 正在运行**（比如 Clash、系统自带的 VPN），两者冲突。
+
+### Q: `ping 10.64.0.3` 不通？
+
+**Android 的 TUN 对 ICMP 支持不完整**，部分 ROM 直接丢弃 TUN 上写回的 ICMP reply。
+
+**用 TCP 测**：
+
+```bash
+# 对端开服务
+python3 -m http.server 8080
+
+# 本机测
+curl -v --max-time 5 http://10.64.0.3:8080/
+```
+
+TCP 的连接握手必须双向往返，是最干净的端到端测试。
+
+### Q: Termux 里 ping 不通？
+
+同上——**Android 不允许普通 App 用 raw ICMP socket**，且 TUN 对 ICMP 支持不完整。用 `nc -zv 10.64.0.3 8080` 或 `curl` 测。
 
 ### Q: 耗电严重？
 
 1. 关闭其他 VPN 类 App
 2. 在系统设置里将 App 加入电池优化白名单（App 会主动引导）
 3. 长时间不使用请在 App 内停止 VPN
+
+**注意**：UDP 保活（每 5 秒 3 个包）的电量开销可忽略，不是耗电原因。
 
 ### Q: 编译 AAR 报 "NDK 路径不存在"？
 
@@ -423,6 +534,10 @@ export ANDROID_NDK_HOME=/c/Users/<you>/AppData/Local/Android/Sdk/ndk/26.1.109091
 ```
 
 NDK 可通过 Android Studio 安装：`SDK Manager → SDK Tools → NDK (Side by side)`
+
+### Q: 编译报 `readTCPPacket redeclared in this block`？
+
+`turn_lite.go` 和 `turn_lite_tcp.go` 都定义了 `readTCPPacket`。**删掉 `turn_lite.go` 里的那个定义**（保留在 `turn_lite_tcp.go`）。
 
 ### Q: App 启动后闪退？
 
@@ -439,7 +554,47 @@ NDK 可通过 Android Studio 安装：`SDK Manager → SDK Tools → NDK (Side b
 [NAT] ⚠️ WS/STUN 出口不一致：WS=120.229.199.61 STUN=120.239.134.13 —— CGNAT 池化，打洞大概率失败
 ```
 
-**这种情况下 P2P 打洞基本不可能成功**，客户端会自动走 TURN 兜底。**不是 bug，是网络限制**。
+**这种情况下 P2P 打洞成功率降低**，客户端会按以下顺序尝试：
+
+1. LAN 直连（同 WiFi 时）
+2. CGNAT hairpin（部分运营商支持，通过端口扫描 + probe 回发）
+3. TURN 中继（默认兜底）
+4. WS 中继
+
+**保活生效后**，两端 UDP 出口端口保持稳定，hairpin 成功率显著提升。**不是 bug，是网络限制**。
+
+### Q: `[WS] 重放 1 条早期文本消息` 是什么意思？
+
+**正常信息**——`ready` 消息在 handler 设置前到达，被缓冲后重放。
+
+**旧版会丢这条消息**，导致 `virtualIP` 和 `serverSeenIP` 拿不到。
+
+### Q: `[Keepalive] 已停止` 后重启 VPN 还能恢复吗？
+
+能。`[Keepalive]` 只在 `Edge.Stop()` 时退出。**VPN 停止后重启**，会重新启动 keepalive 协程。
+
+### Q: 如何验证保活是否生效？
+
+**方法 1：看端口是否稳定**
+
+反复重启 App，看 `[信令] 上报 p2p_metadata` 的 `publicEndpoint` 端口：
+
+- **保活生效**：重启后端口**跟上次一样**（CGNAT 还在缓存里）
+- **保活失效**：重启后端口**变了**（旧映射被回收）
+
+**方法 2：看打洞时的端口差**
+
+```
+[16:31:19] A 上报 publicEndpoint="...:18517"
+[16:31:30] B 上报 publicEndpoint="...:18520"    ← 端口差 3
+[16:31:30] [NAT-HOLE] ✅ 成功 (公网) tier=±3
+```
+
+**端口差 < 10 且第 1 层命中** → 保活生效。
+
+**方法 3：看 keepalive 日志**
+
+启动日志有 `[Keepalive] 启动，每 5s 刷新 3 个 STUN 服务器`。
 
 ## 📄 License
 
