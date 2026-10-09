@@ -61,7 +61,7 @@ var probePrefix = []byte{0x4E, 0x32, 0x4E, 0x50} // "N2NP"
 var (
 	natHoleActiveMu sync.Mutex
 	natHoleActive   map[string]bool
-	failCounts      map[string]int  // ★ target → 连续失败次数
+	failCounts      map[string]int
 )
 
 func init() {
@@ -69,6 +69,7 @@ func init() {
 	failCounts = make(map[string]int)
 }
 
+// scanTiers 端口扫描分级：从窄到宽，逐级放大。
 var scanTiers = []int{3, 10, 20, 30, 60, 100}
 
 func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
@@ -77,7 +78,6 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		return nil
 	}
 
-	// ★ 连续失败 N 次后跳过
 	natHoleActiveMu.Lock()
 	fc := failCounts[instr.TargetMac]
 	if fc >= maxConsecutiveFails {
@@ -258,7 +258,6 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 	log.Printf("[NAT-HOLE] ❌ 失败 role=%d target=%s attempts=%d",
 		instr.Role, targetAddr.IP, attempts)
 
-	// ★ 累计失败次数
 	natHoleActiveMu.Lock()
 	failCounts[instr.TargetMac]++
 	newFc := failCounts[instr.TargetMac]
@@ -356,21 +355,4 @@ func buildPunchProbe(virtualIP string) []byte {
 	return buf
 }
 
-func (e *Edge) hasTrafficFromAny(ips []net.IP, since int64) bool {
-	if len(ips) == 0 {
-		return false
-	}
-	e.peersMu.RLock()
-	defer e.peersMu.RUnlock()
-	for _, p := range e.peers {
-		if p.UDPAddr == nil || p.lastRecvAt < since {
-			continue
-		}
-		for _, ip := range ips {
-			if p.UDPAddr.IP.Equal(ip) {
-				return true
-			}
-		}
-	}
-	return false
-}
+// ★ hasTrafficFromAny 定义在 edge.go（两个文件都定义会冲突）
