@@ -596,6 +596,11 @@ func (t *TURNLite) handleIncoming(data []byte) {
 
 // ============ 定时刷新 ============
 
+// refreshLoop 每 60 秒刷新 TURN allocation。
+//
+// ★ 438 Stale Nonce 是 TURN 服务器的**正常行为**（nonce 会轮换），
+//   遇到 438 时静默重试，不打日志，避免每 60 秒刷屏。
+//   只有真正的失败（非 438 错误 / 网络错误 / 重试也失败）才打日志。
 func (t *TURNLite) refreshLoop() {
 	ticker := time.NewTicker(turnRefreshInterval)
 	defer ticker.Stop()
@@ -611,26 +616,30 @@ func (t *TURNLite) refreshLoop() {
 				log.Printf("[TURN-Lite] Refresh 失败: %v", err)
 				continue
 			}
-			// ★ 438 Stale Nonce：更新 nonce 后重试一次
-			if resp.msgType != msgRefreshSuccess {
-				code := parseErrorCode(resp.attrs[attrErrorCode])
-				if code == 438 {
-					newNonce := resp.attrs[attrNonce]
-					if len(newNonce) > 0 {
-						t.mu.Lock()
-						t.nonce = newNonce
-						t.mu.Unlock()
-						log.Printf("[TURN-Lite] 438 刷新 nonce，重试 Refresh")
-						_, err2 := t.sendRequest(msgRefreshRequest, []stunAttr{
-							{typ: attrLifetime, value: uint32ToBytes(turnDefaultLifetime)},
-						}, true)
-						if err2 != nil {
-							log.Printf("[TURN-Lite] 438 重试失败: %v", err2)
-						}
+			if resp.msgType == msgRefreshSuccess {
+				continue
+			}
+
+			code := parseErrorCode(resp.attrs[attrErrorCode])
+			if code == 438 {
+				// ★ 438 Stale Nonce：更新 nonce 后静默重试
+				newNonce := resp.attrs[attrNonce]
+				if len(newNonce) > 0 {
+					t.mu.Lock()
+					t.nonce = newNonce
+					t.mu.Unlock()
+					_, err2 := t.sendRequest(msgRefreshRequest, []stunAttr{
+						{typ: attrLifetime, value: uint32ToBytes(turnDefaultLifetime)},
+					}, true)
+					if err2 != nil {
+						log.Printf("[TURN-Lite] 438 重试失败: %v", err2)
 					}
+					// 成功则静默
 				} else {
-					log.Printf("[TURN-Lite] Refresh 被拒: code=%d", code)
+					log.Printf("[TURN-Lite] 438 但响应无 nonce")
 				}
+			} else {
+				log.Printf("[TURN-Lite] Refresh 被拒: code=%d", code)
 			}
 		}
 	}
