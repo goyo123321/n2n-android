@@ -4,6 +4,7 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/pion/stun/v2"
@@ -17,21 +18,15 @@ type NATMetadata struct {
 	RegularPortsChange bool
 	Behavior           string
 	AssistedSockets    []string
-	MultiExit          bool // ★ 新增
+	MultiExit          bool
 }
 
-// ★ 硬编码 STUN IP：不依赖 DNS，纯 VPN 场景也能工作。
-//
-// 这些都是长期稳定的 anycast IP：
-//   - 74.125.250.129 / 74.125.204.127 → stun.l.google.com (anycast)
-//   - 162.159.207.0                   → stun.cloudflare.com
 var stunServersHardcoded = []string{
 	"74.125.250.129:19302",
 	"74.125.204.127:19302",
 	"162.159.207.0:3478",
 }
 
-// ★ 域名兜底：IP 全部失败后才尝试（需 DNS 可用）
 var stunServersDomain = []string{
 	"stun.l.google.com:19302",
 	"stun.cloudflare.com:3478",
@@ -40,7 +35,6 @@ var stunServersDomain = []string{
 	"stun.hitv.com:3478",
 }
 
-// 至少需要几个成功样本才能判断 NAT 类型
 const minStunSamples = 2
 
 type natProbeResult struct {
@@ -48,8 +42,6 @@ type natProbeResult struct {
 	port int
 }
 
-// probeNATWithConn 用已有的 PacketConn（protected）做 STUN 探测
-// 不关闭 conn，由调用方管理生命周期
 func probeNATWithConn(conn net.PacketConn, stunServers []string) *NATMetadata {
 	meta := &NATMetadata{
 		P2PEndpoint: "",
@@ -62,16 +54,36 @@ func probeNATWithConn(conn net.PacketConn, stunServers []string) *NATMetadata {
 		return probeNAT(0, stunServers)
 	}
 
-	// 取本地端口，用于 localLANAddrs
 	if la := conn.LocalAddr(); la != nil {
 		if ua, ok := la.(*net.UDPAddr); ok {
 			meta.AssistedSockets = localLANAddrs(ua.Port)
 		}
 	}
 
-	// 决定要探测的 server 列表：
-	// - 外部传入优先
-	// - 否则 IP 列表 → 域名列表
+	// ★ 探测完成后记录 socket 绑定到的本地 IP（多出口设备可能有多个）
+	defer func() {
+		if la := conn.LocalAddr(); la != nil {
+			if ua, ok := la.(*net.UDPAddr); ok {
+				ip := ua.IP.String()
+				if ip != "0.0.0.0" && ip != "" && ip != "::" {
+					existing := false
+					portSuffix := ":" + strconv.Itoa(ua.Port)
+					for _, s := range meta.AssistedSockets {
+						if strings.HasSuffix(s, portSuffix) && strings.HasPrefix(s, ip+":") {
+							existing = true
+							break
+						}
+					}
+					if !existing {
+						meta.AssistedSockets = append(meta.AssistedSockets,
+							net.JoinHostPort(ip, strconv.Itoa(ua.Port)))
+						log.Printf("[NAT] socket 探测后本地出口: %s", ip)
+					}
+				}
+			}
+		}
+	}()
+
 	servers := stunServers
 	if len(servers) == 0 {
 		servers = append(servers, stunServersHardcoded...)
@@ -89,15 +101,12 @@ func probeNATWithConn(conn net.PacketConn, stunServers []string) *NATMetadata {
 	return meta
 }
 
-// probeConn 遍历 servers，收集成功结果。
-// 在拿到 minStunSamples 个样本后提前退出，避免每次都等满超时。
 func probeConn(conn net.PacketConn, servers []string) []natProbeResult {
 	var results []natProbeResult
 
 	for _, server := range servers {
 		serverAddr, err := net.ResolveUDPAddr("udp4", server)
 		if err != nil {
-			// DNS 失败或 IP 非法，直接跳过
 			continue
 		}
 
@@ -111,8 +120,6 @@ func probeConn(conn net.PacketConn, servers []string) []natProbeResult {
 		buf := make([]byte, 1500)
 		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 
-		// ★ 循环读，直到拿到属于本次事务的响应或超时
-		//   （防止收到其它 socket 的陈旧数据）
 		deadline := time.Now().Add(2 * time.Second)
 		for {
 			remaining := time.Until(deadline)
@@ -127,7 +134,6 @@ func probeConn(conn net.PacketConn, servers []string) []natProbeResult {
 				log.Printf("[NAT] STUN %s 超时", server)
 				break
 			}
-			// 只接受来自目标服务器的响应
 			if from != nil && !sameUDPAddr(from, serverAddr) {
 				continue
 			}
@@ -154,7 +160,6 @@ func probeConn(conn net.PacketConn, servers []string) []natProbeResult {
 			break
 		}
 
-		// 拿到足够样本就提前退出
 		if len(results) >= minStunSamples {
 			break
 		}
@@ -167,7 +172,7 @@ func sameUDPAddr(a, b net.Addr) bool {
 	ua, ok1 := a.(*net.UDPAddr)
 	ub, ok2 := b.(*net.UDPAddr)
 	if !ok1 || !ok2 {
-		return true // 拿不到强类型就不校验
+		return true
 	}
 	return ua.IP.Equal(ub.IP) && ua.Port == ub.Port
 }
@@ -194,7 +199,6 @@ func fillNATMetadata(meta *NATMetadata, results []natProbeResult) {
 		meta.PortsDifference = abs(results[0].port - results[1].port)
 		meta.RegularPortsChange = true
 	} else {
-		// 只拿到一个样本，保守判为 EasyNAT（后续用 p2p 打洞结果学习）
 		meta.NATType = "EasyNAT"
 		meta.Behavior = "BehaviorNoChange"
 	}
@@ -202,7 +206,6 @@ func fillNATMetadata(meta *NATMetadata, results []natProbeResult) {
 	log.Printf("[NAT] %s pub=%s", meta.NATType, meta.PublicEndpoint)
 }
 
-// probeNAT 原方法（非 protected socket，回退用）
 func probeNAT(localUDPPort int, stunServers []string) *NATMetadata {
 	meta := &NATMetadata{
 		P2PEndpoint:     "",
