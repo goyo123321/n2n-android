@@ -7,7 +7,6 @@ import (
 	"crypto/sha1"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"sync"
@@ -522,47 +521,7 @@ func (t *TURNLite) readLoopTCP() {
 	}
 }
 
-func readTCPPacket(conn net.Conn) ([]byte, error) {
-	header := make([]byte, 4)
-	if _, err := io.ReadFull(conn, header); err != nil {
-		return nil, err
-	}
-
-	if header[0]&0xC0 == 0x40 {
-		length := int(binary.BigEndian.Uint16(header[2:4]))
-		totalAfterHeader := length + ((4 - length%4) & 3)
-		body := make([]byte, totalAfterHeader)
-		if _, err := io.ReadFull(conn, body); err != nil {
-			return nil, err
-		}
-		full := make([]byte, 4+length)
-		copy(full, header)
-		copy(full[4:], body[:length])
-		return full, nil
-	}
-
-	rest := make([]byte, 16)
-	if _, err := io.ReadFull(conn, rest); err != nil {
-		return nil, err
-	}
-
-	bodyLen := int(binary.BigEndian.Uint16(header[2:4]))
-	if bodyLen > 65535-20 {
-		return nil, fmt.Errorf("非法 STUN bodyLen: %d", bodyLen)
-	}
-
-	body := make([]byte, bodyLen)
-	if bodyLen > 0 {
-		if _, err := io.ReadFull(conn, body); err != nil {
-			return nil, err
-		}
-	}
-	full := make([]byte, 20+bodyLen)
-	copy(full, header)
-	copy(full[4:], rest)
-	copy(full[20:], body)
-	return full, nil
-}
+// ★ readTCPPacket 定义在 turn_lite_tcp.go（按文件名归属）
 
 func (t *TURNLite) handleIncoming(data []byte) {
 	if len(data) < 4 {
