@@ -50,29 +50,25 @@ func (rm *RelayManager) MarkP2P(peerId string) {
 
 // MarkFallback P2P 失败时降级。
 //
-// ★ 关键修复（补充）：
-//   - P2P 已建立时不允许降级
-//   - peer 最近 3 秒收到过对端 UDP 包时，跳过降级（时序问题）
+// ★ P2P 已建立 → 不降级（避免状态抖动）
+// ★ 最近 3 秒收到过对端 UDP 包 → 跳过降级（时序问题）
+// 优先 TURN，TURN 不可用则 WS。
 func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.mu.Lock()
 
-	// P2P 已建立 → 不可降级
 	if rm.states[peerId] == ConnP2P {
 		rm.mu.Unlock()
 		rm.cancelFallbackTimer(peerId)
 		log.Printf("[连接] %s 已 P2P，忽略 MarkFallback", peerId)
 		return
 	}
-
 	if rm.states[peerId] == ConnTURN || rm.states[peerId] == ConnRelay {
 		rm.mu.Unlock()
 		rm.cancelFallbackTimer(peerId)
 		return
 	}
-
 	rm.mu.Unlock()
 
-	// ★ 检查最近是否收到过对端 UDP 包
 	if rm.edge != nil {
 		rm.edge.peersMu.RLock()
 		p, ok := rm.edge.peers[peerId]
@@ -94,7 +90,6 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
-	// 再次检查（防止 unlock 期间状态变化）
 	if rm.states[peerId] == ConnP2P {
 		rm.cancelFallbackTimer(peerId)
 		return
@@ -106,28 +101,14 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 
 	if rm.turnClient != nil && rm.turnClient.IsReady() {
 		rm.states[peerId] = ConnTURN
-		log.Printf("[连接] %s → TURN 中继", peerId)
+		log.Printf("[连接] %s → TURN 中继 (%s)", peerId, rm.turnClient.GetRelayAddr())
 		rm.cancelFallbackTimer(peerId)
 		return
 	}
 
 	rm.states[peerId] = ConnRelay
-	log.Printf("[连接] %s → WS 中继（TURN 未就绪，5s 内 TURN 就绪则自动升级）", peerId)
-
+	log.Printf("[连接] %s → WS 中继 (TURN 未就绪，最后兜底)", peerId)
 	rm.cancelFallbackTimer(peerId)
-
-	safeGo("relay-upgrade-retry", func() {
-		time.Sleep(5 * time.Second)
-		rm.mu.Lock()
-		defer rm.mu.Unlock()
-		if rm.states[peerId] != ConnRelay {
-			return
-		}
-		if rm.turnClient != nil && rm.turnClient.IsReady() {
-			rm.states[peerId] = ConnTURN
-			log.Printf("[连接] %s → TURN 中继（延迟升级）", peerId)
-		}
-	})
 }
 
 func (rm *RelayManager) cancelFallbackTimer(peerID string) {
@@ -143,11 +124,13 @@ func (rm *RelayManager) UpgradeRelaysToTURN() {
 	if rm.turnClient == nil || !rm.turnClient.IsReady() {
 		return
 	}
+	relayAddr := rm.turnClient.GetRelayAddr()
 	upgraded := 0
 	for peerId, state := range rm.states {
 		if state == ConnRelay {
 			rm.states[peerId] = ConnTURN
 			upgraded++
+			log.Printf("[连接] %s → TURN 中继 (延迟升级, %s)", peerId, relayAddr)
 		}
 	}
 	if upgraded > 0 {
@@ -186,6 +169,9 @@ func (rm *RelayManager) GetState(peerId string) ConnType {
 	return ConnUnknown
 }
 
+// SendToPeer 三级降级：P2P → TURN → WS。
+//
+// ★ 修复：TURN 发送失败时，日志打的是内层 err，而不是外层的 nil。
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
 	state := rm.GetState(peerId)
 
@@ -196,19 +182,39 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 			if err == nil {
 				return true
 			}
-			log.Printf("[P2P] UDP 发送到 %s 失败: %v", peerId, err)
+			log.Printf("[P2P] UDP 发送到 %s 失败: %v，降级到 WS", peerId, err)
+			rm.MarkFallback(peerId)
+		} else {
+			rm.MarkFallback(peerId)
 		}
-		return false
+		if rm.ws == nil {
+			return false
+		}
+		return rm.ws.SendBinary(data) == nil
 
 	case ConnTURN:
 		if target != nil && target.TurnRelayAddr != "" && rm.turnClient != nil {
 			relayAddr, err := net.ResolveUDPAddr("udp", target.TurnRelayAddr)
 			if err == nil {
-				if err := rm.turnClient.Send(data, relayAddr); err == nil {
+				// ★ 修复：内层 err 用独立变量名，避免 log 打 nil
+				if sendErr := rm.turnClient.Send(data, relayAddr); sendErr == nil {
 					return true
+				} else {
+					log.Printf("[TURN] 发送到 %s 失败: %v", peerId, sendErr)
 				}
-				log.Printf("[TURN] 发送到 %s 失败: %v", peerId, err)
+			} else {
+				log.Printf("[TURN] 解析中继地址 %q 失败: %v", target.TurnRelayAddr, err)
 			}
+		} else {
+			log.Printf("[TURN] 前置条件不满足 peer=%s target=%v relay=%q client=%v",
+				peerId, target != nil,
+				func() string {
+					if target != nil {
+						return target.TurnRelayAddr
+					}
+					return ""
+				}(),
+				rm.turnClient != nil)
 		}
 		rm.DowngradeToWS(peerId, "send failed")
 		if rm.ws == nil {
