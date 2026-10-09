@@ -21,7 +21,6 @@ type Config struct {
 	PreferredPort int
 }
 
-// Protector 由 Kotlin 侧实现，调用 VpnService.protect(fd)
 type Protector interface {
 	Protect(fd int) bool
 }
@@ -58,15 +57,23 @@ func (c *Client) SetStunFD(fd int) {
 	c.stunFd = fd
 }
 
+// SetProtector 注册 VpnService.protect 桥。p == nil 时注销。
 func (c *Client) SetProtector(p Protector) {
 	c.mu.Lock()
 	c.protector = p
 	c.mu.Unlock()
 
-	internal.SetProtector(func(fd int) bool {
+	if p == nil {
+		log.Printf("[mobile] SetProtector: 传入 nil，注销 protector")
+		internal.SetProtector(nil)
+		return
+	}
+
+	internal.SetProtector(func(fd int) (ok bool) {
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("[protector] panic: %v", r)
+				log.Printf("[protector] panic: %v\n%s", r, debug.Stack())
+				ok = false
 			}
 		}()
 		return p.Protect(fd)
@@ -80,6 +87,11 @@ func (c *Client) FetchVirtualIP(cfg *Config) (result string) {
 			result = ""
 		}
 	}()
+
+	if cfg == nil {
+		log.Printf("[mobile] FetchVirtualIP: cfg == nil")
+		return ""
+	}
 
 	icfg := &internal.Config{
 		SignalingURL: cfg.SignalingURL, RoomID: cfg.RoomID,
@@ -98,12 +110,16 @@ func (c *Client) Start(cfg *Config) (errMsg string) {
 		}
 	}()
 
+	if cfg == nil {
+		return "cfg is nil"
+	}
+
 	c.mu.Lock()
 	if c.running {
 		c.mu.Unlock()
 		return "already running"
 	}
-	if c.tunFd <= 0 {
+	if c.tunFd < 0 {
 		c.mu.Unlock()
 		return "tun fd not set"
 	}
@@ -135,6 +151,11 @@ func (c *Client) Start(cfg *Config) (errMsg string) {
 	c.mu.Unlock()
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[mobile] vip-poll panic: %v\n%s", r, debug.Stack())
+			}
+		}()
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 		for {
@@ -208,8 +229,6 @@ func (c *Client) GetPeersJSON() string {
 	}
 	return edge.GetPeersJSON()
 }
-
-// ============ 日志（package-level 静态方法）============
 
 func GetLogs() string {
 	return internal.GetLogs()
