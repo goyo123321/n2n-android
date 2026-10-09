@@ -65,13 +65,16 @@ type Edge struct {
 	fallbackTimers   map[string]*time.Timer
 	fallbackTimersMu sync.Mutex
 
+	// ★ 日志节流：同一 dstIP 每 5 秒最多打一次"无匹配 peer"
+	lastNoPeerLog   map[string]int64
+	lastNoPeerLogMu sync.Mutex
+
 	doneCh  chan struct{}
 	closeMu sync.Mutex
 	closed  bool
 	mu      sync.Mutex
 }
 
-// safeGo 在 goroutine 里执行 fn，panic 时只记录日志，不让整个进程崩溃。
 func safeGo(name string, fn func()) {
 	go func() {
 		defer func() {
@@ -116,36 +119,24 @@ func generateDefaultClientID() string {
 
 // ============ UDP 保活 ============
 
-// keepaliveInterval UDP 保活间隔。
-//
-// CGNAT 的 UDP 映射 TTL 通常 30 秒~几分钟。空闲超时后映射被回收，
-// 从同一 socket 出去的包会被分给新端口——这就是为什么"上报的 pubSocket
-// 端口"和"打洞时实际端口"会差 840。
-//
-// 每 5 秒刷一次，确保映射持续活跃。
 const keepaliveInterval = 5 * time.Second
 
-// keepaliveServers 保活用的 STUN 服务器（硬编码 IP，不依赖 DNS）。
 var keepaliveServers = []string{
-	"74.125.250.129:19302", // stun.l.google.com (anycast)
-	"162.159.207.0:3478",   // stun.cloudflare.com
-	"74.125.204.127:19302", // stun.l.google.com 备用
+	"74.125.250.129:19302",
+	"162.159.207.0:3478",
+	"74.125.204.127:19302",
 }
 
-// buildSTUNBindingRequest 构造一个 20 字节的 STUN Binding Request。
-//
-// 保活只需要"出方向的包"让 CGNAT 刷新映射，不需要读响应。
-// 响应会被 udpReadLoop 收到并丢弃。
 func buildSTUNBindingRequest() []byte {
 	buf := make([]byte, 20)
 	buf[0] = 0x00
-	buf[1] = 0x01 // Binding Request
+	buf[1] = 0x01
 	buf[2] = 0x00
-	buf[3] = 0x00 // no attributes
+	buf[3] = 0x00
 	buf[4] = 0x21
 	buf[5] = 0x12
 	buf[6] = 0xA4
-	buf[7] = 0x42 // magic cookie
+	buf[7] = 0x42
 	if _, err := rand.Read(buf[8:20]); err != nil {
 		binary.BigEndian.PutUint64(buf[8:16], uint64(time.Now().UnixNano()))
 	}
@@ -154,8 +145,8 @@ func buildSTUNBindingRequest() []byte {
 
 // startKeepalive 启动 UDP 保活协程。
 //
-// ★ 必须用 e.udpConn（P2P 打洞用的那个 socket），
-//   而不是新建一个 socket —— 只有同一个 socket 的映射才需要保活。
+// ★ 条件触发：只有在 e.peers 非空时才发 STUN binding request。
+//   无 peer 时静默跳过，避免"一端离线还在发心跳"。
 func (e *Edge) startKeepalive() {
 	if e.udpConn == nil {
 		return
@@ -172,13 +163,25 @@ func (e *Edge) startKeepalive() {
 		return
 	}
 
-	log.Printf("[Keepalive] 启动，每 %v 刷新 %d 个 STUN 服务器", keepaliveInterval, len(addrs))
+	log.Printf("[Keepalive] 启动（条件触发），每 %v 刷新 %d 个 STUN 服务器（仅在有 peer 时）",
+		keepaliveInterval, len(addrs))
 
 	safeGo("keepalive", func() {
-		// ★ 启动立即发一次
-		for _, addr := range addrs {
-			probe := buildSTUNBindingRequest()
-			_, _ = e.udpConn.WriteTo(probe, addr)
+		sendOnce := func() {
+			for _, addr := range addrs {
+				probe := buildSTUNBindingRequest()
+				_, _ = e.udpConn.WriteTo(probe, addr)
+			}
+		}
+
+		hasPeers := func() bool {
+			e.peersMu.RLock()
+			defer e.peersMu.RUnlock()
+			return len(e.peers) > 0
+		}
+
+		if hasPeers() {
+			sendOnce()
 		}
 
 		ticker := time.NewTicker(keepaliveInterval)
@@ -189,15 +192,32 @@ func (e *Edge) startKeepalive() {
 				log.Printf("[Keepalive] 已停止")
 				return
 			case <-ticker.C:
-				for _, addr := range addrs {
-					probe := buildSTUNBindingRequest()
-					if _, err := e.udpConn.WriteTo(probe, addr); err != nil {
-						continue
-					}
+				if !hasPeers() {
+					continue
 				}
+				sendOnce()
 			}
 		}
 	})
+}
+
+// ============ 日志节流 ============
+
+// logNoPeerThrottled 节流"无匹配 peer"日志。
+//
+// 对端离线后，Termux 的 ping 会持续发包，每秒刷一行。
+// 同一 dstIP 每 5 秒只打一次。
+func (e *Edge) logNoPeerThrottled(dstIP string, n int) {
+	now := time.Now().UnixMilli()
+	e.lastNoPeerLogMu.Lock()
+	last := e.lastNoPeerLog[dstIP]
+	if now-last < 5000 {
+		e.lastNoPeerLogMu.Unlock()
+		return
+	}
+	e.lastNoPeerLog[dstIP] = now
+	e.lastNoPeerLogMu.Unlock()
+	log.Printf("[TUN] 无匹配 peer，dst=%s len=%d", dstIP, n)
 }
 
 // ============ 主流程 ============
@@ -270,6 +290,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		myLanIPs:       lanIPs,
 		peers:          make(map[string]*PeerInfo),
 		fallbackTimers: make(map[string]*time.Timer),
+		lastNoPeerLog:  make(map[string]int64),
 		tunWriteCh:     make(chan []byte, 4096),
 		doneCh:         make(chan struct{}),
 		natMeta: &NATMetadata{
@@ -279,14 +300,12 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	}
 	log.Printf("[LAN] 本机局域网 IP: %v", e.myLanIPs)
 
-	// 1. TUN
 	tun, err := setupTUNFromFD(tunFd)
 	if err != nil {
 		return nil, fmt.Errorf("包装 TUN fd 失败: %w", err)
 	}
 	e.tun = tun
 
-	// 2. UDP
 	var udpConn net.PacketConn
 	if udpFd > 0 {
 		file := os.NewFile(uintptr(udpFd), "protected-udp")
@@ -320,7 +339,6 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	}
 	log.Printf("[P2P] UDP 监听端口 %d", e.udpPort)
 
-	// 3. STUN socket
 	var stunConn net.PacketConn
 	if stunFd > 0 {
 		file := os.NewFile(uintptr(stunFd), "protected-stun")
@@ -339,7 +357,6 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		log.Printf("[NAT] 无 protected STUN socket，STUN 探测可能失败")
 	}
 
-	// 4. 信令
 	ws, err := NewWSTransport(
 		cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken,
 		cfg.PreferredIP, cfg.PreferredPort,
@@ -371,17 +388,14 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		log.Printf("[LAN] ⚠️ 无法获取任何局域网 IP")
 	}
 
-	// 5. TURN
 	e.turnClient = NewTURNClient(cfg.SignalingURL, cfg.ConnectToken, e)
 	e.turnClient.onMessage = func(data []byte, addr net.Addr) {
 		e.onRemotePacket(data)
 	}
 
-	// 6. 中继
 	e.relayMgr = NewRelayManager(ws, e.turnClient, e)
 	e.relayMgr.Report(10 * time.Second)
 
-	// 7. 回调
 	ws.SetHandlers(
 		e.handleSignaling,
 		func(data []byte) {
@@ -389,15 +403,12 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		},
 	)
 
-	// 8. 后台协程
 	safeGo("udpReadLoop", e.udpReadLoop)
 	safeGo("tunWriteLoop", e.tunWriteLoop)
 	safeGo("tunReadLoop", e.tunReadLoop)
 
-	// ★ 启动 UDP 保活（保持 CGNAT 映射新鲜）
 	e.startKeepalive()
 
-	// 9. NAT 探测
 	safeGo("nat-probe", func() {
 		log.Printf("[NAT] 开始异步 STUN 探测...")
 		var meta *NATMetadata
@@ -444,7 +455,6 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		}
 	})
 
-	// 10. TURN 异步初始化
 	safeGo("turn-init", func() {
 		time.Sleep(200 * time.Millisecond)
 		ctx, cancel := contextWithTimeout(30 * time.Second)
@@ -683,6 +693,11 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			log.Printf("[NAT-HOLE] 指令解析失败: %v", err)
 			return
 		}
+		// ★ 检查 target 是否还在线，不在就忽略
+		if !e.peerExists(instr.TargetMac) {
+			log.Printf("[NAT-HOLE] 忽略指令 target=%s（peer 不在线）", instr.TargetMac)
+			return
+		}
 		e.ensureTargetPeer(&instr)
 		e.scheduleFallbackTimer(instr.TargetMac)
 		instrCopy := instr
@@ -734,10 +749,24 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		delete(e.peers, from)
 		e.peersMu.Unlock()
 		e.cancelFallbackTimer(from)
+		// ★ 清理日志节流记录
+		e.lastNoPeerLogMu.Lock()
+		delete(e.lastNoPeerLog, from)
+		e.lastNoPeerLogMu.Unlock()
 
 	case "connection_status":
 		return
 	}
+}
+
+func (e *Edge) peerExists(peerID string) bool {
+	if peerID == "" {
+		return false
+	}
+	e.peersMu.RLock()
+	defer e.peersMu.RUnlock()
+	_, ok := e.peers[peerID]
+	return ok
 }
 
 func (e *Edge) reportMetadata() {
@@ -1018,7 +1047,6 @@ func (e *Edge) udpReadLoop() {
 			}
 			e.onRemotePacket(buf[:n])
 		}
-		// ★ STUN Binding Response（0x01 开头）落到这里，静默丢弃
 	}
 }
 
@@ -1078,7 +1106,8 @@ func (e *Edge) tunReadLoop() {
 				_ = e.ws.SendBinary(buf[:n])
 			}
 		} else {
-			log.Printf("[TUN] 无匹配 peer，dst=%s len=%d", dstIP, n)
+			// ★ 节流：同一 dstIP 每 5 秒最多一次
+			e.logNoPeerThrottled(dstIP, n)
 		}
 	}
 }
@@ -1172,7 +1201,6 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool) {
 		}
 		return
 	}
-
 	if state != ConnP2P {
 		log.Printf("[P2P] 从 %s (%s) 收到打洞探测，UDP 通道可用，升级为 P2P", clientID, ip)
 		e.relayMgr.MarkP2P(clientID)
