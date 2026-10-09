@@ -124,41 +124,51 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		len(instr.TargetLanEndpoints),
 	)
 
-	var targets []*net.UDPAddr
-	var candidateIPs []net.IP
+	// === 分类目标 ===
+	var lanTargets []*net.UDPAddr
+	var publicTargets []*net.UDPAddr
+	var lanIPs []net.IP
+	var publicIPs []net.IP
 
+	// 1. LAN endpoints（优先）
 	for _, ep := range instr.TargetLanEndpoints {
 		if addr := parseSockAddr(ep); addr != nil {
-			targets = append(targets, addr)
-			candidateIPs = append(candidateIPs, addr.IP)
+			lanTargets = append(lanTargets, addr)
+			lanIPs = append(lanIPs, addr.IP)
 		}
 	}
-	if len(targets) > 0 {
-		log.Printf("[NAT-HOLE] LAN 候选 %d 个（优先尝试）", len(targets))
-	}
 
+	// 2. assisted endpoints
 	for _, ep := range instr.TargetAssistedEndpoints {
 		if addr := parseSockAddr(ep); addr != nil {
-			targets = append(targets, addr)
-			candidateIPs = append(candidateIPs, addr.IP)
+			publicTargets = append(publicTargets, addr)
+			publicIPs = append(publicIPs, addr.IP)
 		}
 	}
 
+	// 3. 端口扫描范围 或 单点
 	if instr.PortsRangeFrom > 0 && instr.PortsRangeTo >= instr.PortsRangeFrom {
 		count := int(instr.PortsRangeTo - instr.PortsRangeFrom + 1)
 		if count > 100 {
 			count = 100
 		}
 		for i := 0; i < count; i++ {
-			targets = append(targets, &net.UDPAddr{
+			publicTargets = append(publicTargets, &net.UDPAddr{
 				IP:   targetAddr.IP,
 				Port: int(instr.PortsRangeFrom) + i,
 			})
 		}
 	} else {
-		targets = append(targets, targetAddr)
+		publicTargets = append(publicTargets, targetAddr)
 	}
-	candidateIPs = append(candidateIPs, targetAddr.IP)
+	publicIPs = append(publicIPs, targetAddr.IP)
+
+	if len(lanTargets) > 0 {
+		log.Printf("[NAT-HOLE] LAN 候选 %d 个（阶段 1）", len(lanTargets))
+	}
+	if len(publicTargets) > 0 {
+		log.Printf("[NAT-HOLE] 公网候选 %d 个（阶段 2）", len(publicTargets))
+	}
 
 	if instr.Role == 0 && instr.SendDelayMs > 0 {
 		time.Sleep(time.Duration(instr.SendDelayMs) * time.Millisecond)
@@ -167,42 +177,55 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 	probe := buildPunchProbe(e.virtualIP)
 	var attempts uint32
 
-	const rounds = 5
-	const roundInterval = 200 * time.Millisecond
-
-	for round := 0; round < rounds; round++ {
-		for _, t := range targets {
-			if _, err := e.udpConn.WriteTo(probe, t); err == nil {
-				attempts++
-			}
-		}
-		// ★ 用 hasTrafficFromAny（不再要求 hasRealData）
-		if e.hasTrafficFromAny(candidateIPs, startAt) {
-			res.State = PunchStateSucceeded
-			res.Attempts = attempts
-			res.Detail = "收到对端 UDP 探测"
-
-			e.peersMu.Lock()
-			if p, ok := e.peers[instr.TargetMac]; ok {
-				p.UDPAddr = targetAddr
-				p.lastRecvAt = time.Now().UnixMilli()
-			} else {
-				e.peers[instr.TargetMac] = &PeerInfo{
-					ClientID:   instr.TargetMac,
-					VirtualIP:  instr.TargetVirtualIp,
-					UDPAddr:    targetAddr,
-					lastRecvAt: time.Now().UnixMilli(),
+	// === 阶段 1：LAN 候选，100ms 间隔，最多 3 轮 ===
+	// LAN 延迟 <5ms，不需要长间隔。
+	if len(lanTargets) > 0 {
+		const lanRounds = 3
+		const lanInterval = 100 * time.Millisecond
+		for i := 0; i < lanRounds; i++ {
+			for _, t := range lanTargets {
+				if _, err := e.udpConn.WriteTo(probe, t); err == nil {
+					attempts++
 				}
 			}
-			e.peersMu.Unlock()
-
-			log.Printf(
-				"[NAT-HOLE] ✅ 成功 role=%d target=%s attempts=%d",
-				instr.Role, targetAddr.IP, attempts,
-			)
-			return res
+			if e.hasTrafficFromAny(lanIPs, startAt) {
+				res.State = PunchStateSucceeded
+				res.Attempts = attempts
+				res.Detail = "LAN 直连成功"
+				e.recordP2PSuccess(instr, targetAddr)
+				log.Printf(
+					"[NAT-HOLE] ✅ 成功 (LAN) role=%d target=%s attempts=%d",
+					instr.Role, targetAddr.IP, attempts,
+				)
+				return res
+			}
+			time.Sleep(lanInterval)
 		}
-		time.Sleep(roundInterval)
+	}
+
+	// === 阶段 2：公网端口扫描，200ms 间隔，最多 5 轮 ===
+	if len(publicTargets) > 0 {
+		const pubRounds = 5
+		const pubInterval = 200 * time.Millisecond
+		for round := 0; round < pubRounds; round++ {
+			for _, t := range publicTargets {
+				if _, err := e.udpConn.WriteTo(probe, t); err == nil {
+					attempts++
+				}
+			}
+			if e.hasTrafficFromAny(publicIPs, startAt) {
+				res.State = PunchStateSucceeded
+				res.Attempts = attempts
+				res.Detail = "公网端口扫描成功"
+				e.recordP2PSuccess(instr, targetAddr)
+				log.Printf(
+					"[NAT-HOLE] ✅ 成功 (公网) role=%d target=%s attempts=%d",
+					instr.Role, targetAddr.IP, attempts,
+				)
+				return res
+			}
+			time.Sleep(pubInterval)
+		}
 	}
 
 	res.State = PunchStateFailed
@@ -213,6 +236,23 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		instr.Role, targetAddr.IP, attempts,
 	)
 	return res
+}
+
+// recordP2PSuccess 打洞成功后记录 peer 的 UDP 地址。
+func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAddr) {
+	e.peersMu.Lock()
+	if p, ok := e.peers[instr.TargetMac]; ok {
+		p.UDPAddr = targetAddr
+		p.lastRecvAt = time.Now().UnixMilli()
+	} else {
+		e.peers[instr.TargetMac] = &PeerInfo{
+			ClientID:   instr.TargetMac,
+			VirtualIP:  instr.TargetVirtualIp,
+			UDPAddr:    targetAddr,
+			lastRecvAt: time.Now().UnixMilli(),
+		}
+	}
+	e.peersMu.Unlock()
 }
 
 func (e *Edge) reportInProgress(instr *NatHoleInstruction) {
