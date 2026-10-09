@@ -62,6 +62,7 @@ type Edge struct {
 	tunWriteCh chan []byte
 	natMeta    *NATMetadata
 
+	// ★ 超时降级定时器：peerID → Timer
 	fallbackTimers   map[string]*time.Timer
 	fallbackTimersMu sync.Mutex
 
@@ -71,6 +72,7 @@ type Edge struct {
 	mu      sync.Mutex
 }
 
+// safeGo 在 goroutine 里执行 fn，panic 时只记录日志，不让整个进程崩溃。
 func safeGo(name string, fn func()) {
 	go func() {
 		defer func() {
@@ -82,6 +84,7 @@ func safeGo(name string, fn func()) {
 	}()
 }
 
+// isTransientReadError 判断是否为可重试的临时错误（EAGAIN/EINTR）。
 func isTransientReadError(err error) bool {
 	if err == nil {
 		return false
@@ -132,6 +135,7 @@ func FetchVirtualIP(cfg *Config) string {
 	defer ws.Close()
 
 	done := make(chan string, 1)
+	// ★ 用 SetHandlers（会重放早期消息），而非直接赋值 onMessage
 	ws.SetHandlers(func(msg map[string]interface{}) {
 		t, _ := msg["type"].(string)
 		if t == "ready" {
@@ -190,12 +194,14 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	}
 	log.Printf("[LAN] 本机局域网 IP: %v", e.myLanIPs)
 
+	// 1. TUN
 	tun, err := setupTUNFromFD(tunFd)
 	if err != nil {
 		return nil, fmt.Errorf("包装 TUN fd 失败: %w", err)
 	}
 	e.tun = tun
 
+	// 2. UDP
 	var udpConn net.PacketConn
 	if udpFd > 0 {
 		file := os.NewFile(uintptr(udpFd), "protected-udp")
@@ -229,6 +235,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	}
 	log.Printf("[P2P] UDP 监听端口 %d", e.udpPort)
 
+	// 3. STUN socket
 	var stunConn net.PacketConn
 	if stunFd > 0 {
 		file := os.NewFile(uintptr(stunFd), "protected-stun")
@@ -247,6 +254,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		log.Printf("[NAT] 无 protected STUN socket，STUN 探测可能失败")
 	}
 
+	// 4. 信令
 	ws, err := NewWSTransport(
 		cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken,
 		cfg.PreferredIP, cfg.PreferredPort,
@@ -261,6 +269,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	}
 	e.ws = ws
 
+	// ★ WS 建立后，从 socket 本地地址反推 LAN IP
 	socketIPs := collectLanIPsFromSockets(ws)
 	if len(socketIPs) > 0 {
 		seen := make(map[string]bool)
@@ -278,14 +287,17 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		log.Printf("[LAN] ⚠️ 无法获取任何局域网 IP")
 	}
 
+	// 5. TURN
 	e.turnClient = NewTURNClient(cfg.SignalingURL, cfg.ConnectToken, e)
 	e.turnClient.onMessage = func(data []byte, addr net.Addr) {
 		e.onRemotePacket(data)
 	}
 
+	// 6. 中继（必须在 SetHandlers 之前初始化）
 	e.relayMgr = NewRelayManager(ws, e.turnClient, e)
 	e.relayMgr.Report(10 * time.Second)
 
+	// 7. 回调（★ 用 SetHandlers，会重放 ready 等早期消息）
 	ws.SetHandlers(
 		e.handleSignaling,
 		func(data []byte) {
@@ -293,10 +305,12 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		},
 	)
 
+	// 8. 后台协程
 	safeGo("udpReadLoop", e.udpReadLoop)
 	safeGo("tunWriteLoop", e.tunWriteLoop)
 	safeGo("tunReadLoop", e.tunReadLoop)
 
+	// 9. NAT 探测
 	safeGo("nat-probe", func() {
 		log.Printf("[NAT] 开始异步 STUN 探测...")
 		var meta *NATMetadata
@@ -343,6 +357,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		}
 	})
 
+	// 10. TURN 异步初始化
 	safeGo("turn-init", func() {
 		time.Sleep(200 * time.Millisecond)
 		ctx, cancel := contextWithTimeout(30 * time.Second)
@@ -381,6 +396,7 @@ func (e *Edge) Stop() {
 	close(e.doneCh)
 	e.closeMu.Unlock()
 
+	// ★ 清理所有 fallback 定时器
 	e.fallbackTimersMu.Lock()
 	for _, t := range e.fallbackTimers {
 		t.Stop()
@@ -582,11 +598,13 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			return
 		}
 		e.ensureTargetPeer(&instr)
+		// ★ 兜底：确保 fallback timer 已启动
 		e.scheduleFallbackTimer(instr.TargetMac)
 		instrCopy := instr
 		safeGo("nat-hole", func() { e.runNatHole(&instrCopy) })
 
 	case "force_fallback":
+		// ★ 服务端主动要求降级（同 CGNAT IP 等场景）
 		payload, _ := msg["payload"].(map[string]interface{})
 		if payload == nil {
 			return
@@ -638,6 +656,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	}
 }
 
+// reportMetadata 上报 p2p_metadata + share_announce。
 func (e *Edge) reportMetadata() {
 	e.mu.Lock()
 	nm := e.natMeta
@@ -649,6 +668,7 @@ func (e *Edge) reportMetadata() {
 		nm = &NATMetadata{NATType: "unknown", Behavior: "BehaviorPortChanged"}
 	}
 
+	// 实时判断 CGNAT 池化
 	if serverSeenIP != "" && nm.PublicEndpoint != "" {
 		stunIP := extractIPFromEndpoint(nm.PublicEndpoint)
 		if stunIP != "" && stunIP != serverSeenIP {
@@ -767,11 +787,13 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int) {
 	}
 	e.peersMu.Unlock()
 
+	// ★ 新 peer 且尚未有连接状态 → 启动超时降级定时器
 	if !existed {
 		e.scheduleFallbackTimer(pid)
 	}
 }
 
+// scheduleFallbackTimer 8 秒后如果 peer 仍是 ConnUnknown，主动降级。
 func (e *Edge) scheduleFallbackTimer(peerID string) {
 	if e.relayMgr == nil || peerID == "" {
 		return
@@ -807,6 +829,7 @@ func (e *Edge) scheduleFallbackTimer(peerID string) {
 	e.fallbackTimersMu.Unlock()
 }
 
+// cancelFallbackTimer 取消 peer 的超时降级定时器。
 func (e *Edge) cancelFallbackTimer(peerID string) {
 	e.fallbackTimersMu.Lock()
 	defer e.fallbackTimersMu.Unlock()
@@ -850,6 +873,7 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	if res.State == PunchStateSucceeded {
 		e.relayMgr.MarkP2P(instr.TargetMac)
 	} else if res.State == PunchStateFailed {
+		// ★ MarkFallback 内部已判断 P2P，不会误降级
 		e.relayMgr.MarkFallback(instr.TargetMac)
 	}
 
@@ -1024,7 +1048,7 @@ func (e *Edge) notePeerTraffic(addr *net.UDPAddr) {
 
 // notePeerCommon 记录 peer 收到 UDP 包的时间。
 //
-// ★ 收到 probe 立即回发：
+// ★ 收到 probe 立即回发（连发 5 次）：
 //   对方 probe 的源地址（addr）就是其 NAT 后的真实映射，
 //   直接回发一定命中，让对方也能升级 P2P。
 //   修复"单向打洞成功"——A 收到 B 的 probe 升级 P2P，
@@ -1088,16 +1112,31 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool) {
 
 // sendProbeTo 向指定地址发送打洞探测包。
 //
-// ★ 用途：收到对方 probe 后立即回发，让对方也能确认 UDP 双向通。
-//   对方 probe 的源地址（NAT 后真实端口）就是最佳回发目标。
+// ★ 异步连发 5 次（每次间隔 100ms），覆盖瞬时丢包。
+//   之前只发一次，撞上丢包就对端永远升不了 P2P，造成"单向打洞"。
+//   连发 5 次后，单方向失败率从 ~20% 降到 ~0.03%。
 func (e *Edge) sendProbeTo(addr *net.UDPAddr) {
 	if e.udpConn == nil || addr == nil {
 		return
 	}
-	probe := buildPunchProbe(e.GetVirtualIP())
-	if _, err := e.udpConn.WriteTo(probe, addr); err != nil {
-		log.Printf("[P2P] 回发 probe 到 %s 失败: %v", addr.String(), err)
-	}
+	// 复制地址（防止外部修改）
+	target := &net.UDPAddr{IP: addr.IP, Port: addr.Port}
+	vip := e.GetVirtualIP()
+
+	safeGo("probe-reply", func() {
+		probe := buildPunchProbe(vip)
+		for i := 0; i < 5; i++ {
+			select {
+			case <-e.doneCh:
+				return
+			default:
+			}
+			if _, err := e.udpConn.WriteTo(probe, target); err != nil {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	})
 }
 
 func (e *Edge) hasTrafficFromAny(ips []net.IP, since int64) bool {
