@@ -75,6 +75,7 @@ type Edge struct {
 	mu      sync.Mutex
 }
 
+// safeGo 在 goroutine 里执行 fn，panic 时只记录日志，不让整个进程崩溃。
 func safeGo(name string, fn func()) {
 	go func() {
 		defer func() {
@@ -119,6 +120,11 @@ func generateDefaultClientID() string {
 
 // ============ UDP 保活 ============
 
+// keepaliveInterval UDP 保活间隔。
+//
+// CGNAT 的 UDP 映射 TTL 通常 30 秒~几分钟。空闲超时后映射被回收，
+// 从同一 socket 出去的包会被分给新端口——这就是为什么"上报的 pubSocket
+// 端口"和"打洞时实际端口"会差 840。
 const keepaliveInterval = 5 * time.Second
 
 var keepaliveServers = []string{
@@ -127,6 +133,7 @@ var keepaliveServers = []string{
 	"74.125.204.127:19302",
 }
 
+// buildSTUNBindingRequest 构造一个 20 字节的 STUN Binding Request。
 func buildSTUNBindingRequest() []byte {
 	buf := make([]byte, 20)
 	buf[0] = 0x00
@@ -300,12 +307,14 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	}
 	log.Printf("[LAN] 本机局域网 IP: %v", e.myLanIPs)
 
+	// 1. TUN
 	tun, err := setupTUNFromFD(tunFd)
 	if err != nil {
 		return nil, fmt.Errorf("包装 TUN fd 失败: %w", err)
 	}
 	e.tun = tun
 
+	// 2. UDP
 	var udpConn net.PacketConn
 	if udpFd > 0 {
 		file := os.NewFile(uintptr(udpFd), "protected-udp")
@@ -339,6 +348,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	}
 	log.Printf("[P2P] UDP 监听端口 %d", e.udpPort)
 
+	// 3. STUN socket
 	var stunConn net.PacketConn
 	if stunFd > 0 {
 		file := os.NewFile(uintptr(stunFd), "protected-stun")
@@ -357,6 +367,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		log.Printf("[NAT] 无 protected STUN socket，STUN 探测可能失败")
 	}
 
+	// 4. 信令
 	ws, err := NewWSTransport(
 		cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken,
 		cfg.PreferredIP, cfg.PreferredPort,
@@ -371,6 +382,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	}
 	e.ws = ws
 
+	// ★ WS 建立后，从 socket 本地地址反推 LAN IP
 	socketIPs := collectLanIPsFromSockets(ws)
 	if len(socketIPs) > 0 {
 		seen := make(map[string]bool)
@@ -388,14 +400,17 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		log.Printf("[LAN] ⚠️ 无法获取任何局域网 IP")
 	}
 
+	// 5. TURN
 	e.turnClient = NewTURNClient(cfg.SignalingURL, cfg.ConnectToken, e)
 	e.turnClient.onMessage = func(data []byte, addr net.Addr) {
 		e.onRemotePacket(data)
 	}
 
+	// 6. 中继（必须在 SetHandlers 之前初始化）
 	e.relayMgr = NewRelayManager(ws, e.turnClient, e)
 	e.relayMgr.Report(10 * time.Second)
 
+	// 7. 回调（★ 用 SetHandlers，会重放 ready 等早期消息）
 	ws.SetHandlers(
 		e.handleSignaling,
 		func(data []byte) {
@@ -403,12 +418,15 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		},
 	)
 
+	// 8. 后台协程
 	safeGo("udpReadLoop", e.udpReadLoop)
 	safeGo("tunWriteLoop", e.tunWriteLoop)
 	safeGo("tunReadLoop", e.tunReadLoop)
 
+	// ★ 启动 UDP 保活
 	e.startKeepalive()
 
+	// 9. NAT 探测
 	safeGo("nat-probe", func() {
 		log.Printf("[NAT] 开始异步 STUN 探测...")
 		var meta *NATMetadata
@@ -455,6 +473,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		}
 	})
 
+	// 10. TURN 异步初始化
 	safeGo("turn-init", func() {
 		time.Sleep(200 * time.Millisecond)
 		ctx, cancel := contextWithTimeout(30 * time.Second)
@@ -478,6 +497,9 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 			})
 		}
 	})
+
+	// ★ 11. TURN 后台重连循环（网络切换后自动重建）
+	e.turnClient.StartReconnectLoop()
 
 	log.Printf("[Edge] 已启动 clientId=%s room=%s", clientId, cfg.RoomID)
 	return e, nil
@@ -693,7 +715,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			log.Printf("[NAT-HOLE] 指令解析失败: %v", err)
 			return
 		}
-		// ★ 检查 target 是否还在线，不在就忽略
+		// ★ 检查 target 是否还在线
 		if !e.peerExists(instr.TargetMac) {
 			log.Printf("[NAT-HOLE] 忽略指令 target=%s（peer 不在线）", instr.TargetMac)
 			return
@@ -928,7 +950,10 @@ func (e *Edge) scheduleFallbackTimer(peerID string) {
 		}
 		state := e.relayMgr.GetState(peerID)
 		if state != ConnUnknown {
-			log.Printf("[fallback-timer] %s 已有状态 %s，跳过降级", peerID, state)
+			// ★ P2P 状态不打日志（正常流程）
+			if state != ConnP2P {
+				log.Printf("[fallback-timer] %s 已有状态 %s，跳过降级", peerID, state)
+			}
 			return
 		}
 		log.Printf("[fallback-timer] %s 8s 内未收到打洞指令，主动降级", peerID)
@@ -1047,6 +1072,7 @@ func (e *Edge) udpReadLoop() {
 			}
 			e.onRemotePacket(buf[:n])
 		}
+		// STUN Binding Response（0x01 开头）落到这里，静默丢弃
 	}
 }
 
@@ -1230,6 +1256,10 @@ func (e *Edge) sendProbeTo(addr *net.UDPAddr) {
 	})
 }
 
+// hasTrafficFromAny 判断候选 IP 中是否有过 UDP 包到达。
+//
+// ★ 不再要求 hasRealData：收到 probe 也算通道可用。
+// ★ 定义在 edge.go（两个文件都定义会冲突，nathole_executor.go 不再重复）。
 func (e *Edge) hasTrafficFromAny(ips []net.IP, since int64) bool {
 	if len(ips) == 0 {
 		return false
