@@ -32,19 +32,7 @@ type TURNResponse struct {
 
 // TURNClient TURN 主控。
 //
-// ★ 只做 UDP transport（RFC 5766）+ TCP transport 兜底，不做 RFC 6062。
-//   RFC 6062（TURN TCP allocation + ConnectionBind 隧道）在本项目里
-//   从未被数据面使用——旧代码分配了 allocation 却不发一字节，
-//   白占 TURN 服务器并发槽位。已删除。
-//
-//   如果将来真要加 TCP 中继路径，需要：
-//   1. 客户端两侧都做 RFC 6062 allocation
-//   2. 服务端协调下发 turnTCPConnectRequest 指令
-//   3. 一侧 DialTCP 得到 io.ReadWriteCloser
-//   4. 套 4 字节长度前缀复用现有 framer
-//   5. relay_fallback.go 加 ConnTURN-TCP 状态
-//   6. 服务端透传对端 relay addr
-//   这是一个独立功能（200+ 行 + 服务端协议扩展），不在当前范围。
+// 只做 UDP transport（RFC 5766）+ TCP transport 兜底，不做 RFC 6062。
 type TURNClient struct {
 	mu           sync.RWMutex
 	lite         *TURNLite
@@ -59,20 +47,14 @@ type TURNClient struct {
 	httpClient *http.Client
 }
 
-// NewTURNClient 创建 TURN 客户端。
-//
-// 关键：拉凭证时也走「优选 IP + SNI」，避免依赖 DNS 解析
-// （系统 DNS 指向 TUN 虚拟 IP 时，解析域名会死循环）。
 func NewTURNClient(signalingURL string, uuid string, edge *Edge) *TURNClient {
 	protectedDialer := newProtectedDialer()
 
-	// 从 signalingURL 提取 SNI host
 	var sniHost string
 	if u, err := url.Parse(signalingURL); err == nil {
 		sniHost = u.Hostname()
 	}
 
-	// 从 edge.cfg 读取优选 IP
 	var preferredAddr string
 	if edge != nil && edge.cfg != nil && edge.cfg.PreferredIP != "" {
 		host := edge.cfg.PreferredIP
@@ -91,13 +73,11 @@ func NewTURNClient(signalingURL string, uuid string, edge *Edge) *TURNClient {
 
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			// ★ 有优选 IP 就直连 IP，跳过 DNS 解析
 			if preferredAddr != "" {
 				return protectedDialer.DialContext(ctx, network, preferredAddr)
 			}
 			return protectedDialer.DialContext(ctx, network, addr)
 		},
-		// ★ 用域名做 SNI 让证书验证通过，但 TCP 层连的是 IP
 		TLSClientConfig:   &tls.Config{ServerName: sniHost},
 		ForceAttemptHTTP2: false,
 	}
@@ -114,7 +94,27 @@ func NewTURNClient(signalingURL string, uuid string, edge *Edge) *TURNClient {
 	}
 }
 
+// IsReady 检查 TURN 是否可用。
+//
+// ★ 改为检测 lite.IsAlive()，而不是 lite != nil。
+//   网络切换后 lite.Close() 把 stopped 置 true，
+//   但 tc.lite 指针仍非空，旧逻辑会误判"就绪"。
+func (tc *TURNClient) IsReady() bool {
+	tc.mu.RLock()
+	lite := tc.lite
+	tc.mu.RUnlock()
+	if lite == nil {
+		return false
+	}
+	return lite.IsAlive()
+}
+
 func (tc *TURNClient) FetchAndSetup(ctx context.Context) error {
+	// ★ 已有活着的 lite 就不重复建
+	if tc.IsReady() {
+		return nil
+	}
+
 	httpBase := tc.signalingURL
 	if strings.HasPrefix(httpBase, "wss://") {
 		httpBase = "https://" + httpBase[len("wss://"):]
@@ -164,10 +164,6 @@ func (tc *TURNClient) FetchAndSetup(ctx context.Context) error {
 	return tc.setupAllocation(ctx)
 }
 
-// setupAllocation 尝试建立 TURN allocation。
-//
-// ★ 只用 UDP transport（RFC 5766）。失败时尝试 TCP transport（同样的
-//   RFC 5766 协议但走 TCP），两者都不依赖 RFC 6062。
 func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 	tc.mu.RLock()
 	srv := tc.server
@@ -186,7 +182,6 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 	turnAddr = strings.TrimPrefix(turnAddr, "turns:")
 	turnAddr = strings.TrimPrefix(turnAddr, "//")
 
-	// ★ UDP transport（主路径）
 	log.Printf("[TURN] 尝试 UDP transport: %s", turnAddr)
 	lite := NewTURNLiteWithTCP(turnAddr, srv.Username, srv.Password, false)
 	lite.onMessage = func(data []byte, addr net.Addr) {
@@ -195,7 +190,6 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 		}
 	}
 	if err := lite.Allocate(); err != nil {
-		// ★ UDP 被运营商封时，回退到 TCP transport（同一个 TURN 服务器）
 		log.Printf("[TURN] UDP transport 失败: %v，尝试 TCP transport", err)
 		lite2 := NewTURNLiteWithTCP(turnAddr, srv.Username, srv.Password, true)
 		lite2.onMessage = func(data []byte, addr net.Addr) {
@@ -223,6 +217,53 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 	return nil
 }
 
+// StartReconnectLoop 后台重连：每 30 秒检查 lite 是否还在，不在就重建。
+//
+// 触发场景：
+//   - 网络接口切换（WiFi ↔ 4G）→ 旧 socket 绑定失效 → lite.Close()
+//   - TURN 服务器重启 → Refresh 失败 → lite.Close()
+//
+// 重建成功后重新上报 relayAddr，让服务端广播给对端。
+func (tc *TURNClient) StartReconnectLoop() {
+	safeGo("turn-reconnect", func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-tc.stopCh:
+				return
+			case <-ticker.C:
+				// 已就绪（lite 存活）就跳过
+				if tc.IsReady() {
+					continue
+				}
+
+				log.Printf("[TURN] 检测到分配失效，尝试重建")
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				err := tc.FetchAndSetup(ctx)
+				cancel()
+				if err != nil {
+					log.Printf("[TURN] 重建失败: %v（30 秒后重试）", err)
+					continue
+				}
+
+				log.Printf("[TURN] ✅ 重建成功: %s", tc.GetRelayAddr())
+
+				if tc.edge != nil && tc.edge.ws != nil {
+					_ = tc.edge.ws.Send(map[string]interface{}{
+						"type":      "turn_relay_info",
+						"relayAddr": tc.GetRelayAddr(),
+					})
+				}
+
+				if tc.edge != nil && tc.edge.relayMgr != nil {
+					tc.edge.relayMgr.UpgradeRelaysToTURN()
+				}
+			}
+		}
+	})
+}
+
 func (tc *TURNClient) Send(data []byte, remoteAddr net.Addr) error {
 	tc.mu.RLock()
 	lite := tc.lite
@@ -244,12 +285,6 @@ func (tc *TURNClient) GetRelayAddr() string {
 		return ""
 	}
 	return tc.relayAddr.String()
-}
-
-func (tc *TURNClient) IsReady() bool {
-	tc.mu.RLock()
-	defer tc.mu.RUnlock()
-	return tc.lite != nil
 }
 
 func (tc *TURNClient) Close() {
