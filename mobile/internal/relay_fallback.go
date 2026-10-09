@@ -109,17 +109,13 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 
 	switch state {
 	case ConnP2P:
-		if target != nil && target.UDPAddr != nil {
+		if target != nil && target.UDPAddr != nil && rm.edge != nil && rm.edge.udpConn != nil {
 			_, err := rm.edge.udpConn.WriteTo(data, target.UDPAddr)
 			if err == nil {
 				return true
 			}
 			log.Printf("[P2P] UDP 发送到 %s 失败: %v", peerId, err)
 		}
-		// 单播失败时不再 WS 双发——保持和 PC 端一致。
-		// 上一版本在这里会 `rm.ws.SendBinary(data)` 兜底，
-		// 结果每包走两条路径（P2P + WS），浪费带宽且让接收端收到重复。
-		// 真正的降级由 MarkFallback 在几次失败后触发，不是每包兜底。
 		return false
 
 	case ConnTURN:
@@ -133,9 +129,15 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 			}
 		}
 		rm.DowngradeToWS(peerId, "send failed")
+		if rm.ws == nil {
+			return false
+		}
 		return rm.ws.SendBinary(data) == nil
 
 	case ConnRelay:
+		if rm.ws == nil {
+			return false
+		}
 		return rm.ws.SendBinary(data) == nil
 	}
 
@@ -144,10 +146,13 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 
 // Report 定期上报连接状态。
 //
-// 通过 rm.edge.doneCh 感知 Edge 停止，避免 goroutine 泄漏
-// （反复启停 VPN 时若旧 goroutine 不退出，每次会累积一个 + 每 10 秒一次无效网络调用）。
+// 用 safeGo 包裹整个循环：panic 时只记录日志，不让整个进程崩溃。
+// 通过 rm.edge.doneCh 感知 Edge 停止，避免 goroutine 泄漏。
 func (rm *RelayManager) Report(interval time.Duration) {
-	go func() {
+	if rm.edge == nil {
+		return
+	}
+	safeGo("relay-report", func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -162,6 +167,9 @@ func (rm *RelayManager) Report(interval time.Duration) {
 				if len(conns) == 0 {
 					continue
 				}
+				if rm.ws == nil {
+					continue
+				}
 				_ = rm.ws.Send(map[string]interface{}{
 					"type":    "connection_status",
 					"payload": map[string]interface{}{"connections": conns},
@@ -170,5 +178,5 @@ func (rm *RelayManager) Report(interval time.Duration) {
 				return
 			}
 		}
-	}()
+	})
 }
