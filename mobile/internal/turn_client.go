@@ -30,10 +30,24 @@ type TURNResponse struct {
 	Error   string           `json:"error,omitempty"`
 }
 
+// TURNClient TURN 主控。
+//
+// ★ 只做 UDP transport（RFC 5766）+ TCP transport 兜底，不做 RFC 6062。
+//   RFC 6062（TURN TCP allocation + ConnectionBind 隧道）在本项目里
+//   从未被数据面使用——旧代码分配了 allocation 却不发一字节，
+//   白占 TURN 服务器并发槽位。已删除。
+//
+//   如果将来真要加 TCP 中继路径，需要：
+//   1. 客户端两侧都做 RFC 6062 allocation
+//   2. 服务端协调下发 turnTCPConnectRequest 指令
+//   3. 一侧 DialTCP 得到 io.ReadWriteCloser
+//   4. 套 4 字节长度前缀复用现有 framer
+//   5. relay_fallback.go 加 ConnTURN-TCP 状态
+//   6. 服务端透传对端 relay addr
+//   这是一个独立功能（200+ 行 + 服务端协议扩展），不在当前范围。
 type TURNClient struct {
 	mu           sync.RWMutex
 	lite         *TURNLite
-	tcpAlloc     *TURNTCPAllocation
 	relayAddr    net.Addr
 	server       *TURNServerInfo
 	signalingURL string
@@ -150,6 +164,10 @@ func (tc *TURNClient) FetchAndSetup(ctx context.Context) error {
 	return tc.setupAllocation(ctx)
 }
 
+// setupAllocation 尝试建立 TURN allocation。
+//
+// ★ 只用 UDP transport（RFC 5766）。失败时尝试 TCP transport（同样的
+//   RFC 5766 协议但走 TCP），两者都不依赖 RFC 6062。
 func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 	tc.mu.RLock()
 	srv := tc.server
@@ -168,6 +186,7 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 	turnAddr = strings.TrimPrefix(turnAddr, "turns:")
 	turnAddr = strings.TrimPrefix(turnAddr, "//")
 
+	// ★ UDP transport（主路径）
 	log.Printf("[TURN] 尝试 UDP transport: %s", turnAddr)
 	lite := NewTURNLiteWithTCP(turnAddr, srv.Username, srv.Password, false)
 	lite.onMessage = func(data []byte, addr net.Addr) {
@@ -176,6 +195,7 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 		}
 	}
 	if err := lite.Allocate(); err != nil {
+		// ★ UDP 被运营商封时，回退到 TCP transport（同一个 TURN 服务器）
 		log.Printf("[TURN] UDP transport 失败: %v，尝试 TCP transport", err)
 		lite2 := NewTURNLiteWithTCP(turnAddr, srv.Username, srv.Password, true)
 		lite2.onMessage = func(data []byte, addr net.Addr) {
@@ -184,34 +204,21 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 			}
 		}
 		if err2 := lite2.Allocate(); err2 != nil {
-			log.Printf("[TURN] UDP+TCP allocation 都失败: %v", err2)
-			lite = nil
-		} else {
-			lite = lite2
+			log.Printf("[TURN] UDP+TCP transport 都失败: %v", err2)
+			return fmt.Errorf("TURN 完全不可用: %v", err2)
 		}
+		lite = lite2
 	}
 
-	if lite != nil && lite.relayAddr != nil {
-		tc.mu.Lock()
-		tc.lite = lite
-		tc.relayAddr = lite.relayAddr
-		tc.mu.Unlock()
-		log.Printf("[TURN] ✅ UDP 就绪: %s", tc.relayAddr)
-	}
+	tc.mu.Lock()
+	tc.lite = lite
+	tc.relayAddr = lite.relayAddr
+	tc.mu.Unlock()
 
-	log.Printf("[TURN] 尝试 RFC 6062 TCP allocation: %s", turnAddr)
-	tcpAlloc := NewTURNTCPAllocation(turnAddr, srv.Username, srv.Password)
-	if err := tcpAlloc.Allocate(); err != nil {
-		log.Printf("[TURN] RFC 6062 不可用: %v（不影响 P2P 中继）", err)
+	if lite.useTCP {
+		log.Printf("[TURN] ✅ TCP transport 就绪: %s", tc.relayAddr)
 	} else {
-		tc.mu.Lock()
-		tc.tcpAlloc = tcpAlloc
-		tc.mu.Unlock()
-		log.Printf("[TURN] ✅ RFC 6062 TCP allocation 就绪: %s", tcpAlloc.GetRelayAddr())
-	}
-
-	if tc.lite == nil && tc.tcpAlloc == nil {
-		return fmt.Errorf("TURN 完全不可用")
+		log.Printf("[TURN] ✅ UDP transport 就绪: %s", tc.relayAddr)
 	}
 	return nil
 }
@@ -221,29 +228,13 @@ func (tc *TURNClient) Send(data []byte, remoteAddr net.Addr) error {
 	lite := tc.lite
 	tc.mu.RUnlock()
 	if lite == nil {
-		return fmt.Errorf("TURN UDP 未就绪")
+		return fmt.Errorf("TURN 未就绪")
 	}
 	udp, ok := remoteAddr.(*net.UDPAddr)
 	if !ok {
 		return fmt.Errorf("TURN 只支持 UDP 地址")
 	}
 	return lite.SendTo(data, udp)
-}
-
-func (tc *TURNClient) DialTCP(targetIP string, targetPort int) (io.ReadWriteCloser, error) {
-	tc.mu.RLock()
-	tcpAlloc := tc.tcpAlloc
-	tc.mu.RUnlock()
-	if tcpAlloc == nil {
-		return nil, fmt.Errorf("TURN RFC 6062 未就绪")
-	}
-	return tcpAlloc.Dial(targetIP, targetPort)
-}
-
-func (tc *TURNClient) HasTCPAlloc() bool {
-	tc.mu.RLock()
-	defer tc.mu.RUnlock()
-	return tc.tcpAlloc != nil
 }
 
 func (tc *TURNClient) GetRelayAddr() string {
@@ -272,10 +263,6 @@ func (tc *TURNClient) Close() {
 	if tc.lite != nil {
 		tc.lite.Close()
 		tc.lite = nil
-	}
-	if tc.tcpAlloc != nil {
-		tc.tcpAlloc.Close()
-		tc.tcpAlloc = nil
 	}
 }
 
