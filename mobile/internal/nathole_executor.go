@@ -20,7 +20,7 @@ type NatHoleInstruction struct {
 	TargetVirtualIp           string   `json:"targetVirtualIp"`
 	TargetPubSocket           string   `json:"targetPubSocket"`
 	TargetAssistedEndpoints   []string `json:"targetAssistedEndpoints"`
-	TargetLanEndpoints        []string `json:"targetLanEndpoints"` // ★ 新增
+	TargetLanEndpoints        []string `json:"targetLanEndpoints"`
 	SenderMac                 string   `json:"senderMac"`
 	SenderP2PEndpoint         string   `json:"senderP2pEndpoint"`
 	SenderPubSocket           string   `json:"senderPubSocket"`
@@ -54,7 +54,6 @@ const (
 
 var probePrefix = []byte{0x4E, 0x32, 0x4E, 0x50} // "N2NP"
 
-// 同一时刻只允许一个 executeNatHole 在跑。
 var (
 	natHoleActiveMu sync.Mutex
 	natHoleActive   map[string]bool
@@ -65,13 +64,11 @@ func init() {
 }
 
 func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
-	// 已 P2P 就跳过
 	if e.relayMgr != nil && e.relayMgr.GetState(instr.TargetMac) == ConnP2P {
 		log.Printf("[NAT-HOLE] 跳过指令 target=%s（已 P2P）", instr.TargetMac)
 		return nil
 	}
 
-	// 同一 target 已有执行中的指令，返回 nil
 	natHoleActiveMu.Lock()
 	if natHoleActive[instr.TargetMac] {
 		natHoleActiveMu.Unlock()
@@ -86,7 +83,6 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		natHoleActiveMu.Unlock()
 	}()
 
-	// 立即上报 InProgress
 	e.reportInProgress(instr)
 
 	startAt := time.Now().UnixMilli()
@@ -104,7 +100,6 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		return res
 	}
 
-	// TTL 是 socket 的 IP TTL，不是轮次数
 	var prevTTL int = -1
 	if instr.TTL > 0 && e.udpConn != nil {
 		p := ipv4.NewPacketConn(e.udpConn)
@@ -129,11 +124,9 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		len(instr.TargetLanEndpoints),
 	)
 
-	// === 构建目标地址列表：LAN 优先 ===
 	var targets []*net.UDPAddr
 	var candidateIPs []net.IP
 
-	// 1. ★ LAN endpoints 优先
 	for _, ep := range instr.TargetLanEndpoints {
 		if addr := parseSockAddr(ep); addr != nil {
 			targets = append(targets, addr)
@@ -144,7 +137,6 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		log.Printf("[NAT-HOLE] LAN 候选 %d 个（优先尝试）", len(targets))
 	}
 
-	// 2. assisted endpoints
 	for _, ep := range instr.TargetAssistedEndpoints {
 		if addr := parseSockAddr(ep); addr != nil {
 			targets = append(targets, addr)
@@ -152,7 +144,6 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		}
 	}
 
-	// 3. 端口扫描范围或公网单点
 	if instr.PortsRangeFrom > 0 && instr.PortsRangeTo >= instr.PortsRangeFrom {
 		count := int(instr.PortsRangeTo - instr.PortsRangeFrom + 1)
 		if count > 100 {
@@ -185,10 +176,11 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 				attempts++
 			}
 		}
-		if e.hasRealTrafficFromAny(candidateIPs, startAt) {
+		// ★ 用 hasTrafficFromAny（不再要求 hasRealData）
+		if e.hasTrafficFromAny(candidateIPs, startAt) {
 			res.State = PunchStateSucceeded
 			res.Attempts = attempts
-			res.Detail = "收到对端真实数据帧"
+			res.Detail = "收到对端 UDP 探测"
 
 			e.peersMu.Lock()
 			if p, ok := e.peers[instr.TargetMac]; ok {
@@ -223,7 +215,6 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 	return res
 }
 
-// 向服务端上报 InProgress
 func (e *Edge) reportInProgress(instr *NatHoleInstruction) {
 	if e.ws == nil {
 		return
@@ -285,26 +276,4 @@ func buildPunchProbe(virtualIP string) []byte {
 		copy(buf[4:8], ip.To4())
 	}
 	return buf
-}
-
-func (e *Edge) hasRealTrafficFromAny(ips []net.IP, since int64) bool {
-	if len(ips) == 0 {
-		return false
-	}
-	e.peersMu.RLock()
-	defer e.peersMu.RUnlock()
-	for _, p := range e.peers {
-		if p.UDPAddr == nil || p.lastRecvAt < since {
-			continue
-		}
-		if !p.hasRealData {
-			continue
-		}
-		for _, ip := range ips {
-			if p.UDPAddr.IP.Equal(ip) {
-				return true
-			}
-		}
-	}
-	return false
 }
