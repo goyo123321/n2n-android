@@ -35,35 +35,38 @@ func NewRelayManager(ws *WSTransport, turnClient *TURNClient, edge *Edge) *Relay
 
 func (rm *RelayManager) MarkP2P(peerId string) {
 	rm.mu.Lock()
-	defer rm.mu.Unlock()
 	if rm.states[peerId] != ConnP2P {
 		log.Printf("[连接] %s → P2P 直连", peerId)
 		rm.states[peerId] = ConnP2P
 	}
+	rm.mu.Unlock()
+	rm.cancelFallbackTimer(peerId)
 }
 
 // MarkFallback P2P 失败时降级。
 //
 // TURN 就绪 → TURN；未就绪 → 暂时 WS，并启动 5s 延迟升级 goroutine。
-// 这样即使首次判定时 TURN 未就绪，TURN 就绪后也能自动升级，
-// 避免出现 A-ws-B / B-turn-A 的不对称状态。
 func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.mu.Lock()
 	if rm.states[peerId] == ConnTURN || rm.states[peerId] == ConnRelay {
 		rm.mu.Unlock()
+		rm.cancelFallbackTimer(peerId)
 		return
 	}
 	if rm.turnClient != nil && rm.turnClient.IsReady() {
 		rm.states[peerId] = ConnTURN
 		rm.mu.Unlock()
 		log.Printf("[连接] %s → TURN 中继", peerId)
+		rm.cancelFallbackTimer(peerId)
 		return
 	}
 	rm.states[peerId] = ConnRelay
 	rm.mu.Unlock()
 	log.Printf("[连接] %s → WS 中继（TURN 未就绪，5s 内 TURN 就绪则自动升级）", peerId)
 
-	// ★ 延迟升级：5s 后如果 TURN 已就绪，从 WS 升级到 TURN
+	rm.cancelFallbackTimer(peerId)
+
+	// 延迟升级：5s 后如果 TURN 已就绪，从 WS 升级到 TURN
 	safeGo("relay-upgrade-retry", func() {
 		time.Sleep(5 * time.Second)
 		rm.mu.Lock()
@@ -76,6 +79,14 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 			log.Printf("[连接] %s → TURN 中继（延迟升级）", peerId)
 		}
 	})
+}
+
+// cancelFallbackTimer 取消 edge 上该 peer 的超时降级定时器。
+func (rm *RelayManager) cancelFallbackTimer(peerID string) {
+	if rm.edge == nil {
+		return
+	}
+	rm.edge.cancelFallbackTimer(peerID)
 }
 
 func (rm *RelayManager) UpgradeRelaysToTURN() {
