@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -76,6 +78,29 @@ func safeGo(name string, fn func()) {
 		}()
 		fn()
 	}()
+}
+
+// isTransientReadError 判断是否为可重试的临时错误（EAGAIN/EINTR）。
+//
+// Android 的 TUN fd 在某些情况下会返回 EAGAIN/EINTR，不是致命错误，
+// 但之前的代码直接 return，导致读循环死掉，之后所有包都进不来。
+func isTransientReadError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+		return true
+	}
+	if errors.Is(err, syscall.EINTR) {
+		return true
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	s := err.Error()
+	return strings.Contains(s, "resource temporarily unavailable") ||
+		strings.Contains(s, "interrupted system call") ||
+		strings.Contains(s, "try again")
 }
 
 func generateDefaultClientID() string {
@@ -241,7 +266,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	}
 	e.ws = ws
 
-	// ★ WS 建立后，从 socket 本地地址反推 LAN IP，补充 net.Interfaces 的不足
+	// ★ WS 建立后，从 socket 本地地址反推 LAN IP
 	socketIPs := collectLanIPsFromSockets(ws)
 	if len(socketIPs) > 0 {
 		seen := make(map[string]bool)
@@ -275,7 +300,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		e.onRemotePacket(data)
 	}
 
-	// 8. 后台协程（全部 safeGo）
+	// 8. 后台协程
 	safeGo("udpReadLoop", e.udpReadLoop)
 	safeGo("tunWriteLoop", e.tunWriteLoop)
 	safeGo("tunReadLoop", e.tunReadLoop)
@@ -391,7 +416,6 @@ func (e *Edge) GetVirtualIP() string {
 
 func (e *Edge) GetClientID() string { return e.clientId }
 
-// GetPeersJSON 在锁内快照，锁外序列化，避免 data race。
 func (e *Edge) GetPeersJSON() string {
 	e.peersMu.RLock()
 	type pair struct {
@@ -494,17 +518,12 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		e.peersMu.Unlock()
 		log.Printf("[信令] 分配虚拟 IP: %s", vip)
 
-		// 服务端看到的源 IP 是 WS/TCP 出口，仅用于 CGNAT 池化判断
 		if serverIP, ok := payload["yourPublicIp"].(string); ok && serverIP != "" {
 			e.mu.Lock()
 			e.serverSeenIP = serverIP
 			e.mu.Unlock()
 			log.Printf("[信令] 服务端看到的本机出口 IP: %s（WS/TCP 出口，仅参考）", serverIP)
 		}
-
-		// ★ 不再用 WS 出口 IP 兜底 publicEndpoint。
-		//   CGNAT 池化下 WS 出口 ≠ UDP 出口，用错 IP 打洞必失败。
-		//   等 STUN 探测完成后 reportMetadata 上报真正的 UDP 出口。
 
 		e.reportMetadata()
 
@@ -595,13 +614,28 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 }
 
 // reportMetadata 上报 p2p_metadata + share_announce。
-// 合并 myLanIPs 与 natMeta.AssistedSockets 中的 IP。
+// 合并 myLanIPs 与 natMeta.AssistedSockets 中的 IP；
+// 实时判断 CGNAT 池化，不依赖 NAT 探测时序。
 func (e *Edge) reportMetadata() {
 	e.mu.Lock()
 	nm := e.natMeta
 	ws := e.ws
 	serverSeenIP := e.serverSeenIP
 	e.mu.Unlock()
+
+	if nm == nil {
+		nm = &NATMetadata{NATType: "unknown", Behavior: "BehaviorPortChanged"}
+	}
+
+	// ★ 每次上报时实时判断 CGNAT 池化
+	if serverSeenIP != "" && nm.PublicEndpoint != "" {
+		stunIP := extractIPFromEndpoint(nm.PublicEndpoint)
+		if stunIP != "" && stunIP != serverSeenIP {
+			nm.MultiExit = true
+			nm.NATType = "HardNAT"
+			nm.Behavior = "BehaviorPortChanged"
+		}
+	}
 
 	// 合并 myLanIPs 与 AssistedSockets
 	merged := make(map[string]bool)
@@ -634,14 +668,12 @@ func (e *Edge) reportMetadata() {
 	for _, ip := range e.myLanIPs {
 		addIP(ip)
 	}
-	if nm != nil {
-		for _, sock := range nm.AssistedSockets {
-			host := sock
-			if i := strings.LastIndex(sock, ":"); i > 0 {
-				host = sock[:i]
-			}
-			addIP(host)
+	for _, sock := range nm.AssistedSockets {
+		host := sock
+		if i := strings.LastIndex(sock, ":"); i > 0 {
+			host = sock[:i]
 		}
+		addIP(host)
 	}
 
 	metaPayload := map[string]interface{}{
@@ -759,6 +791,9 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 		p2pStatus = 2
 	}
 
+	if e.ws == nil {
+		return
+	}
 	_ = e.ws.Send(map[string]interface{}{
 		"type": "p2p_state_info",
 		"payload": map[string]interface{}{
@@ -776,6 +811,12 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 func (e *Edge) udpReadLoop() {
 	buf := make([]byte, 65535)
 	for {
+		select {
+		case <-e.doneCh:
+			return
+		default:
+		}
+
 		n, addr, err := e.udpConn.ReadFrom(buf)
 		if err != nil {
 			select {
@@ -783,6 +824,11 @@ func (e *Edge) udpReadLoop() {
 				return
 			default:
 			}
+			if isTransientReadError(err) {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			log.Printf("[P2P] UDP 读错误，退出读循环: %v", err)
 			return
 		}
 		if n < 4 {
@@ -806,6 +852,12 @@ func (e *Edge) udpReadLoop() {
 func (e *Edge) tunReadLoop() {
 	buf := make([]byte, 65535)
 	for {
+		select {
+		case <-e.doneCh:
+			return
+		default:
+		}
+
 		n, err := e.tun.Read(buf)
 		if err != nil {
 			select {
@@ -813,6 +865,11 @@ func (e *Edge) tunReadLoop() {
 				return
 			default:
 			}
+			if isTransientReadError(err) {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			log.Printf("[TUN] 读错误，退出读循环: %v", err)
 			return
 		}
 		if n < 20 || buf[0]>>4 != 4 {
@@ -832,9 +889,24 @@ func (e *Edge) tunReadLoop() {
 		e.peersMu.RUnlock()
 
 		if target != nil {
-			if !e.relayMgr.SendToPeer(target.ClientID, buf[:n], target) {
+			state := ConnUnknown
+			if e.relayMgr != nil {
+				state = e.relayMgr.GetState(target.ClientID)
+			}
+			sent := false
+			if e.relayMgr != nil {
+				sent = e.relayMgr.SendToPeer(target.ClientID, buf[:n], target)
+			}
+			// ★ 调试日志：确认 TUN 是否收到包、往哪个 peer、走了哪条路
+			if n >= 10 {
+				log.Printf("[TUN] → %s dst=%s len=%d proto=%d sent=%v state=%s",
+					target.ClientID, dstIP, n, buf[9], sent, state)
+			}
+			if !sent && e.ws != nil {
 				_ = e.ws.SendBinary(buf[:n])
 			}
+		} else {
+			log.Printf("[TUN] 无匹配 peer，dst=%s len=%d", dstIP, n)
 		}
 	}
 }
@@ -881,6 +953,11 @@ func (e *Edge) notePeerTraffic(addr *net.UDPAddr) {
 	e.notePeerCommon(addr, true)
 }
 
+// notePeerCommon 记录 peer 收到 UDP 包的时间。
+//
+// ★ 关键修复：probe（N2NP 前缀）到达也触发 P2P 升级。
+//   之前只认 isRealData，导致 probe 阶段双方互相收到探测包但永不升级，
+//   打洞永远失败（LAN 直连场景尤为明显）。
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool) {
 	now := time.Now().UnixMilli()
 	e.peersMu.Lock()
@@ -912,11 +989,41 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool) {
 	}
 	clientID := best.ClientID
 	ip := addr.IP.String()
-	realData := best.hasRealData
 	e.peersMu.Unlock()
 
-	if realData && isRealData && e.relayMgr.ShouldRelay(clientID) {
-		log.Printf("[P2P] 从 %s (%s) 收到真实数据帧，升级为 P2P", clientID, ip)
+	if e.relayMgr == nil {
+		return
+	}
+
+	// ★ probe 到达 = UDP 双向通道可用，直接升级
+	if e.relayMgr.ShouldRelay(clientID) {
+		if isRealData {
+			log.Printf("[P2P] 从 %s (%s) 收到真实数据帧，升级为 P2P", clientID, ip)
+		} else {
+			log.Printf("[P2P] 从 %s (%s) 收到打洞探测，UDP 通道可用，升级为 P2P", clientID, ip)
+		}
 		e.relayMgr.MarkP2P(clientID)
 	}
+}
+
+// hasTrafficFromAny 检查是否有来自指定 IP 列表的 UDP 包。
+//
+// ★ 不再要求 hasRealData：收到 probe 也算通道可用。
+func (e *Edge) hasTrafficFromAny(ips []net.IP, since int64) bool {
+	if len(ips) == 0 {
+		return false
+	}
+	e.peersMu.RLock()
+	defer e.peersMu.RUnlock()
+	for _, p := range e.peers {
+		if p.UDPAddr == nil || p.lastRecvAt < since {
+			continue
+		}
+		for _, ip := range ips {
+			if p.UDPAddr.IP.Equal(ip) {
+				return true
+			}
+		}
+	}
+	return false
 }
