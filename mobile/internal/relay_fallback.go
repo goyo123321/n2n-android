@@ -1,255 +1,1280 @@
 package internal
 
 import (
+	"crypto/rand"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"net"
+	"os"
+	"runtime/debug"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
-type ConnType string
+type PeerInfo struct {
+	ClientID      string
+	VirtualIP     string
+	PubIP         string
+	PubPort       int
+	TurnRelayAddr string
+	UDPAddr       *net.UDPAddr
+	lastRecvAt    int64
+	loggedReady   bool
+	hasRealData   bool
+}
 
-const (
-	ConnP2P     ConnType = "p2p"
-	ConnTURN    ConnType = "turn"
-	ConnRelay   ConnType = "relay"
-	ConnUnknown ConnType = "unknown"
-)
+type PeerSnapshot struct {
+	Code      string `json:"code"`
+	ClientID  string `json:"clientId"`
+	VirtualIP string `json:"vip"`
+	Online    bool   `json:"online"`
+	ConnType  string `json:"connType"`
+	NATType   string `json:"natType"`
+}
 
-type RelayManager struct {
-	mu         sync.RWMutex
+type Edge struct {
+	cfg       *Config
+	clientId  string
+	nodeName  string
+	virtualIP string
+	roomId    string
+
+	myLanIPs     []string
+	serverSeenIP string
+
 	ws         *WSTransport
+	relayMgr   *RelayManager
 	turnClient *TURNClient
-	edge       *Edge
-	states     map[string]ConnType
+	tun        *TUNDevice
+
+	udpConn net.PacketConn
+	udpPort int
+
+	peers   map[string]*PeerInfo
+	peersMu sync.RWMutex
+
+	tunWriteCh chan []byte
+	natMeta    *NATMetadata
+
+	fallbackTimers   map[string]*time.Timer
+	fallbackTimersMu sync.Mutex
+
+	// ★ 日志节流：同一 dstIP 每 5 秒最多打一次"无匹配 peer"
+	lastNoPeerLog   map[string]int64
+	lastNoPeerLogMu sync.Mutex
+
+	doneCh  chan struct{}
+	closeMu sync.Mutex
+	closed  bool
+	mu      sync.Mutex
 }
 
-func NewRelayManager(ws *WSTransport, turnClient *TURNClient, edge *Edge) *RelayManager {
-	return &RelayManager{
-		ws:         ws,
-		turnClient: turnClient,
-		edge:       edge,
-		states:     make(map[string]ConnType),
-	}
-}
-
-func (rm *RelayManager) MarkP2P(peerId string) {
-	rm.mu.Lock()
-	if rm.states[peerId] == ConnP2P {
-		rm.mu.Unlock()
-		return
-	}
-	prev := rm.states[peerId]
-	rm.states[peerId] = ConnP2P
-	rm.mu.Unlock()
-
-	log.Printf("[连接] %s → P2P 直连（prev=%s）", peerId, prev)
-	rm.cancelFallbackTimer(peerId)
-}
-
-func (rm *RelayManager) MarkFallback(peerId string) {
-	rm.mu.Lock()
-
-	if rm.states[peerId] == ConnP2P {
-		rm.mu.Unlock()
-		rm.cancelFallbackTimer(peerId)
-		log.Printf("[连接] %s 已 P2P，忽略 MarkFallback", peerId)
-		return
-	}
-	if rm.states[peerId] == ConnTURN || rm.states[peerId] == ConnRelay {
-		rm.mu.Unlock()
-		rm.cancelFallbackTimer(peerId)
-		return
-	}
-	rm.mu.Unlock()
-
-	if rm.edge != nil {
-		rm.edge.peersMu.RLock()
-		p, ok := rm.edge.peers[peerId]
-		var lastRecv int64 = 0
-		if ok {
-			lastRecv = p.lastRecvAt
-		}
-		rm.edge.peersMu.RUnlock()
-
-		if lastRecv > 0 {
-			idleMs := time.Now().UnixMilli() - lastRecv
-			if idleMs < 3000 {
-				log.Printf("[连接] %s 最近 %dms 收到过 UDP 包，跳过降级", peerId, idleMs)
-				return
+// safeGo 在 goroutine 里执行 fn，panic 时只记录日志，不让整个进程崩溃。
+func safeGo(name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[panic] %s: %v\n%s", name, r, debug.Stack())
 			}
-		}
-	}
-
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-
-	if rm.states[peerId] == ConnP2P {
-		rm.cancelFallbackTimer(peerId)
-		return
-	}
-	if rm.states[peerId] == ConnTURN || rm.states[peerId] == ConnRelay {
-		rm.cancelFallbackTimer(peerId)
-		return
-	}
-
-	if rm.turnClient != nil && rm.turnClient.IsReady() {
-		rm.states[peerId] = ConnTURN
-		log.Printf("[连接] %s → TURN 中继 (%s)", peerId, rm.turnClient.GetRelayAddr())
-		rm.cancelFallbackTimer(peerId)
-		return
-	}
-
-	rm.states[peerId] = ConnRelay
-	log.Printf("[连接] %s → WS 中继 (TURN 未就绪，最后兜底)", peerId)
-	rm.cancelFallbackTimer(peerId)
+		}()
+		fn()
+	}()
 }
 
-func (rm *RelayManager) cancelFallbackTimer(peerID string) {
-	if rm.edge == nil {
-		return
+func isTransientReadError(err error) bool {
+	if err == nil {
+		return false
 	}
-	rm.edge.cancelFallbackTimer(peerID)
-}
-
-func (rm *RelayManager) UpgradeRelaysToTURN() {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-	if rm.turnClient == nil || !rm.turnClient.IsReady() {
-		return
-	}
-	relayAddr := rm.turnClient.GetRelayAddr()
-	upgraded := 0
-	for peerId, state := range rm.states {
-		if state == ConnRelay {
-			rm.states[peerId] = ConnTURN
-			upgraded++
-			log.Printf("[连接] %s → TURN 中继 (延迟升级, %s)", peerId, relayAddr)
-		}
-	}
-	if upgraded > 0 {
-		log.Printf("[连接] TURN 就绪，升级 %d 个 WS 中继到 TURN", upgraded)
-	}
-}
-
-func (rm *RelayManager) DowngradeToWS(peerId string, reason string) {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-	if rm.states[peerId] == ConnP2P {
-		return
-	}
-	if rm.states[peerId] != ConnRelay {
-		log.Printf("[连接] %s → WS 中继 (%s)", peerId, reason)
-		rm.states[peerId] = ConnRelay
-	}
-}
-
-func (rm *RelayManager) ShouldRelay(peerId string) bool {
-	rm.mu.RLock()
-	defer rm.mu.RUnlock()
-	s, ok := rm.states[peerId]
-	if !ok {
+	if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
 		return true
 	}
-	return s == ConnTURN || s == ConnRelay
-}
-
-func (rm *RelayManager) GetState(peerId string) ConnType {
-	rm.mu.RLock()
-	defer rm.mu.RUnlock()
-	if s, ok := rm.states[peerId]; ok {
-		return s
+	if errors.Is(err, syscall.EINTR) {
+		return true
 	}
-	return ConnUnknown
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	s := err.Error()
+	return strings.Contains(s, "resource temporarily unavailable") ||
+		strings.Contains(s, "interrupted system call") ||
+		strings.Contains(s, "try again")
 }
 
-// SendToPeer 三级降级：P2P → TURN → WS。
+func generateDefaultClientID() string {
+	hostname, _ := os.Hostname()
+	if hostname == "" || hostname == "localhost" {
+		hostname = "android"
+	}
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		binary.BigEndian.PutUint32(b[:], uint32(time.Now().UnixNano()))
+	}
+	return fmt.Sprintf("%s-%s", hostname, hex.EncodeToString(b[:]))
+}
+
+// ============ UDP 保活 ============
+
+// keepaliveInterval UDP 保活间隔。
 //
-// ★ TURN 失败时不降级状态：单帧用 WS 兜底，状态保持 ConnTURN。
-//   TURN 30 秒后恢复后，下一帧自动走 TURN，无需手动回切。
-func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
-	state := rm.GetState(peerId)
+// CGNAT 的 UDP 映射 TTL 通常 30 秒~几分钟。空闲超时后映射被回收，
+// 从同一 socket 出去的包会被分给新端口——这就是为什么"上报的 pubSocket
+// 端口"和"打洞时实际端口"会差 840。
+const keepaliveInterval = 5 * time.Second
 
-	switch state {
-	case ConnP2P:
-		if target != nil && target.UDPAddr != nil && rm.edge != nil && rm.edge.udpConn != nil {
-			_, err := rm.edge.udpConn.WriteTo(data, target.UDPAddr)
-			if err == nil {
-				return true
-			}
-			log.Printf("[P2P] UDP 发送到 %s 失败: %v，降级到 WS", peerId, err)
-			rm.MarkFallback(peerId)
-		} else {
-			rm.MarkFallback(peerId)
-		}
-		if rm.ws == nil {
-			return false
-		}
-		return rm.ws.SendBinary(data) == nil
-
-	case ConnTURN:
-		if target != nil && target.TurnRelayAddr != "" && rm.turnClient != nil {
-			relayAddr, err := net.ResolveUDPAddr("udp", target.TurnRelayAddr)
-			if err == nil {
-				if sendErr := rm.turnClient.Send(data, relayAddr); sendErr == nil {
-					return true
-				} else {
-					// ★ 只是这一帧失败，不降级状态。TURN 30 秒后可能恢复。
-					log.Printf("[TURN] 发送到 %s 失败（临时）: %v", peerId, sendErr)
-					if rm.ws != nil {
-						_ = rm.ws.SendBinary(data)
-					}
-					return false
-				}
-			} else {
-				log.Printf("[TURN] 解析中继地址 %q 失败: %v", target.TurnRelayAddr, err)
-			}
-		}
-		// 兜底：WS 发当前帧，状态保持 ConnTURN
-		if rm.ws != nil {
-			return rm.ws.SendBinary(data) == nil
-		}
-		return false
-
-	case ConnRelay:
-		if rm.ws == nil {
-			return false
-		}
-		return rm.ws.SendBinary(data) == nil
-	}
-
-	return false
+var keepaliveServers = []string{
+	"74.125.250.129:19302",
+	"162.159.207.0:3478",
+	"74.125.204.127:19302",
 }
 
-func (rm *RelayManager) Report(interval time.Duration) {
-	if rm.edge == nil {
+// buildSTUNBindingRequest 构造一个 20 字节的 STUN Binding Request。
+func buildSTUNBindingRequest() []byte {
+	buf := make([]byte, 20)
+	buf[0] = 0x00
+	buf[1] = 0x01
+	buf[2] = 0x00
+	buf[3] = 0x00
+	buf[4] = 0x21
+	buf[5] = 0x12
+	buf[6] = 0xA4
+	buf[7] = 0x42
+	if _, err := rand.Read(buf[8:20]); err != nil {
+		binary.BigEndian.PutUint64(buf[8:16], uint64(time.Now().UnixNano()))
+	}
+	return buf
+}
+
+// startKeepalive 启动 UDP 保活协程。
+//
+// ★ 条件触发：只有在 e.peers 非空时才发 STUN binding request。
+//   无 peer 时静默跳过，避免"一端离线还在发心跳"。
+func (e *Edge) startKeepalive() {
+	if e.udpConn == nil {
 		return
 	}
-	safeGo("relay-report", func() {
-		ticker := time.NewTicker(interval)
+
+	var addrs []*net.UDPAddr
+	for _, s := range keepaliveServers {
+		if a, err := net.ResolveUDPAddr("udp4", s); err == nil {
+			addrs = append(addrs, a)
+		}
+	}
+	if len(addrs) == 0 {
+		log.Printf("[Keepalive] ⚠️ 无可用 STUN 服务器，跳过保活")
+		return
+	}
+
+	log.Printf("[Keepalive] 启动（条件触发），每 %v 刷新 %d 个 STUN 服务器（仅在有 peer 时）",
+		keepaliveInterval, len(addrs))
+
+	safeGo("keepalive", func() {
+		sendOnce := func() {
+			for _, addr := range addrs {
+				probe := buildSTUNBindingRequest()
+				_, _ = e.udpConn.WriteTo(probe, addr)
+			}
+		}
+
+		hasPeers := func() bool {
+			e.peersMu.RLock()
+			defer e.peersMu.RUnlock()
+			return len(e.peers) > 0
+		}
+
+		if hasPeers() {
+			sendOnce()
+		}
+
+		ticker := time.NewTicker(keepaliveInterval)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-ticker.C:
-				rm.mu.RLock()
-				conns := make(map[string]string)
-				for peerId, t := range rm.states {
-					conns[peerId] = string(t)
-				}
-				rm.mu.RUnlock()
-				if len(conns) == 0 {
-					continue
-				}
-				if rm.ws == nil {
-					continue
-				}
-				_ = rm.ws.Send(map[string]interface{}{
-					"type":    "connection_status",
-					"payload": map[string]interface{}{"connections": conns},
-				})
-			case <-rm.edge.doneCh:
+			case <-e.doneCh:
+				log.Printf("[Keepalive] 已停止")
 				return
+			case <-ticker.C:
+				if !hasPeers() {
+					continue
+				}
+				sendOnce()
 			}
 		}
 	})
+}
+
+// ============ 日志节流 ============
+
+// logNoPeerThrottled 节流"无匹配 peer"日志。
+//
+// 对端离线后，Termux 的 ping 会持续发包，每秒刷一行。
+// 同一 dstIP 每 5 秒只打一次。
+func (e *Edge) logNoPeerThrottled(dstIP string, n int) {
+	now := time.Now().UnixMilli()
+	e.lastNoPeerLogMu.Lock()
+	last := e.lastNoPeerLog[dstIP]
+	if now-last < 5000 {
+		e.lastNoPeerLogMu.Unlock()
+		return
+	}
+	e.lastNoPeerLog[dstIP] = now
+	e.lastNoPeerLogMu.Unlock()
+	log.Printf("[TUN] 无匹配 peer，dst=%s len=%d", dstIP, n)
+}
+
+// ============ 主流程 ============
+
+func FetchVirtualIP(cfg *Config) string {
+	if cfg.SignalingURL == "" {
+		return ""
+	}
+	clientId := cfg.ClientID
+	if clientId == "" {
+		clientId = generateDefaultClientID()
+	}
+	ws, err := NewWSTransport(
+		cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken,
+		cfg.PreferredIP, cfg.PreferredPort,
+	)
+	if err != nil {
+		log.Printf("[FetchVIP] 连接信令失败: %v", err)
+		return ""
+	}
+	defer ws.Close()
+
+	done := make(chan string, 1)
+	ws.SetHandlers(func(msg map[string]interface{}) {
+		t, _ := msg["type"].(string)
+		if t == "ready" {
+			payload, _ := msg["payload"].(map[string]interface{})
+			vip, _ := payload["virtualIp"].(string)
+			select {
+			case done <- vip:
+			default:
+			}
+		}
+	}, nil)
+
+	select {
+	case vip := <-done:
+		log.Printf("[FetchVIP] 拿到虚拟 IP: %s", vip)
+		return vip
+	case <-time.After(15 * time.Second):
+		log.Printf("[FetchVIP] 超时")
+		return ""
+	}
+}
+
+func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
+	if cfg.SignalingURL == "" {
+		return nil, fmt.Errorf("signaling URL 为空")
+	}
+	if tunFd <= 0 {
+		return nil, fmt.Errorf("TUN fd 无效")
+	}
+
+	clientId := cfg.ClientID
+	if clientId == "" {
+		clientId = generateDefaultClientID()
+	}
+	nodeName := cfg.NodeName
+	if nodeName == "" {
+		nodeName = "Android"
+	}
+
+	lanIPs := getAllLanIPs()
+
+	e := &Edge{
+		cfg:            cfg,
+		clientId:       clientId,
+		nodeName:       nodeName,
+		roomId:         cfg.RoomID,
+		myLanIPs:       lanIPs,
+		peers:          make(map[string]*PeerInfo),
+		fallbackTimers: make(map[string]*time.Timer),
+		lastNoPeerLog:  make(map[string]int64),
+		tunWriteCh:     make(chan []byte, 4096),
+		doneCh:         make(chan struct{}),
+		natMeta: &NATMetadata{
+			NATType:  "unknown",
+			Behavior: "BehaviorPortChanged",
+		},
+	}
+	log.Printf("[LAN] 本机局域网 IP: %v", e.myLanIPs)
+
+	// 1. TUN
+	tun, err := setupTUNFromFD(tunFd)
+	if err != nil {
+		return nil, fmt.Errorf("包装 TUN fd 失败: %w", err)
+	}
+	e.tun = tun
+
+	// 2. UDP
+	var udpConn net.PacketConn
+	if udpFd > 0 {
+		file := os.NewFile(uintptr(udpFd), "protected-udp")
+		if file != nil {
+			pc, err := net.FilePacketConn(file)
+			_ = file.Close()
+			if err == nil {
+				udpConn = pc
+				log.Printf("[P2P] 使用 protected UDP fd=%d（绕过 VPN）", udpFd)
+			} else {
+				log.Printf("[P2P] FilePacketConn 失败: %v，回退默认 socket", err)
+			}
+		}
+	}
+	if udpConn == nil {
+		addr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+		u, err := net.ListenUDP("udp", addr)
+		if err != nil {
+			_ = tun.Close()
+			return nil, fmt.Errorf("绑定 UDP 失败: %w", err)
+		}
+		udpConn = u
+		log.Printf("[P2P] 使用默认 UDP socket（无保护）")
+	}
+	e.udpConn = udpConn
+
+	if la := udpConn.LocalAddr(); la != nil {
+		if ua, ok := la.(*net.UDPAddr); ok {
+			e.udpPort = ua.Port
+		}
+	}
+	log.Printf("[P2P] UDP 监听端口 %d", e.udpPort)
+
+	// 3. STUN socket
+	var stunConn net.PacketConn
+	if stunFd > 0 {
+		file := os.NewFile(uintptr(stunFd), "protected-stun")
+		if file != nil {
+			pc, err := net.FilePacketConn(file)
+			_ = file.Close()
+			if err == nil {
+				stunConn = pc
+				log.Printf("[NAT] 使用 protected STUN socket fd=%d", stunFd)
+			} else {
+				log.Printf("[NAT] STUN FilePacketConn 失败: %v", err)
+			}
+		}
+	}
+	if stunConn == nil {
+		log.Printf("[NAT] 无 protected STUN socket，STUN 探测可能失败")
+	}
+
+	// 4. 信令
+	ws, err := NewWSTransport(
+		cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken,
+		cfg.PreferredIP, cfg.PreferredPort,
+	)
+	if err != nil {
+		_ = udpConn.Close()
+		if stunConn != nil {
+			_ = stunConn.Close()
+		}
+		_ = tun.Close()
+		return nil, fmt.Errorf("连接信令失败: %w", err)
+	}
+	e.ws = ws
+
+	// ★ WS 建立后，从 socket 本地地址反推 LAN IP
+	socketIPs := collectLanIPsFromSockets(ws)
+	if len(socketIPs) > 0 {
+		seen := make(map[string]bool)
+		for _, ip := range e.myLanIPs {
+			seen[ip] = true
+		}
+		for _, ip := range socketIPs {
+			if !seen[ip] {
+				e.myLanIPs = append(e.myLanIPs, ip)
+				seen[ip] = true
+			}
+		}
+		log.Printf("[LAN] socket 出口补充后: %v", e.myLanIPs)
+	} else if len(e.myLanIPs) == 0 {
+		log.Printf("[LAN] ⚠️ 无法获取任何局域网 IP")
+	}
+
+	// 5. TURN
+	e.turnClient = NewTURNClient(cfg.SignalingURL, cfg.ConnectToken, e)
+	e.turnClient.onMessage = func(data []byte, addr net.Addr) {
+		e.onRemotePacket(data)
+	}
+
+	// 6. 中继（必须在 SetHandlers 之前初始化）
+	e.relayMgr = NewRelayManager(ws, e.turnClient, e)
+	e.relayMgr.Report(10 * time.Second)
+
+	// 7. 回调（★ 用 SetHandlers，会重放 ready 等早期消息）
+	ws.SetHandlers(
+		e.handleSignaling,
+		func(data []byte) {
+			e.onRemotePacket(data)
+		},
+	)
+
+	// 8. 后台协程
+	safeGo("udpReadLoop", e.udpReadLoop)
+	safeGo("tunWriteLoop", e.tunWriteLoop)
+	safeGo("tunReadLoop", e.tunReadLoop)
+
+	// ★ 启动 UDP 保活
+	e.startKeepalive()
+
+	// 9. NAT 探测
+	safeGo("nat-probe", func() {
+		log.Printf("[NAT] 开始异步 STUN 探测...")
+		var meta *NATMetadata
+		if stunConn != nil {
+			meta = probeNATWithConn(stunConn, nil)
+			_ = stunConn.Close()
+		} else {
+			meta = probeNAT(e.udpPort, nil)
+		}
+		if meta == nil {
+			meta = &NATMetadata{NATType: "unknown", Behavior: "BehaviorPortChanged"}
+		}
+
+		e.mu.Lock()
+		serverIP := e.serverSeenIP
+		e.mu.Unlock()
+
+		if serverIP != "" && meta.PublicEndpoint != "" {
+			stunIP := extractIPFromEndpoint(meta.PublicEndpoint)
+			if stunIP != "" && stunIP != serverIP {
+				log.Printf(
+					"[NAT] ⚠️ WS/STUN 出口不一致：WS=%s STUN=%s —— CGNAT 池化，打洞大概率失败",
+					serverIP, stunIP,
+				)
+				meta.MultiExit = true
+				meta.NATType = "HardNAT"
+				meta.Behavior = "BehaviorPortChanged"
+			} else if stunIP != "" {
+				log.Printf("[NAT] ✅ WS/STUN 出口一致：%s —— 出口稳定", stunIP)
+			}
+		}
+
+		e.mu.Lock()
+		e.natMeta = meta
+		wsRef := e.ws
+		e.mu.Unlock()
+
+		log.Printf("[NAT] 探测完成: %s pub=%s multiExit=%v",
+			meta.NATType, meta.PublicEndpoint, meta.MultiExit)
+
+		if wsRef != nil {
+			e.reportMetadata()
+			log.Printf("[NAT] 已重新上报 p2p_metadata")
+		}
+	})
+
+	// 10. TURN 异步初始化
+	safeGo("turn-init", func() {
+		time.Sleep(200 * time.Millisecond)
+		ctx, cancel := contextWithTimeout(30 * time.Second)
+		defer cancel()
+
+		if e.turnClient == nil {
+			return
+		}
+		if err := e.turnClient.FetchAndSetup(ctx); err != nil {
+			log.Printf("[TURN] 初始化失败: %v", err)
+			return
+		}
+		log.Printf("[TURN] 就绪: %s", e.turnClient.GetRelayAddr())
+		if e.relayMgr != nil {
+			e.relayMgr.UpgradeRelaysToTURN()
+		}
+		if e.ws != nil {
+			_ = e.ws.Send(map[string]interface{}{
+				"type":      "turn_relay_info",
+				"relayAddr": e.turnClient.GetRelayAddr(),
+			})
+		}
+	})
+
+	// ★ 11. TURN 后台重连循环（网络切换后自动重建）
+	e.turnClient.StartReconnectLoop()
+
+	log.Printf("[Edge] 已启动 clientId=%s room=%s", clientId, cfg.RoomID)
+	return e, nil
+}
+
+func (e *Edge) Stop() {
+	e.closeMu.Lock()
+	if e.closed {
+		e.closeMu.Unlock()
+		return
+	}
+	e.closed = true
+	close(e.doneCh)
+	e.closeMu.Unlock()
+
+	e.fallbackTimersMu.Lock()
+	for _, t := range e.fallbackTimers {
+		t.Stop()
+	}
+	e.fallbackTimers = make(map[string]*time.Timer)
+	e.fallbackTimersMu.Unlock()
+
+	if e.ws != nil {
+		_ = e.ws.Close()
+	}
+	if e.turnClient != nil {
+		e.turnClient.Close()
+	}
+	if e.udpConn != nil {
+		_ = e.udpConn.Close()
+	}
+	if e.tun != nil {
+		_ = e.tun.Close()
+	}
+	log.Printf("[Edge] 已停止")
+}
+
+func (e *Edge) Done() <-chan struct{} { return e.doneCh }
+
+func (e *Edge) GetVirtualIP() string {
+	e.peersMu.RLock()
+	defer e.peersMu.RUnlock()
+	return e.virtualIP
+}
+
+func (e *Edge) GetClientID() string { return e.clientId }
+
+func (e *Edge) GetPeersJSON() string {
+	e.peersMu.RLock()
+	type pair struct {
+		id     string
+		vip    string
+		online bool
+	}
+	var list []pair
+	for id, p := range e.peers {
+		list = append(list, pair{
+			id:     id,
+			vip:    p.VirtualIP,
+			online: p.UDPAddr != nil || p.TurnRelayAddr != "",
+		})
+	}
+	e.peersMu.RUnlock()
+
+	for i := 0; i < len(list); i++ {
+		for j := i + 1; j < len(list); j++ {
+			if list[i].id > list[j].id {
+				list[i], list[j] = list[j], list[i]
+			}
+		}
+	}
+
+	e.mu.Lock()
+	natType := "unknown"
+	if e.natMeta != nil {
+		natType = e.natMeta.NATType
+	}
+	e.mu.Unlock()
+
+	snapshots := make([]PeerSnapshot, 0, len(list))
+	for i, item := range list {
+		connType := "unknown"
+		if e.relayMgr != nil {
+			connType = string(e.relayMgr.GetState(item.id))
+		}
+		snapshots = append(snapshots, PeerSnapshot{
+			Code:      idxToCode(i),
+			ClientID:  item.id,
+			VirtualIP: item.vip,
+			Online:    item.online,
+			ConnType:  connType,
+			NATType:   natType,
+		})
+	}
+
+	data, _ := json.Marshal(snapshots)
+	return string(data)
+}
+
+func idxToCode(i int) string {
+	if i < 26 {
+		return string(rune('A' + i))
+	}
+	first := i/26 - 1
+	second := i % 26
+	return string(rune('A'+first)) + string(rune('A'+second))
+}
+
+func extractIPFromEndpoint(ep string) string {
+	if ep == "" {
+		return ""
+	}
+	i := lastIndexByte(ep, ':')
+	if i < 0 {
+		return ep
+	}
+	return ep[:i]
+}
+
+func lastIndexByte(s string, c byte) int {
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
+}
+
+// ============ 信令 ============
+
+func (e *Edge) handleSignaling(msg map[string]interface{}) {
+	t, _ := msg["type"].(string)
+	from, _ := msg["from"].(string)
+
+	if t == "_reconnected" {
+		log.Printf("[信令] WebSocket 重连成功，重新上报元数据")
+		e.reportMetadata()
+		return
+	}
+
+	switch t {
+	case "ready":
+		payload, _ := msg["payload"].(map[string]interface{})
+		e.peersMu.Lock()
+		e.virtualIP, _ = payload["virtualIp"].(string)
+		vip := e.virtualIP
+		e.peersMu.Unlock()
+		log.Printf("[信令] 分配虚拟 IP: %s", vip)
+
+		if serverIP, ok := payload["yourPublicIp"].(string); ok && serverIP != "" {
+			e.mu.Lock()
+			e.serverSeenIP = serverIP
+			e.mu.Unlock()
+			log.Printf("[信令] 服务端看到的本机出口 IP: %s（WS/TCP 出口，仅参考）", serverIP)
+		}
+
+		e.reportMetadata()
+
+		if peers, ok := payload["peers"].([]interface{}); ok {
+			log.Printf("[信令] ready: 返回 %d 个已有节点", len(peers))
+			for _, p := range peers {
+				pm, ok := p.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				pid, _ := pm["id"].(string)
+				pip, _ := pm["virtualIp"].(string)
+				pubIP, _ := pm["publicIp"].(string)
+				pubPort := jsonInt(pm["publicPort"])
+				relayAddr, _ := pm["turnRelayAddr"].(string)
+				if pid == "" || pip == "" {
+					continue
+				}
+				e.registerPeer(pid, pip, pubIP, pubPort)
+				if relayAddr != "" {
+					e.peersMu.Lock()
+					if pi, ok := e.peers[pid]; ok {
+						pi.TurnRelayAddr = relayAddr
+					}
+					e.peersMu.Unlock()
+				}
+				log.Printf("[信令] 已有节点: %s vip=%s pub=%s:%d", pid, pip, pubIP, pubPort)
+			}
+		}
+
+	case "joined":
+		payload, _ := msg["payload"].(map[string]interface{})
+		if payload == nil {
+			return
+		}
+		pip, _ := payload["virtualIp"].(string)
+		pubIP, _ := payload["publicIp"].(string)
+		pubPort := jsonInt(payload["publicPort"])
+		relayAddr, _ := payload["turnRelayAddr"].(string)
+
+		log.Printf("[信令] joined: from=%s vip=%s pub=%s:%d", from, pip, pubIP, pubPort)
+
+		if from != "" && pip != "" {
+			e.registerPeer(from, pip, pubIP, pubPort)
+			if relayAddr != "" {
+				e.peersMu.Lock()
+				if pi, ok := e.peers[from]; ok {
+					pi.TurnRelayAddr = relayAddr
+				}
+				e.peersMu.Unlock()
+			}
+		}
+
+	case "nat_hole_instruction":
+		raw, _ := json.Marshal(msg["payload"])
+		var instr NatHoleInstruction
+		if err := json.Unmarshal(raw, &instr); err != nil {
+			log.Printf("[NAT-HOLE] 指令解析失败: %v", err)
+			return
+		}
+		// ★ 检查 target 是否还在线
+		if !e.peerExists(instr.TargetMac) {
+			log.Printf("[NAT-HOLE] 忽略指令 target=%s（peer 不在线）", instr.TargetMac)
+			return
+		}
+		e.ensureTargetPeer(&instr)
+		e.scheduleFallbackTimer(instr.TargetMac)
+		instrCopy := instr
+		safeGo("nat-hole", func() { e.runNatHole(&instrCopy) })
+
+	case "force_fallback":
+		payload, _ := msg["payload"].(map[string]interface{})
+		if payload == nil {
+			return
+		}
+		peersRaw, _ := payload["peers"].([]interface{})
+		reason, _ := payload["reason"].(string)
+		if reason == "" {
+			reason = "server-forced"
+		}
+		log.Printf("[信令] 收到 force_fallback: %d 个 peer, reason=%s", len(peersRaw), reason)
+		for _, pRaw := range peersRaw {
+			peerID, _ := pRaw.(string)
+			if peerID == "" {
+				continue
+			}
+			if e.relayMgr == nil {
+				continue
+			}
+			if e.relayMgr.GetState(peerID) == ConnP2P {
+				continue
+			}
+			e.relayMgr.MarkFallback(peerID)
+		}
+		return
+
+	case "turn_peer_info":
+		edgeMac, _ := msg["edgeMac"].(string)
+		relayAddr, _ := msg["relayAddr"].(string)
+		if edgeMac != "" && relayAddr != "" {
+			e.peersMu.Lock()
+			if p, ok := e.peers[edgeMac]; ok {
+				p.TurnRelayAddr = relayAddr
+			}
+			e.peersMu.Unlock()
+		}
+
+	case "pong":
+		return
+
+	case "left":
+		log.Printf("[信令] 节点离开: %s", from)
+		e.peersMu.Lock()
+		delete(e.peers, from)
+		e.peersMu.Unlock()
+		e.cancelFallbackTimer(from)
+		// ★ 清理日志节流记录
+		e.lastNoPeerLogMu.Lock()
+		delete(e.lastNoPeerLog, from)
+		e.lastNoPeerLogMu.Unlock()
+
+	case "connection_status":
+		return
+	}
+}
+
+func (e *Edge) peerExists(peerID string) bool {
+	if peerID == "" {
+		return false
+	}
+	e.peersMu.RLock()
+	defer e.peersMu.RUnlock()
+	_, ok := e.peers[peerID]
+	return ok
+}
+
+func (e *Edge) reportMetadata() {
+	e.mu.Lock()
+	nm := e.natMeta
+	ws := e.ws
+	serverSeenIP := e.serverSeenIP
+	e.mu.Unlock()
+
+	if nm == nil {
+		nm = &NATMetadata{NATType: "unknown", Behavior: "BehaviorPortChanged"}
+	}
+
+	if serverSeenIP != "" && nm.PublicEndpoint != "" {
+		stunIP := extractIPFromEndpoint(nm.PublicEndpoint)
+		if stunIP != "" && stunIP != serverSeenIP {
+			nm.MultiExit = true
+			nm.NATType = "HardNAT"
+			nm.Behavior = "BehaviorPortChanged"
+		}
+	}
+
+	merged := make(map[string]bool)
+	var lanIPs []string
+	addIP := func(ip string) {
+		if ip == "" || ip == "0.0.0.0" {
+			return
+		}
+		if merged[ip] {
+			return
+		}
+		parsed := net.ParseIP(ip)
+		if parsed == nil {
+			return
+		}
+		ip4 := parsed.To4()
+		if ip4 == nil {
+			return
+		}
+		if ip4[0] == 10 && ip4[1] == 64 {
+			return
+		}
+		if !isPrivateIP(ip4) {
+			return
+		}
+		merged[ip] = true
+		lanIPs = append(lanIPs, ip)
+	}
+
+	for _, ip := range e.myLanIPs {
+		addIP(ip)
+	}
+	for _, sock := range nm.AssistedSockets {
+		host := sock
+		if i := strings.LastIndex(sock, ":"); i > 0 {
+			host = sock[:i]
+		}
+		addIP(host)
+	}
+
+	metaPayload := map[string]interface{}{
+		"name":               e.nodeName,
+		"natType":            nm.NATType,
+		"portsDifference":    nm.PortsDifference,
+		"regularPortsChange": nm.RegularPortsChange,
+		"behavior":           nm.Behavior,
+		"assistedSockets":    nm.AssistedSockets,
+		"p2pEndpoint":        nm.P2PEndpoint,
+		"lanIps":             lanIPs,
+		"udpPort":            e.udpPort,
+		"multiExit":          nm.MultiExit,
+		"wsPublicIp":         serverSeenIP,
+	}
+	if nm.PublicEndpoint != "" {
+		metaPayload["publicEndpoint"] = nm.PublicEndpoint
+	}
+
+	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%q wsPublicIp=%q lanIps=%v udpPort=%d multiExit=%v",
+		nm.NATType, nm.PublicEndpoint, serverSeenIP, lanIPs, e.udpPort, nm.MultiExit)
+
+	if ws == nil {
+		return
+	}
+	_ = ws.Send(map[string]interface{}{"type": "p2p_metadata", "payload": metaPayload})
+
+	vip := e.GetVirtualIP()
+	_ = ws.Send(map[string]interface{}{
+		"type": "share_announce",
+		"payload": map[string]interface{}{
+			"name": e.nodeName, "virtualIp": vip, "port": 0,
+		},
+	})
+}
+
+func jsonInt(v interface{}) int {
+	if f, ok := v.(float64); ok {
+		return int(f)
+	}
+	return 0
+}
+
+func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int) {
+	var udpAddr *net.UDPAddr
+	if pubIP != "" && pubPort > 0 {
+		udpAddr = &net.UDPAddr{IP: net.ParseIP(pubIP), Port: pubPort}
+	}
+
+	e.peersMu.Lock()
+	_, existed := e.peers[pid]
+	if existed {
+		p := e.peers[pid]
+		if vip != "" {
+			p.VirtualIP = vip
+		}
+		if pubIP != "" {
+			p.PubIP = pubIP
+		}
+		if pubPort > 0 {
+			p.PubPort = pubPort
+		}
+		if udpAddr != nil {
+			p.UDPAddr = udpAddr
+		}
+	} else {
+		e.peers[pid] = &PeerInfo{
+			ClientID: pid, VirtualIP: vip, PubIP: pubIP,
+			PubPort: pubPort, UDPAddr: udpAddr,
+		}
+	}
+	e.peersMu.Unlock()
+
+	if !existed {
+		e.scheduleFallbackTimer(pid)
+	}
+}
+
+func (e *Edge) scheduleFallbackTimer(peerID string) {
+	if e.relayMgr == nil || peerID == "" {
+		return
+	}
+
+	e.fallbackTimersMu.Lock()
+	if t, ok := e.fallbackTimers[peerID]; ok {
+		t.Stop()
+	}
+	t := time.AfterFunc(8*time.Second, func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[fallback-timer] panic: %v", r)
+			}
+		}()
+
+		e.fallbackTimersMu.Lock()
+		delete(e.fallbackTimers, peerID)
+		e.fallbackTimersMu.Unlock()
+
+		if e.relayMgr == nil {
+			return
+		}
+		state := e.relayMgr.GetState(peerID)
+		if state != ConnUnknown {
+			// ★ P2P 状态不打日志（正常流程）
+			if state != ConnP2P {
+				log.Printf("[fallback-timer] %s 已有状态 %s，跳过降级", peerID, state)
+			}
+			return
+		}
+		log.Printf("[fallback-timer] %s 8s 内未收到打洞指令，主动降级", peerID)
+		e.relayMgr.MarkFallback(peerID)
+	})
+	e.fallbackTimers[peerID] = t
+	e.fallbackTimersMu.Unlock()
+}
+
+func (e *Edge) cancelFallbackTimer(peerID string) {
+	e.fallbackTimersMu.Lock()
+	defer e.fallbackTimersMu.Unlock()
+	if t, ok := e.fallbackTimers[peerID]; ok {
+		t.Stop()
+		delete(e.fallbackTimers, peerID)
+	}
+}
+
+func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
+	if instr.TargetMac == "" {
+		return
+	}
+	var udpAddr *net.UDPAddr
+	if instr.TargetPubSocket != "" {
+		udpAddr = parseSockAddr(instr.TargetPubSocket)
+	}
+	e.peersMu.Lock()
+	defer e.peersMu.Unlock()
+	if p, ok := e.peers[instr.TargetMac]; ok {
+		if udpAddr != nil {
+			p.UDPAddr = udpAddr
+		}
+		if instr.TargetVirtualIp != "" {
+			p.VirtualIP = instr.TargetVirtualIp
+		}
+	} else {
+		e.peers[instr.TargetMac] = &PeerInfo{
+			ClientID: instr.TargetMac, VirtualIP: instr.TargetVirtualIp, UDPAddr: udpAddr,
+		}
+	}
+}
+
+func (e *Edge) runNatHole(instr *NatHoleInstruction) {
+	res := e.executeNatHole(instr)
+
+	if res == nil {
+		return
+	}
+
+	if res.State == PunchStateSucceeded {
+		e.relayMgr.MarkP2P(instr.TargetMac)
+	} else if res.State == PunchStateFailed {
+		e.relayMgr.MarkFallback(instr.TargetMac)
+	}
+
+	p2pStatus := 0
+	switch e.relayMgr.GetState(instr.TargetMac) {
+	case ConnP2P:
+		p2pStatus = 3
+	case ConnTURN, ConnRelay:
+		p2pStatus = 2
+	}
+
+	if e.ws == nil {
+		return
+	}
+	_ = e.ws.Send(map[string]interface{}{
+		"type": "p2p_state_info",
+		"payload": map[string]interface{}{
+			"to": []map[string]interface{}{{
+				"macAddr": instr.TargetMac, "observedRaddr": "",
+				"punchResult": res, "punchResultPeerMac": instr.TargetMac,
+				"p2pStatus": p2pStatus,
+			}},
+		},
+	})
+}
+
+// ============ IO ============
+
+func (e *Edge) udpReadLoop() {
+	buf := make([]byte, 65535)
+	for {
+		select {
+		case <-e.doneCh:
+			return
+		default:
+		}
+
+		n, addr, err := e.udpConn.ReadFrom(buf)
+		if err != nil {
+			select {
+			case <-e.doneCh:
+				return
+			default:
+			}
+			if isTransientReadError(err) {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			log.Printf("[P2P] UDP 读错误，退出读循环: %v", err)
+			return
+		}
+		if n < 4 {
+			continue
+		}
+		if buf[0] == 'N' && buf[1] == '2' && buf[2] == 'N' && buf[3] == 'P' {
+			if ua, ok := addr.(*net.UDPAddr); ok {
+				e.notePeerProbe(ua)
+			}
+			continue
+		}
+		if buf[0]>>4 == 4 {
+			if ua, ok := addr.(*net.UDPAddr); ok {
+				e.notePeerTraffic(ua)
+			}
+			e.onRemotePacket(buf[:n])
+		}
+		// STUN Binding Response（0x01 开头）落到这里，静默丢弃
+	}
+}
+
+func (e *Edge) tunReadLoop() {
+	buf := make([]byte, 65535)
+	for {
+		select {
+		case <-e.doneCh:
+			return
+		default:
+		}
+
+		n, err := e.tun.Read(buf)
+		if err != nil {
+			select {
+			case <-e.doneCh:
+				return
+			default:
+			}
+			if isTransientReadError(err) {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			log.Printf("[TUN] 读错误，退出读循环: %v", err)
+			return
+		}
+		if n < 20 || buf[0]>>4 != 4 {
+			continue
+		}
+
+		dstIP := net.IP(buf[16:20]).String()
+
+		e.peersMu.RLock()
+		var target *PeerInfo
+		for _, p := range e.peers {
+			if p.VirtualIP == dstIP {
+				target = p
+				break
+			}
+		}
+		e.peersMu.RUnlock()
+
+		if target != nil {
+			state := ConnUnknown
+			if e.relayMgr != nil {
+				state = e.relayMgr.GetState(target.ClientID)
+			}
+			sent := false
+			if e.relayMgr != nil {
+				sent = e.relayMgr.SendToPeer(target.ClientID, buf[:n], target)
+			}
+			if n >= 10 {
+				log.Printf("[TUN] → %s dst=%s len=%d proto=%d sent=%v state=%s",
+					target.ClientID, dstIP, n, buf[9], sent, state)
+			}
+			if !sent && e.ws != nil {
+				_ = e.ws.SendBinary(buf[:n])
+			}
+		} else {
+			// ★ 节流：同一 dstIP 每 5 秒最多一次
+			e.logNoPeerThrottled(dstIP, n)
+		}
+	}
+}
+
+func (e *Edge) tunWriteLoop() {
+	for {
+		select {
+		case <-e.doneCh:
+			return
+		case data := <-e.tunWriteCh:
+			if e.tun != nil {
+				_, _ = e.tun.Write(data)
+			}
+		}
+	}
+}
+
+func (e *Edge) enqueueTUN(data []byte) {
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	select {
+	case e.tunWriteCh <- cp:
+	default:
+	}
+}
+
+func (e *Edge) onRemotePacket(data []byte) {
+	if len(data) < 20 || data[0]>>4 != 4 {
+		return
+	}
+	dstIP := net.IP(data[16:20]).String()
+	vip := e.GetVirtualIP()
+	if dstIP != vip {
+		return
+	}
+	e.enqueueTUN(data)
+}
+
+func (e *Edge) notePeerProbe(addr *net.UDPAddr) {
+	e.notePeerCommon(addr, false)
+}
+
+func (e *Edge) notePeerTraffic(addr *net.UDPAddr) {
+	e.notePeerCommon(addr, true)
+}
+
+func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool) {
+	now := time.Now().UnixMilli()
+	e.peersMu.Lock()
+	var best *PeerInfo
+	bestScore := -1
+	for _, p := range e.peers {
+		if p.UDPAddr == nil || !p.UDPAddr.IP.Equal(addr.IP) {
+			continue
+		}
+		score := 1
+		if p.UDPAddr.Port == addr.Port {
+			score = 2
+		}
+		if score > bestScore {
+			best = p
+			bestScore = score
+		}
+	}
+	if best == nil {
+		e.peersMu.Unlock()
+		return
+	}
+	best.lastRecvAt = now
+	if isRealData {
+		best.hasRealData = true
+	}
+	best.UDPAddr = &net.UDPAddr{IP: addr.IP, Port: addr.Port}
+	clientID := best.ClientID
+	ip := addr.IP.String()
+	e.peersMu.Unlock()
+
+	if e.relayMgr == nil {
+		return
+	}
+
+	if !isRealData {
+		e.sendProbeTo(addr)
+	}
+
+	state := e.relayMgr.GetState(clientID)
+	if isRealData {
+		if state != ConnP2P {
+			log.Printf("[P2P] 从 %s (%s) 收到真实数据帧，升级为 P2P", clientID, ip)
+			e.relayMgr.MarkP2P(clientID)
+		}
+		return
+	}
+	if state != ConnP2P {
+		log.Printf("[P2P] 从 %s (%s) 收到打洞探测，UDP 通道可用，升级为 P2P", clientID, ip)
+		e.relayMgr.MarkP2P(clientID)
+	}
+}
+
+func (e *Edge) sendProbeTo(addr *net.UDPAddr) {
+	if e.udpConn == nil || addr == nil {
+		return
+	}
+	target := &net.UDPAddr{IP: addr.IP, Port: addr.Port}
+	vip := e.GetVirtualIP()
+
+	safeGo("probe-reply", func() {
+		probe := buildPunchProbe(vip)
+		for i := 0; i < 5; i++ {
+			select {
+			case <-e.doneCh:
+				return
+			default:
+			}
+			if _, err := e.udpConn.WriteTo(probe, target); err != nil {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	})
+}
+
+// hasTrafficFromAny 判断候选 IP 中是否有过 UDP 包到达。
+//
+// ★ 不再要求 hasRealData：收到 probe 也算通道可用。
+// ★ 定义在 edge.go（两个文件都定义会冲突，nathole_executor.go 不再重复）。
+func (e *Edge) hasTrafficFromAny(ips []net.IP, since int64) bool {
+	if len(ips) == 0 {
+		return false
+	}
+	e.peersMu.RLock()
+	defer e.peersMu.RUnlock()
+	for _, p := range e.peers {
+		if p.UDPAddr == nil || p.lastRecvAt < since {
+			continue
+		}
+		for _, ip := range ips {
+			if p.UDPAddr.IP.Equal(ip) {
+				return true
+			}
+		}
+	}
+	return false
 }
