@@ -60,7 +60,6 @@ func probeNATWithConn(conn net.PacketConn, stunServers []string) *NATMetadata {
 		}
 	}
 
-	// ★ 探测完成后记录 socket 绑定到的本地 IP（多出口设备可能有多个）
 	defer func() {
 		if la := conn.LocalAddr(); la != nil {
 			if ua, ok := la.(*net.UDPAddr); ok {
@@ -199,8 +198,10 @@ func fillNATMetadata(meta *NATMetadata, results []natProbeResult) {
 		meta.PortsDifference = abs(results[0].port - results[1].port)
 		meta.RegularPortsChange = true
 	} else {
-		meta.NATType = "EasyNAT"
-		meta.Behavior = "BehaviorNoChange"
+		// ★ 只拿到 1 个样本 → unknown，不猜 EasyNAT
+		//   猜错会让服务端按错误模式派发指令，且两端判定不一致
+		meta.NATType = "unknown"
+		meta.Behavior = "BehaviorPortChanged"
 	}
 
 	log.Printf("[NAT] %s pub=%s", meta.NATType, meta.PublicEndpoint)
