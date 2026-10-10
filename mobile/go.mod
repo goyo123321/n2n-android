@@ -1,4 +1,4 @@
-module github.com/goyo123321a/n2n-android/mobile
+module github.com/goyo123321/n2n-android/mobile
 
 go 1.26.0
 
