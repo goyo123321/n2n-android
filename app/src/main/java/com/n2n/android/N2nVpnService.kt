@@ -4,8 +4,10 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.net.wifi.WifiManager
@@ -62,6 +64,15 @@ class N2nVpnService : VpnService() {
 
     private var protectedUdpSocket: DatagramSocket? = null
     private var protectedStunSocket: DatagramSocket? = null
+
+    // ★ 时区变化广播（用户旅行 / 手动切换时区）
+    private val tzReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == Intent.ACTION_TIMEZONE_CHANGED) {
+                N2nController.applySystemTimezone()
+            }
+        }
+    }
 
     inner class ServiceProtector : Protector {
         override fun protect(fd: Long): Boolean {
@@ -143,7 +154,20 @@ class N2nVpnService : VpnService() {
 
     override fun onCreate() {
         super.onCreate()
+
+        // ★ 设置时区（Go 日志和 Kotlin 日志时间一致）
+        N2nController.applySystemTimezone()
+
         installCrashHandler()
+
+        // ★ 注册时区变化广播
+        try {
+            registerReceiver(
+                tzReceiver,
+                IntentFilter(Intent.ACTION_TIMEZONE_CHANGED)
+            )
+        } catch (_: Throwable) {}
+
         ktLog("onCreate: 进程启动/Service 创建")
     }
 
@@ -611,6 +635,10 @@ class N2nVpnService : VpnService() {
         ktLog("onDestroy")
         destroyed = true
         notificationActive = false
+
+        // ★ 注销时区广播
+        try { unregisterReceiver(tzReceiver) } catch (_: Throwable) {}
+
         try { handler.removeCallbacksAndMessages(null) } catch (_: Throwable) {}
         handleStop()
         try { super.onDestroy() } catch (_: Throwable) {}
