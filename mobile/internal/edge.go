@@ -45,7 +45,6 @@ type Edge struct {
 	virtualIP string
 	roomId    string
 
-	myLanIPs     []string
 	serverSeenIP string
 
 	ws         *WSTransport
@@ -65,11 +64,11 @@ type Edge struct {
 	fallbackTimers   map[string]*time.Timer
 	fallbackTimersMu sync.Mutex
 
-	// ★ 日志节流：同一 dstIP 每 5 秒最多打一次"无匹配 peer"
+	// 日志节流：同一 dstIP 每 5 秒最多打一次"无匹配 peer"
 	lastNoPeerLog   map[string]int64
 	lastNoPeerLogMu sync.Mutex
 
-	// ★ 状态变化日志：同一 peer 状态不变时不打
+	// 状态变化日志：同一 peer 状态不变时不打 TUN 转发日志
 	tunStateLog   map[string]ConnType
 	tunStateLogMu sync.Mutex
 
@@ -148,7 +147,6 @@ func buildSTUNBindingRequest() []byte {
 	return buf
 }
 
-// startKeepalive 启动 UDP 保活协程（条件触发：仅在有 peer 时发）。
 func (e *Edge) startKeepalive() {
 	if e.udpConn == nil {
 		return
@@ -205,7 +203,6 @@ func (e *Edge) startKeepalive() {
 
 // ============ 日志节流 ============
 
-// logNoPeerThrottled 节流"无匹配 peer"日志。
 func (e *Edge) logNoPeerThrottled(dstIP string, n int) {
 	now := time.Now().UnixMilli()
 	e.lastNoPeerLogMu.Lock()
@@ -219,10 +216,6 @@ func (e *Edge) logNoPeerThrottled(dstIP string, n int) {
 	log.Printf("[TUN] 无匹配 peer，dst=%s len=%d", dstIP, n)
 }
 
-// logTunForward 节流 TUN 转发日志：同一 peer 状态不变时不打。
-//
-// 首次、或状态从 unknown→p2p、p2p→turn、turn→relay 等变化时打一次。
-// 状态一直 p2p 时静默。
 func (e *Edge) logTunForward(peerID, dstIP string, n, proto int, sent bool, state ConnType) {
 	e.tunStateLogMu.Lock()
 	prev, existed := e.tunStateLog[peerID]
@@ -237,7 +230,6 @@ func (e *Edge) logTunForward(peerID, dstIP string, n, proto int, sent bool, stat
 		peerID, dstIP, n, proto, sent, state)
 }
 
-// forgetTunState 清理 peer 的 TUN 日志状态（peer 离线时调用）。
 func (e *Edge) forgetTunState(peerID string) {
 	e.tunStateLogMu.Lock()
 	delete(e.tunStateLog, peerID)
@@ -304,14 +296,11 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		nodeName = "Android"
 	}
 
-	lanIPs := getAllLanIPs()
-
 	e := &Edge{
 		cfg:            cfg,
 		clientId:       clientId,
 		nodeName:       nodeName,
 		roomId:         cfg.RoomID,
-		myLanIPs:       lanIPs,
 		peers:          make(map[string]*PeerInfo),
 		fallbackTimers: make(map[string]*time.Timer),
 		lastNoPeerLog:  make(map[string]int64),
@@ -323,14 +312,15 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 			Behavior: "BehaviorPortChanged",
 		},
 	}
-	log.Printf("[LAN] 本机局域网 IP: %v", e.myLanIPs)
 
+	// 1. TUN
 	tun, err := setupTUNFromFD(tunFd)
 	if err != nil {
 		return nil, fmt.Errorf("包装 TUN fd 失败: %w", err)
 	}
 	e.tun = tun
 
+	// 2. UDP
 	var udpConn net.PacketConn
 	if udpFd > 0 {
 		file := os.NewFile(uintptr(udpFd), "protected-udp")
@@ -364,6 +354,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	}
 	log.Printf("[P2P] UDP 监听端口 %d", e.udpPort)
 
+	// 3. STUN socket
 	var stunConn net.PacketConn
 	if stunFd > 0 {
 		file := os.NewFile(uintptr(stunFd), "protected-stun")
@@ -382,6 +373,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		log.Printf("[NAT] 无 protected STUN socket，STUN 探测可能失败")
 	}
 
+	// 4. 信令
 	ws, err := NewWSTransport(
 		cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken,
 		cfg.PreferredIP, cfg.PreferredPort,
@@ -396,31 +388,17 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	}
 	e.ws = ws
 
-	socketIPs := collectLanIPsFromSockets(ws)
-	if len(socketIPs) > 0 {
-		seen := make(map[string]bool)
-		for _, ip := range e.myLanIPs {
-			seen[ip] = true
-		}
-		for _, ip := range socketIPs {
-			if !seen[ip] {
-				e.myLanIPs = append(e.myLanIPs, ip)
-				seen[ip] = true
-			}
-		}
-		log.Printf("[LAN] socket 出口补充后: %v", e.myLanIPs)
-	} else if len(e.myLanIPs) == 0 {
-		log.Printf("[LAN] ⚠️ 无法获取任何局域网 IP")
-	}
-
+	// 5. TURN
 	e.turnClient = NewTURNClient(cfg.SignalingURL, cfg.ConnectToken, e)
 	e.turnClient.onMessage = func(data []byte, addr net.Addr) {
 		e.onRemotePacket(data)
 	}
 
+	// 6. 中继（必须在 SetHandlers 之前初始化）
 	e.relayMgr = NewRelayManager(ws, e.turnClient, e)
 	e.relayMgr.Report(10 * time.Second)
 
+	// 7. 回调
 	ws.SetHandlers(
 		e.handleSignaling,
 		func(data []byte) {
@@ -428,12 +406,15 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		},
 	)
 
+	// 8. 后台协程
 	safeGo("udpReadLoop", e.udpReadLoop)
 	safeGo("tunWriteLoop", e.tunWriteLoop)
 	safeGo("tunReadLoop", e.tunReadLoop)
 
+	// 启动 UDP 保活
 	e.startKeepalive()
 
+	// 9. NAT 探测
 	safeGo("nat-probe", func() {
 		log.Printf("[NAT] 开始异步 STUN 探测...")
 		var meta *NATMetadata
@@ -480,6 +461,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		}
 	})
 
+	// 10. TURN 异步初始化
 	safeGo("turn-init", func() {
 		time.Sleep(200 * time.Millisecond)
 		ctx, cancel := contextWithTimeout(30 * time.Second)
@@ -504,7 +486,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		}
 	})
 
-	// ★ TURN 后台重连循环（网络切换后自动重建）
+	// 11. TURN 后台重连循环
 	e.turnClient.StartReconnectLoop()
 
 	log.Printf("[Edge] 已启动 clientId=%s room=%s", clientId, cfg.RoomID)
@@ -779,7 +761,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		e.lastNoPeerLogMu.Lock()
 		delete(e.lastNoPeerLog, from)
 		e.lastNoPeerLogMu.Unlock()
-		// ★ 清理 TUN 转发日志状态
 		e.forgetTunState(from)
 
 	case "connection_status":
@@ -797,6 +778,7 @@ func (e *Edge) peerExists(peerID string) bool {
 	return ok
 }
 
+// reportMetadata 上报 p2p_metadata（LAN 字段已删除）。
 func (e *Edge) reportMetadata() {
 	e.mu.Lock()
 	nm := e.natMeta
@@ -817,53 +799,13 @@ func (e *Edge) reportMetadata() {
 		}
 	}
 
-	merged := make(map[string]bool)
-	var lanIPs []string
-	addIP := func(ip string) {
-		if ip == "" || ip == "0.0.0.0" {
-			return
-		}
-		if merged[ip] {
-			return
-		}
-		parsed := net.ParseIP(ip)
-		if parsed == nil {
-			return
-		}
-		ip4 := parsed.To4()
-		if ip4 == nil {
-			return
-		}
-		if ip4[0] == 10 && ip4[1] == 64 {
-			return
-		}
-		if !isPrivateIP(ip4) {
-			return
-		}
-		merged[ip] = true
-		lanIPs = append(lanIPs, ip)
-	}
-
-	for _, ip := range e.myLanIPs {
-		addIP(ip)
-	}
-	for _, sock := range nm.AssistedSockets {
-		host := sock
-		if i := strings.LastIndex(sock, ":"); i > 0 {
-			host = sock[:i]
-		}
-		addIP(host)
-	}
-
 	metaPayload := map[string]interface{}{
 		"name":               e.nodeName,
 		"natType":            nm.NATType,
 		"portsDifference":    nm.PortsDifference,
 		"regularPortsChange": nm.RegularPortsChange,
 		"behavior":           nm.Behavior,
-		"assistedSockets":    nm.AssistedSockets,
 		"p2pEndpoint":        nm.P2PEndpoint,
-		"lanIps":             lanIPs,
 		"udpPort":            e.udpPort,
 		"multiExit":          nm.MultiExit,
 		"wsPublicIp":         serverSeenIP,
@@ -872,8 +814,8 @@ func (e *Edge) reportMetadata() {
 		metaPayload["publicEndpoint"] = nm.PublicEndpoint
 	}
 
-	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%q wsPublicIp=%q lanIps=%v udpPort=%d multiExit=%v",
-		nm.NATType, nm.PublicEndpoint, serverSeenIP, lanIPs, e.udpPort, nm.MultiExit)
+	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%q wsPublicIp=%q udpPort=%d multiExit=%v",
+		nm.NATType, nm.PublicEndpoint, serverSeenIP, e.udpPort, nm.MultiExit)
 
 	if ws == nil {
 		return
@@ -956,7 +898,6 @@ func (e *Edge) scheduleFallbackTimer(peerID string) {
 		}
 		state := e.relayMgr.GetState(peerID)
 		if state != ConnUnknown {
-			// ★ P2P 状态不打日志（正常流程）
 			if state != ConnP2P {
 				log.Printf("[fallback-timer] %s 已有状态 %s，跳过降级", peerID, state)
 			}
@@ -1130,7 +1071,6 @@ func (e *Edge) tunReadLoop() {
 				sent = e.relayMgr.SendToPeer(target.ClientID, buf[:n], target)
 			}
 			if n >= 10 {
-				// ★ 状态变化才打（同一 peer 状态不变时静默）
 				e.logTunForward(target.ClientID, dstIP, n, int(buf[9]), sent, state)
 			}
 			if !sent && e.ws != nil {
