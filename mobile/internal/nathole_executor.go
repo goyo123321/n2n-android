@@ -55,7 +55,7 @@ const (
 
 const maxConsecutiveFails = 5
 
-var probePrefix = []byte{0x4E, 0x32, 0x4E, 0x50} // "N2NP"
+var probePrefix = []byte{0x4E, 0x32, 0x4E, 0x50}
 
 var (
 	natHoleActiveMu sync.Mutex
@@ -68,12 +68,8 @@ func init() {
 	failCounts = make(map[string]int)
 }
 
-// ============ 扫描分级 ============
-
-// fullScanTiers 全端口扫描（分级递增，覆盖到 ±10000）。
 var fullScanTiers = []int{3, 10, 20, 30, 60, 100, 300, 1000, 3000, 10000}
 
-// buildTiers 根据 halfWidth 生成分级数组，最后一层是 halfWidth。
 func buildTiers(halfWidth int) []int {
 	tiers := []int{}
 	for _, t := range []int{3, 10, 20, 30, 60, 100, 300, 1000, 3000, 10000} {
@@ -85,7 +81,6 @@ func buildTiers(halfWidth int) []int {
 	return tiers
 }
 
-// extractPortFromEndpoint 从 "IP:Port" 提取 Port，失败返回 0。
 func extractPortFromEndpoint(ep string) int {
 	if ep == "" {
 		return 0
@@ -101,19 +96,6 @@ func extractPortFromEndpoint(ep string) int {
 	return port
 }
 
-// chooseScanTiers 根据本机 STUN 出口和 target 选择扫描策略。
-//
-// 返回：
-//   - tiers     分级数组
-//   - sameStun  是否同 STUN IP
-//   - portDiff  端口差（仅同 STUN 时有意义）
-//   - halfWidth 精准扫描的半径（0 表示走全端口扫描）
-//
-// 逻辑：
-//   1. 本机 STUN IP 与 target IP 不同 → 全端口扫描
-//   2. 同 STUN IP：
-//      a. portDiff < 100 → 精准扫描 [targetPort ± (portDiff + 100)]
-//      b. portDiff ≥ 100 → 全端口扫描
 func (e *Edge) chooseScanTiers(targetAddr *net.UDPAddr) (tiers []int, sameStun bool, portDiff int, halfWidth int) {
 	e.mu.Lock()
 	ep := ""
@@ -213,14 +195,10 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		instr.BehaviorIndex, instr.Mode, instr.TTL,
 	)
 
-	// 收集辅助端点
 	var assistedTargets []*net.UDPAddr
-	var publicIPs []net.IP
-	publicIPs = append(publicIPs, targetAddr.IP)
 	for _, ep := range instr.TargetAssistedEndpoints {
 		if addr := parseSockAddr(ep); addr != nil {
 			assistedTargets = append(assistedTargets, addr)
-			publicIPs = append(publicIPs, addr.IP)
 		}
 	}
 
@@ -231,7 +209,6 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 	probe := buildPunchProbe(e.virtualIP)
 	var attempts uint32
 
-	// 选择扫描分级
 	tiers, sameStun, portDiff, halfWidth := e.chooseScanTiers(targetAddr)
 
 	if sameStun && halfWidth > 0 {
@@ -244,11 +221,18 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		log.Printf("[NAT-HOLE] 模式：不同 STUN IP，全端口扫描，分级 %v", tiers)
 	}
 
-	// 公网扫描
 	lastHalf := 0
 	receiverPort := targetAddr.Port
 
 	for _, half := range tiers {
+		select {
+		case <-e.doneCh:
+			res.State = PunchStateFailed
+			res.Detail = "aborted: edge stopped"
+			return res
+		default:
+		}
+
 		var tierTargets []*net.UDPAddr
 		for port := receiverPort - half; port <= receiverPort+half; port++ {
 			if port < 1 || port > 65535 {
@@ -263,12 +247,10 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 			})
 		}
 
-		// 第 1 层追加辅助端点
 		if lastHalf == 0 && len(assistedTargets) > 0 {
 			tierTargets = append(tierTargets, assistedTargets...)
 		}
 
-		// 大范围层只发 1 轮
 		rounds := 3
 		if half > 500 {
 			rounds = 1
@@ -276,16 +258,31 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 
 		success := false
 		for r := 0; r < rounds; r++ {
+			select {
+			case <-e.doneCh:
+				res.State = PunchStateFailed
+				res.Detail = "aborted: edge stopped"
+				return res
+			default:
+			}
+
 			for _, t := range tierTargets {
 				if _, err := e.udpConn.WriteTo(probe, t); err == nil {
 					attempts++
 				}
 			}
-			if e.hasTrafficFromAny(publicIPs, startAt) {
+			if e.hasTrafficFromTarget(instr.TargetMac, startAt) {
 				success = true
 				break
 			}
-			time.Sleep(100 * time.Millisecond)
+
+			select {
+			case <-e.doneCh:
+				res.State = PunchStateFailed
+				res.Detail = "aborted: edge stopped"
+				return res
+			case <-time.After(100 * time.Millisecond):
+			}
 		}
 
 		if success {
