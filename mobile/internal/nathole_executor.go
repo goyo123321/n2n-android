@@ -195,15 +195,11 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		instr.BehaviorIndex, instr.Mode, instr.TTL,
 	)
 
-	// ★ 收集辅助端点
 	var assistedTargets []*net.UDPAddr
 	for _, ep := range instr.TargetAssistedEndpoints {
 		if addr := parseSockAddr(ep); addr != nil {
 			assistedTargets = append(assistedTargets, addr)
 		}
-	}
-	if len(assistedTargets) > 0 {
-		log.Printf("[NAT-HOLE] assisted 候选 %d 个", len(assistedTargets))
 	}
 
 	if instr.Role == 0 && instr.SendDelayMs > 0 {
@@ -251,7 +247,6 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 			})
 		}
 
-		// ★ 第 1 层追加辅助端点
 		if lastHalf == 0 && len(assistedTargets) > 0 {
 			tierTargets = append(tierTargets, assistedTargets...)
 		}
@@ -276,7 +271,6 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 					attempts++
 				}
 			}
-
 			if e.hasTrafficFromTarget(instr.TargetMac, startAt) {
 				success = true
 				break
@@ -408,17 +402,4 @@ func buildPunchProbe(virtualIP string) []byte {
 		copy(buf[4:8], ip.To4())
 	}
 	return buf
-}
-
-func (e *Edge) hasTrafficFromTarget(peerID string, since int64) bool {
-	if peerID == "" {
-		return false
-	}
-	e.peersMu.RLock()
-	defer e.peersMu.RUnlock()
-	p := e.peers[peerID]
-	if p == nil || p.UDPAddr == nil {
-		return false
-	}
-	return p.lastRecvAt >= since
 }
