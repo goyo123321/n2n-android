@@ -43,9 +43,6 @@ func NewClient() *Client { return &Client{} }
 //
 // gomobile 环境下 Go 无法读取 Android 系统时区，需要在 App 启动时
 // 由 Kotlin 侧读 TimeZone.getDefault() 后传入。
-//
-// ★ 首字母大写 —— gomobile 只导出首字母大写的符号，
-//   生成到 Kotlin 的 com.n2n.mobile.Mobile 类里。
 func SetTimezoneOffset(seconds int) {
 	internal.SetTimezoneOffset(seconds)
 }
@@ -68,6 +65,7 @@ func (c *Client) SetStunFD(fd int) {
 	c.stunFd = fd
 }
 
+// SetProtector 注册 VpnService.protect 桥。p == nil 时注销。
 func (c *Client) SetProtector(p Protector) {
 	c.mu.Lock()
 	c.protector = p
