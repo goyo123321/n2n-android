@@ -4,8 +4,10 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.net.wifi.WifiManager
@@ -62,6 +64,15 @@ class N2nVpnService : VpnService() {
 
     private var protectedUdpSocket: DatagramSocket? = null
     private var protectedStunSocket: DatagramSocket? = null
+
+    // ★ 时区变化广播（用户旅行 / 手动切换时区）
+    private val tzReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == Intent.ACTION_TIMEZONE_CHANGED) {
+                N2nController.applySystemTimezone()
+            }
+        }
+    }
 
     inner class ServiceProtector : Protector {
         override fun protect(fd: Long): Boolean {
@@ -143,7 +154,20 @@ class N2nVpnService : VpnService() {
 
     override fun onCreate() {
         super.onCreate()
+
+        // ★ 设置时区（Go 日志和 Kotlin 日志时间一致）
+        N2nController.applySystemTimezone()
+
         installCrashHandler()
+
+        // ★ 注册时区变化广播
+        try {
+            registerReceiver(
+                tzReceiver,
+                IntentFilter(Intent.ACTION_TIMEZONE_CHANGED)
+            )
+        } catch (_: Throwable) {}
+
         ktLog("onCreate: 进程启动/Service 创建")
     }
 
@@ -363,7 +387,24 @@ class N2nVpnService : VpnService() {
         }.apply { name = "n2n-fetchvip" }.start()
     }
 
+    // ============================================================
+    // 从 DatagramSocket 提取 fd —— 必须 detachFd
+    // ============================================================
+    //
+    // ParcelFileDescriptor.fromDatagramSocket(socket) 会 dup socket 的 fd，
+    // 返回持有 dup fd 的新 PFD。PFD 被 GC 时 finalizer 会 close 这个 fd。
+    //
+    // 若只反射读 mFd.descriptor 而不 detach：
+    //   - PFD 仍持有 dup fd
+    //   - GC → finalizer close(dup fd)
+    //   - fd 号被系统回收 → 分配给新 socket（WS / TURN 等）
+    //   - Go 继续按旧 fd 号读写 → 数据错乱或误关无关 socket
+    //
+    // detachFd() 把 fd 从 PFD 摘出，PFD 的 mFd 置 null，
+    // finalizer 不再 close 它。fd 所有权转移到调用方（Go）。
+    //
     private fun extractFdFromDatagramSocket(socket: DatagramSocket): Int {
+        // 路径 1：API 30+ 公开 API
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             try {
                 val pfd = ParcelFileDescriptor.fromDatagramSocket(socket)
@@ -374,6 +415,7 @@ class N2nVpnService : VpnService() {
             } catch (_: Throwable) {}
         }
 
+        // 路径 2：反射（Android 10 及以下）
         try {
             val m = ParcelFileDescriptor::class.java.getDeclaredMethod(
                 "fromDatagramSocket", DatagramSocket::class.java
@@ -593,6 +635,10 @@ class N2nVpnService : VpnService() {
         ktLog("onDestroy")
         destroyed = true
         notificationActive = false
+
+        // ★ 注销时区广播
+        try { unregisterReceiver(tzReceiver) } catch (_: Throwable) {}
+
         try { handler.removeCallbacksAndMessages(null) } catch (_: Throwable) {}
         handleStop()
         try { super.onDestroy() } catch (_: Throwable) {}
