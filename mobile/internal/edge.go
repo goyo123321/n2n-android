@@ -11,27 +11,24 @@ import (
 	"net"
 	"os"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 )
 
 type PeerInfo struct {
-	ClientID          string
-	VirtualIP         string
-	PubIP             string
-	PubPort           int
-	NATType           string
-	TurnRelayAddr     string
-	UDPAddr           *net.UDPAddr
-	lastRecvAt        int64
-	loggedReady       bool
-	hasRealData       bool
-	probeReplied      bool
-	AssistedEndpoints []string
+	ClientID      string
+	VirtualIP     string
+	PubIP         string
+	PubPort       int
+	NATType       string
+	TurnRelayAddr string
+	UDPAddr       *net.UDPAddr
+	lastRecvAt    int64
+	loggedReady   bool
+	hasRealData   bool
+	probeReplied  bool
 }
 
 type PeerSnapshot struct {
@@ -74,8 +71,6 @@ type Edge struct {
 
 	tunStateLog   map[string]ConnType
 	tunStateLogMu sync.Mutex
-
-	lastMetadataReportAt int64 // ★ 30 秒节流用（atomic）
 
 	doneCh  chan struct{}
 	closeMu sync.Mutex
@@ -460,12 +455,11 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		wsRef := e.ws
 		e.mu.Unlock()
 
-		log.Printf("[NAT] 探测完成: %s pub=%s multiExit=%v endpoints=%d",
-			meta.NATType, meta.PublicEndpoint, meta.MultiExit, len(meta.AllEndpoints))
+		log.Printf("[NAT] 探测完成: %s pub=%s multiExit=%v",
+			meta.NATType, meta.PublicEndpoint, meta.MultiExit)
 
 		if wsRef != nil {
 			e.reportMetadata()
-			atomic.StoreInt64(&e.lastMetadataReportAt, time.Now().UnixMilli())
 			log.Printf("[NAT] 已重新上报 p2p_metadata")
 		}
 	})
@@ -637,7 +631,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	if t == "_reconnected" {
 		log.Printf("[信令] WebSocket 重连成功，重新上报元数据")
 		e.reportMetadata()
-		atomic.StoreInt64(&e.lastMetadataReportAt, time.Now().UnixMilli())
 		return
 	}
 
@@ -658,7 +651,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		}
 
 		e.reportMetadata()
-		atomic.StoreInt64(&e.lastMetadataReportAt, time.Now().UnixMilli())
 
 		if peers, ok := payload["peers"].([]interface{}); ok {
 			log.Printf("[信令] ready: 返回 %d 个已有节点", len(peers))
@@ -673,20 +665,10 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 				pubPort := jsonInt(pm["publicPort"])
 				relayAddr, _ := pm["turnRelayAddr"].(string)
 				natType, _ := pm["natType"].(string)
-
-				var assisted []string
-				if raw, ok := pm["assistedEndpoints"].([]interface{}); ok {
-					for _, v := range raw {
-						if s, ok := v.(string); ok && s != "" {
-							assisted = append(assisted, s)
-						}
-					}
-				}
-
 				if pid == "" || pip == "" {
 					continue
 				}
-				e.registerPeer(pid, pip, pubIP, pubPort, natType, assisted)
+				e.registerPeer(pid, pip, pubIP, pubPort, natType)
 				if relayAddr != "" {
 					e.peersMu.Lock()
 					if pi, ok := e.peers[pid]; ok {
@@ -694,8 +676,8 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 					}
 					e.peersMu.Unlock()
 				}
-				log.Printf("[信令] 已有节点: %s vip=%s pub=%s:%d nat=%s assisted=%d",
-					pid, pip, pubIP, pubPort, natType, len(assisted))
+				log.Printf("[信令] 已有节点: %s vip=%s pub=%s:%d nat=%s",
+					pid, pip, pubIP, pubPort, natType)
 			}
 		}
 
@@ -710,20 +692,11 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		relayAddr, _ := payload["turnRelayAddr"].(string)
 		natType, _ := payload["natType"].(string)
 
-		var assisted []string
-		if raw, ok := payload["assistedEndpoints"].([]interface{}); ok {
-			for _, v := range raw {
-				if s, ok := v.(string); ok && s != "" {
-					assisted = append(assisted, s)
-				}
-			}
-		}
-
-		log.Printf("[信令] joined: from=%s vip=%s pub=%s:%d nat=%s assisted=%d",
-			from, pip, pubIP, pubPort, natType, len(assisted))
+		log.Printf("[信令] joined: from=%s vip=%s pub=%s:%d nat=%s",
+			from, pip, pubIP, pubPort, natType)
 
 		if from != "" && pip != "" {
-			e.registerPeer(from, pip, pubIP, pubPort, natType, assisted)
+			e.registerPeer(from, pip, pubIP, pubPort, natType)
 			if relayAddr != "" {
 				e.peersMu.Lock()
 				if pi, ok := e.peers[from]; ok {
@@ -784,7 +757,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 				p.TurnRelayAddr = relayAddr
 			}
 			e.peersMu.Unlock()
-			log.Printf("[TURN] 记录 %s 的中继地址: %s", edgeMac, relayAddr)
 		}
 
 	case "pong":
@@ -848,13 +820,9 @@ func (e *Edge) reportMetadata() {
 	if nm.PublicEndpoint != "" {
 		metaPayload["publicEndpoint"] = nm.PublicEndpoint
 	}
-	// ★ 上报所有 STUN 端点
-	if len(nm.AllEndpoints) > 0 {
-		metaPayload["assistedEndpoints"] = nm.AllEndpoints
-	}
 
-	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%q multiExit=%v assisted=%d",
-		nm.NATType, nm.PublicEndpoint, nm.MultiExit, len(nm.AllEndpoints))
+	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%q multiExit=%v",
+		nm.NATType, nm.PublicEndpoint, nm.MultiExit)
 
 	if ws == nil {
 		return
@@ -877,7 +845,7 @@ func jsonInt(v interface{}) int {
 	return 0
 }
 
-func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string, assisted []string) {
+func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string) {
 	var udpAddr *net.UDPAddr
 	if pubIP != "" && pubPort > 0 {
 		udpAddr = &net.UDPAddr{IP: net.ParseIP(pubIP), Port: pubPort}
@@ -902,15 +870,11 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string,
 		if natType != "" {
 			p.NATType = natType
 		}
-		if len(assisted) > 0 {
-			p.AssistedEndpoints = assisted
-		}
 	} else {
 		e.peers[pid] = &PeerInfo{
 			ClientID: pid, VirtualIP: vip, PubIP: pubIP,
 			PubPort: pubPort, UDPAddr: udpAddr,
 			NATType: natType,
-			AssistedEndpoints: assisted,
 		}
 	}
 	e.peersMu.Unlock()
@@ -1054,24 +1018,12 @@ func (e *Edge) udpReadLoop() {
 		if n < 4 {
 			continue
 		}
-
-		// ★ STUN Binding Response（0x0101）—— 从保活探测得到 CGNAT 映射
-		if buf[0] == 0x01 && buf[1] == 0x01 {
-			if ip, port, ok := parseSTUNResponse(buf[:n]); ok {
-				e.addAssistedEndpoint(ip, port)
-			}
-			continue
-		}
-
-		// N2NP probe
 		if buf[0] == 'N' && buf[1] == '2' && buf[2] == 'N' && buf[3] == 'P' {
 			if ua, ok := addr.(*net.UDPAddr); ok {
 				e.notePeerProbe(ua)
 			}
 			continue
 		}
-
-		// IPv4 数据帧
 		if buf[0]>>4 == 4 {
 			if ua, ok := addr.(*net.UDPAddr); ok {
 				e.notePeerTraffic(ua)
@@ -1324,51 +1276,4 @@ func (e *Edge) hasTrafficFromAny(ips []net.IP, since int64) bool {
 		}
 	}
 	return false
-}
-
-// ============ 多 STUN 端点收集 ============
-
-// addAssistedEndpoint 把一个 STUN 探测到的映射端点加入 AllEndpoints。
-//
-// 去重 + 上限 5 个（FIFO 淘汰最旧）。
-// 变化后触发一次节流上报（30 秒内最多一次）。
-func (e *Edge) addAssistedEndpoint(ip string, port int) {
-	if ip == "" || port <= 0 {
-		return
-	}
-	ep := net.JoinHostPort(ip, strconv.Itoa(port))
-
-	e.mu.Lock()
-	if e.natMeta == nil {
-		e.mu.Unlock()
-		return
-	}
-	for _, existing := range e.natMeta.AllEndpoints {
-		if existing == ep {
-			e.mu.Unlock()
-			return
-		}
-	}
-	if len(e.natMeta.AllEndpoints) >= 5 {
-		e.natMeta.AllEndpoints = e.natMeta.AllEndpoints[1:]
-	}
-	e.natMeta.AllEndpoints = append(e.natMeta.AllEndpoints, ep)
-	count := len(e.natMeta.AllEndpoints)
-	e.mu.Unlock()
-
-	log.Printf("[NAT] +assisted: %s (total=%d)", ep, count)
-	e.reportMetadataThrottled()
-}
-
-// reportMetadataThrottled 30 秒内最多上报一次 p2p_metadata。
-func (e *Edge) reportMetadataThrottled() {
-	now := time.Now().UnixMilli()
-	last := atomic.LoadInt64(&e.lastMetadataReportAt)
-	if now-last < 30000 {
-		return
-	}
-	if !atomic.CompareAndSwapInt64(&e.lastMetadataReportAt, last, now) {
-		return
-	}
-	e.reportMetadata()
 }
