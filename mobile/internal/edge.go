@@ -390,11 +390,13 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 			e.onRemotePacket(data)
 			return
 		}
+		// probe 判定（首 4 字节 "N2NP"）
 		if len(data) >= 4 &&
 			data[0] == 'N' && data[1] == '2' && data[2] == 'N' && data[3] == 'P' {
 			e.notePeerProbeTURN(ua)
 			return
 		}
+		// 真实 IPv4 数据帧
 		if len(data) > 0 && data[0]>>4 == 4 {
 			e.notePeerTrafficTURN(ua)
 			e.onRemotePacket(data)
@@ -1145,6 +1147,17 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 	e.notePeerCommon(addr, true, true)
 }
 
+// notePeerCommon 处理来自对端的 UDP 包。
+//
+// viaTURN：
+//   - false：从本地 UDP socket 收到 → 回包走本地 socket
+//   - true：从 TURN 中继收到 → 回包走 TURN（按原路）
+//
+// 首次收到 probe 的处理顺序：
+//   1. 立即上报 P2P（MarkP2P）
+//   2. 并发启动 5 轮 probe 回包（每 100ms 一次）
+//
+// 后续收到的 probe 只刷新 lastRecvAt，不再重复回包。
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool) {
 	now := time.Now().UnixMilli()
 
@@ -1200,6 +1213,9 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool) 
 		return
 	}
 
+	// ★ 首次收到该 peer 的 probe：
+	//    1. 立即上报 P2P
+	//    2. 并发回 5 轮（每 100ms 一次）
 	if e.relayMgr.GetState(clientID) != ConnP2P {
 		log.Printf("[P2P] 从 %s (%s) 收到打洞探测，上报 P2P 并回 5 轮", clientID, ip)
 		e.relayMgr.MarkP2P(clientID)
@@ -1221,6 +1237,7 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool) 
 	})
 }
 
+// writeProbe 按原路写一个 probe 包。
 func (e *Edge) writeProbe(addr *net.UDPAddr, probe []byte, viaTURN bool) {
 	if addr == nil {
 		return
@@ -1238,6 +1255,7 @@ func (e *Edge) writeProbe(addr *net.UDPAddr, probe []byte, viaTURN bool) {
 	_, _ = e.udpConn.WriteTo(probe, addr)
 }
 
+// sendProbeTo 保留兼容（当前无调用方）。
 func (e *Edge) sendProbeTo(addr *net.UDPAddr) {
 	if e.udpConn == nil || addr == nil {
 		return
@@ -1259,6 +1277,7 @@ func (e *Edge) hasTrafficFromTarget(peerID string, since int64) bool {
 	return p.lastRecvAt >= since
 }
 
+// hasTrafficFromAny 保留兼容（当前已无调用方）。
 func (e *Edge) hasTrafficFromAny(ips []net.IP, since int64) bool {
 	if len(ips) == 0 {
 		return false
