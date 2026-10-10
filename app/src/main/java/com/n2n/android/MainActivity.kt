@@ -69,9 +69,6 @@ class MainActivity : AppCompatActivity() {
         applyThemeMode(Prefs.loadThemeMode(this))
         super.onCreate(savedInstanceState)
 
-        // ★ 设置时区（Go 日志和 Kotlin 日志时间一致）
-        N2nController.applySystemTimezone()
-
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
@@ -167,10 +164,6 @@ class MainActivity : AppCompatActivity() {
         outState.putString("connectToken", binding.etConnectToken.text.toString())
     }
 
-    // ============================================================
-    // 深链延迟启动
-    // ============================================================
-
     private fun scheduleAutoStart(delayMs: Long = 300) {
         cancelPendingAutoStart()
         if (!::binding.isInitialized) return
@@ -191,10 +184,6 @@ class MainActivity : AppCompatActivity() {
         }
         pendingAutoStart = null
     }
-
-    // ============================================================
-    // 主题
-    // ============================================================
 
     private fun applyThemeMode(mode: Int) {
         val nightMode = when (mode) {
@@ -223,10 +212,6 @@ class MainActivity : AppCompatActivity() {
             }
             .show()
     }
-
-    // ============================================================
-    // 权限
-    // ============================================================
 
     private fun requestNotifPermissionIfNeeded() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -289,10 +274,6 @@ class MainActivity : AppCompatActivity() {
             .setCancelable(false)
             .show()
     }
-
-    // ============================================================
-    // 配置加载 / 保存
-    // ============================================================
 
     private fun loadConfig(savedInstanceState: Bundle?) {
         if (!::binding.isInitialized) return
@@ -386,10 +367,6 @@ class MainActivity : AppCompatActivity() {
             Log.e(TAG, "saveCurrentInput failed", t)
         }
     }
-
-    // ============================================================
-    // 启动 / 停止
-    // ============================================================
 
     private fun saveThenRequest() {
         saveCurrentInput()
@@ -491,10 +468,6 @@ class MainActivity : AppCompatActivity() {
             Log.e(TAG, "stopVpnService failed", t)
         }
     }
-
-    // ============================================================
-    // UI 刷新
-    // ============================================================
 
     private fun refreshStatus() {
         if (isFinishing || isDestroyed || !::binding.isInitialized) return
