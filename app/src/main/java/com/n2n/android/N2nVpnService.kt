@@ -19,6 +19,7 @@ import com.n2n.mobile.Client
 import com.n2n.mobile.Config
 import com.n2n.mobile.Protector
 import java.io.File
+import java.io.FileDescriptor
 import java.net.DatagramSocket
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -51,78 +52,97 @@ class N2nVpnService : VpnService() {
 
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
+
     private var protectedUdpSocket: DatagramSocket? = null
     private var protectedStunSocket: DatagramSocket? = null
+    private val udpFdHandedOff = AtomicBoolean(false)
+    private val stunFdHandedOff = AtomicBoolean(false)
 
     inner class ServiceProtector : Protector {
         override fun protect(fd: Long): Boolean {
             return try {
                 this@N2nVpnService.protect(fd.toInt())
-            } catch (e: Exception) {
-                Log.w(TAG, "protect($fd) 失败: ${e.message}")
+            } catch (t: Throwable) {
+                Log.w(TAG, "protect($fd) 失败: ${t.message}")
                 false
             }
         }
     }
 
+    // ============================================================
+    // 日志
+    // ============================================================
     private fun ktLog(msg: String) {
-        val ts = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
-        val line = "[$ts] [K] $msg"
+        try {
+            val ts = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+            val line = "[$ts] [K] $msg"
 
-        val candidates = mutableListOf<File>()
-        try { candidates.add(File(filesDir, "n2n.log")) } catch (_: Throwable) {}
-        candidates.add(File("/data/user/0/com.n2n.android/files/n2n.log"))
-        candidates.add(File("/data/data/com.n2n.android/files/n2n.log"))
+            val candidates = mutableListOf<File>()
+            try { candidates.add(File(filesDir, "n2n.log")) } catch (_: Throwable) {}
+            candidates.add(File("/data/user/0/com.n2n.android/files/n2n.log"))
+            candidates.add(File("/data/data/com.n2n.android/files/n2n.log"))
 
-        var written = false
-        for (f in candidates) {
-            try {
-                f.parentFile?.mkdirs()
-                f.appendText("$line\n")
-                written = true
-                break
-            } catch (_: Exception) {}
+            var written = false
+            for (f in candidates) {
+                try {
+                    f.parentFile?.mkdirs()
+                    f.appendText("$line\n")
+                    written = true
+                    break
+                } catch (_: Throwable) {}
+            }
+            if (!written) Log.e(TAG, "ktLog 全部路径写入失败")
+        } catch (_: Throwable) {
         }
-        if (!written) Log.e(TAG, "ktLog 全部路径写入失败")
         Log.i(TAG, msg)
     }
 
     private val updateIpRunnable = object : Runnable {
         private var attempts = 0
         override fun run() {
-            attempts++
-            val ip = N2nController.getVirtualIP()
-            if (ip.isNotEmpty()) {
-                updateNotification("已连接 · 虚拟 IP $ip")
-                Log.i(TAG, "VPN 虚拟 IP: $ip")
-            } else if (attempts < 30) {
-                updateNotification("正在连接... (${attempts}s)")
-                handler.postDelayed(this, 1000)
-            } else {
-                updateNotification("正在连接... (${attempts}s)")
-                handler.postDelayed(this, 3000)
+            try {
+                attempts++
+                val ip = N2nController.getVirtualIP()
+                if (ip.isNotEmpty()) {
+                    updateNotification("已连接 · 虚拟 IP $ip")
+                    Log.i(TAG, "VPN 虚拟 IP: $ip")
+                } else if (attempts < 30) {
+                    updateNotification("正在连接... (${attempts}s)")
+                    handler.postDelayed(this, 1000)
+                } else {
+                    updateNotification("正在连接... (${attempts}s)")
+                    handler.postDelayed(this, 3000)
+                }
+            } catch (t: Throwable) {
+                Log.e(TAG, "updateIpRunnable failed", t)
             }
         }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         ktLog("onStartCommand action=${intent?.action}")
-        when (intent?.action) {
-            ACTION_START -> handleStart(intent)
-            ACTION_STOP -> handleStop()
-            else -> {
-                ktLog("unknown action or null intent, stopSelf")
-                stopSelf()
-                return START_NOT_STICKY
+        try {
+            when (intent?.action) {
+                ACTION_START -> handleStart(intent)
+                ACTION_STOP -> handleStop()
+                else -> {
+                    ktLog("unknown action or null intent, stopSelf")
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
             }
+        } catch (t: Throwable) {
+            ktLog("onStartCommand 崩溃: ${t.message}")
+            Log.e(TAG, "onStartCommand crash", t)
+            try { handleStop() } catch (_: Throwable) {}
         }
         return START_NOT_STICKY
     }
 
     override fun onRevoke() {
         ktLog("onRevoke: VPN 权限被撤销")
-        handleStop()
-        super.onRevoke()
+        try { handleStop() } catch (_: Throwable) {}
+        try { super.onRevoke() } catch (_: Throwable) {}
     }
 
     private fun handleStart(intent: Intent) {
@@ -163,14 +183,22 @@ class N2nVpnService : VpnService() {
             return
         }
 
-        val config = Config().apply {
-            setSignalingURL(signalingUrl)
-            setRoomID(roomId)
-            setClientID(clientId)
-            setNodeName(nodeName)
-            setConnectToken(connectToken)
-            setPreferredIP(preferredIp)
-            setPreferredPort(443)
+        val config = try {
+            Config().apply {
+                setSignalingURL(signalingUrl)
+                setRoomID(roomId)
+                setClientID(clientId)
+                setNodeName(nodeName)
+                setConnectToken(connectToken)
+                setPreferredIP(preferredIp)
+                setPreferredPort(443)
+            }
+        } catch (t: Throwable) {
+            ktLog("Config 构造失败: ${t.message}")
+            Log.e(TAG, "Config build failed", t)
+            starting.set(false)
+            stopVpn()
+            return
         }
         ktLog("Config 构造完成")
 
@@ -178,7 +206,7 @@ class N2nVpnService : VpnService() {
             try {
                 ktLog("开始 FetchVIP")
                 val tmpClient = Client()
-                val vip = tmpClient.fetchVirtualIP(config)
+                val vip = tmpClient.fetchVirtualIP(config) ?: ""
                 ktLog("FetchVIP 返回: '$vip'")
 
                 handler.post {
@@ -205,39 +233,45 @@ class N2nVpnService : VpnService() {
                         ktLog("创建 protected UDP socket")
                         val udpFd = createProtectedUdpSocket()
                         ktLog("UDP fd=$udpFd")
+                        if (udpFd <= 0) {
+                            ktLog("UDP fd 无效，退出")
+                            updateNotification("UDP socket 创建失败")
+                            handler.postDelayed({ stopVpn() }, 3000)
+                            return@post
+                        }
 
                         ktLog("创建 protected STUN socket")
                         val stunFd = createProtectedStunSocket()
                         ktLog("STUN fd=$stunFd")
 
-                        if (udpFd <= 0) {
-                            ktLog("UDP fd 无效，无法建立 P2P，退出")
-                            updateNotification("UDP socket 创建失败")
-                            handler.postDelayed({ stopVpn() }, 3000)
-                            return@post
-                        }
+                        udpFdHandedOff.set(true)
+                        if (stunFd > 0) stunFdHandedOff.set(true)
 
                         ktLog("调用 startAsync")
                         N2nController.startAsync(
                             tunFd, udpFd, stunFd, config, ServiceProtector()
                         ) { err ->
                             handler.post {
-                                if (err.isNotEmpty()) {
-                                    ktLog("startAsync 失败: $err")
-                                    updateNotification("启动失败: $err")
-                                    handler.postDelayed({ stopVpn() }, 3000)
-                                } else {
-                                    ktLog("startAsync 成功")
-                                    started = true
-                                    starting.set(false)
-                                    handler.post(updateIpRunnable)
+                                try {
+                                    if (err.isNotEmpty()) {
+                                        ktLog("startAsync 失败: $err")
+                                        updateNotification("启动失败: $err")
+                                        handler.postDelayed({ stopVpn() }, 3000)
+                                    } else {
+                                        ktLog("startAsync 成功")
+                                        started = true
+                                        starting.set(false)
+                                        handler.post(updateIpRunnable)
+                                    }
+                                } catch (t: Throwable) {
+                                    Log.e(TAG, "startAsync callback failed", t)
                                 }
                             }
                         }
                     } catch (t: Throwable) {
                         ktLog("handler.post 崩溃: ${t.message}")
                         Log.e(TAG, "handler.post failed", t)
-                        updateNotification("启动失败: ${t.message}")
+                        try { updateNotification("启动失败: ${t.message}") } catch (_: Throwable) {}
                         handler.postDelayed({ stopVpn() }, 3000)
                     }
                 }
@@ -245,26 +279,98 @@ class N2nVpnService : VpnService() {
                 ktLog("handleStart Thread 崩溃: ${t.message}")
                 Log.e(TAG, "handleStart thread failed", t)
                 handler.post {
-                    updateNotification("启动失败: ${t.message}")
+                    try { updateNotification("启动失败: ${t.message}") } catch (_: Throwable) {}
                     handler.postDelayed({ stopVpn() }, 3000)
                 }
             }
         }.start()
     }
 
+    // ============================================================
+    // 从 DatagramSocket 提取 fd
+    // ============================================================
+    private fun extractFdFromDatagramSocket(socket: DatagramSocket): Int {
+        try {
+            val m = ParcelFileDescriptor::class.java.getDeclaredMethod(
+                "fromDatagramSocket", DatagramSocket::class.java
+            )
+            m.isAccessible = true
+            val pfd = m.invoke(null, socket) as? ParcelFileDescriptor
+            if (pfd != null) {
+                val fd = extractDescriptorFromPfd(pfd)
+                if (fd > 0) return fd
+            }
+        } catch (_: Throwable) {}
+
+        try {
+            val implField = DatagramSocket::class.java.getDeclaredField("impl")
+            implField.isAccessible = true
+            val impl = implField.get(socket) ?: return -1
+
+            var cls: Class<*>? = impl.javaClass
+            var fdField: java.lang.reflect.Field? = null
+            while (cls != null && cls != Any::class.java) {
+                try {
+                    fdField = cls.getDeclaredField("fd")
+                    break
+                } catch (_: NoSuchFieldException) {
+                    cls = cls.superclass
+                }
+            }
+            if (fdField == null) return -1
+            fdField.isAccessible = true
+            val fdObj = fdField.get(impl) as? FileDescriptor ?: return -1
+
+            val descriptorField = FileDescriptor::class.java
+                .getDeclaredField("descriptor")
+            descriptorField.isAccessible = true
+            return descriptorField.getInt(fdObj)
+        } catch (_: Throwable) {}
+
+        return -1
+    }
+
+    private fun extractDescriptorFromPfd(pfd: ParcelFileDescriptor): Int {
+        return try {
+            val mFdField = ParcelFileDescriptor::class.java.getDeclaredField("mFd")
+            mFdField.isAccessible = true
+            val fileDescriptor = mFdField.get(pfd) as? FileDescriptor ?: return -1
+            val descriptorField = FileDescriptor::class.java
+                .getDeclaredField("descriptor")
+            descriptorField.isAccessible = true
+            descriptorField.getInt(fileDescriptor)
+        } catch (_: Throwable) {
+            -1
+        }
+    }
+
     private fun createProtectedUdpSocket(): Int {
         return try {
             val socket = DatagramSocket()
             socket.reuseAddress = true
-            val ok = protect(socket)
-            if (!ok) ktLog("protect(DatagramSocket) 返回 false")
+
+            val protectedOk = try { protect(socket) } catch (t: Throwable) {
+                ktLog("protect(UDP) 抛异常: ${t.message}")
+                false
+            }
+            if (!protectedOk) {
+                ktLog("protect(DatagramSocket) 返回 false，关闭 socket")
+                try { socket.close() } catch (_: Throwable) {}
+                return -1
+            }
+
+            val fd = extractFdFromDatagramSocket(socket)
+            if (fd <= 0) {
+                ktLog("无法从 DatagramSocket 提取 fd")
+                try { socket.close() } catch (_: Throwable) {}
+                return -1
+            }
+
             protectedUdpSocket = socket
-            val pfd = ParcelFileDescriptor.fromDatagramSocket(socket)
-            val fd = pfd.detachFd()
             ktLog("protected UDP socket fd=$fd")
             fd
-        } catch (e: Exception) {
-            ktLog("createProtectedUdpSocket 失败: ${e.message}")
+        } catch (t: Throwable) {
+            ktLog("createProtectedUdpSocket 失败: ${t.message}")
             -1
         }
     }
@@ -273,19 +379,34 @@ class N2nVpnService : VpnService() {
         return try {
             val socket = DatagramSocket()
             socket.reuseAddress = true
-            protect(socket)
+
+            val protectedOk = try { protect(socket) } catch (t: Throwable) {
+                ktLog("protect(STUN) 抛异常: ${t.message}")
+                false
+            }
+            if (!protectedOk) {
+                try { socket.close() } catch (_: Throwable) {}
+                return -1
+            }
+
+            val fd = extractFdFromDatagramSocket(socket)
+            if (fd <= 0) {
+                try { socket.close() } catch (_: Throwable) {}
+                return -1
+            }
+
             protectedStunSocket = socket
-            val pfd = ParcelFileDescriptor.fromDatagramSocket(socket)
-            val fd = pfd.detachFd()
             ktLog("protected STUN socket fd=$fd")
             fd
-        } catch (e: Exception) {
-            ktLog("createProtectedStunSocket 失败: ${e.message}")
+        } catch (t: Throwable) {
+            ktLog("createProtectedStunSocket 失败: ${t.message}")
             -1
         }
     }
 
-    private fun stopVpn() { handleStop() }
+    private fun stopVpn() {
+        try { handleStop() } catch (t: Throwable) { Log.e(TAG, "stopVpn failed", t) }
+    }
 
     private fun handleStop() {
         if (!stopping.compareAndSet(false, true)) {
@@ -297,27 +418,38 @@ class N2nVpnService : VpnService() {
             handler.removeCallbacks(updateIpRunnable)
 
             if (started) {
-                N2nController.stop()
+                try { N2nController.stop() } catch (t: Throwable) {
+                    Log.e(TAG, "N2nController.stop failed", t)
+                }
                 started = false
             }
             starting.set(false)
 
-            try { tunInterface?.close() } catch (_: Exception) {}
+            try { tunInterface?.close() } catch (_: Throwable) {}
             tunInterface = null
-            try { protectedUdpSocket?.close() } catch (_: Exception) {}
+
+            try { protectedUdpSocket?.close() } catch (_: Throwable) {}
             protectedUdpSocket = null
-            try { protectedStunSocket?.close() } catch (_: Exception) {}
+            udpFdHandedOff.set(false)
+
+            try { protectedStunSocket?.close() } catch (_: Throwable) {}
             protectedStunSocket = null
+            stunFdHandedOff.set(false)
+
             releaseLocks()
             ktLog("handleStop 清理完成")
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-            } else {
-                @Suppress("DEPRECATION")
-                stopForeground(true)
-            }
-            stopSelf()
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                } else {
+                    @Suppress("DEPRECATION")
+                    stopForeground(true)
+                }
+            } catch (_: Throwable) {}
+            try { stopSelf() } catch (_: Throwable) {}
+        } catch (t: Throwable) {
+            Log.e(TAG, "handleStop 异常", t)
         } finally {
             stopping.set(false)
         }
@@ -332,7 +464,7 @@ class N2nVpnService : VpnService() {
                 setReferenceCounted(false)
                 acquire()
             }
-        } catch (e: Exception) { ktLog("acquire WakeLock 失败: ${e.message}") }
+        } catch (t: Throwable) { ktLog("acquire WakeLock 失败: ${t.message}") }
         try {
             val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
             wifiLock = wm.createWifiLock(
@@ -341,13 +473,13 @@ class N2nVpnService : VpnService() {
                 setReferenceCounted(false)
                 acquire()
             }
-        } catch (e: Exception) { ktLog("acquire WifiLock 失败: ${e.message}") }
+        } catch (t: Throwable) { ktLog("acquire WifiLock 失败: ${t.message}") }
     }
 
     private fun releaseLocks() {
-        try { wakeLock?.let { if (it.isHeld) it.release() } } catch (_: Exception) {}
+        try { wakeLock?.let { if (it.isHeld) it.release() } } catch (_: Throwable) {}
         wakeLock = null
-        try { wifiLock?.let { if (it.isHeld) it.release() } } catch (_: Exception) {}
+        try { wifiLock?.let { if (it.isHeld) it.release() } } catch (_: Throwable) {}
         wifiLock = null
     }
 
@@ -361,13 +493,15 @@ class N2nVpnService : VpnService() {
                 .addAddress(vip, 24)
                 .addRoute("10.64.0.0", 24)
 
+            try { builder.addDisallowedApplication(packageName) } catch (_: Throwable) {}
+
             ktLog("TUN 仅接管 10.64.0.0/24，其他流量走系统默认")
 
             val pfd = builder.setBlocking(true).establish()
             ktLog("TUN establish 成功")
             pfd
-        } catch (e: Exception) {
-            ktLog("establish TUN 失败: ${e.message}")
+        } catch (t: Throwable) {
+            ktLog("establish TUN 失败: ${t.message}")
             null
         }
     }
@@ -393,26 +527,28 @@ class N2nVpnService : VpnService() {
         try {
             val nm = getSystemService(NotificationManager::class.java)
             nm.notify(NOTIF_ID, buildNotification(text))
-        } catch (_: Exception) {}
+        } catch (_: Throwable) {}
     }
 
     private fun createChannelIfNeeded() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val nm = getSystemService(NotificationManager::class.java)
-            if (nm.getNotificationChannel(NOTIF_CHANNEL_ID) == null) {
-                val ch = NotificationChannel(
-                    NOTIF_CHANNEL_ID, "n2n VPN",
-                    NotificationManager.IMPORTANCE_LOW
-                ).apply { description = "n2n 组网运行状态" }
-                nm.createNotificationChannel(ch)
-            }
+            try {
+                val nm = getSystemService(NotificationManager::class.java)
+                if (nm.getNotificationChannel(NOTIF_CHANNEL_ID) == null) {
+                    val ch = NotificationChannel(
+                        NOTIF_CHANNEL_ID, "n2n VPN",
+                        NotificationManager.IMPORTANCE_LOW
+                    ).apply { description = "n2n 组网运行状态" }
+                    nm.createNotificationChannel(ch)
+                }
+            } catch (_: Throwable) {}
         }
     }
 
     override fun onDestroy() {
         ktLog("onDestroy")
-        handler.removeCallbacks(updateIpRunnable)
+        try { handler.removeCallbacks(updateIpRunnable) } catch (_: Throwable) {}
         handleStop()
-        super.onDestroy()
+        try { super.onDestroy() } catch (_: Throwable) {}
     }
 }
