@@ -345,7 +345,7 @@ func (t *TURNLite) Allocate() error {
 		if err != nil {
 			return fmt.Errorf("TCP 连接失败: %w", err)
 		}
-		// ★ TCP keepalive：尽早检测对端断开
+		// TCP keepalive：尽早检测对端断开
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			_ = tcpConn.SetKeepAlive(true)
 			_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
@@ -435,6 +435,13 @@ func (t *TURNLite) extractAllocateResult(resp *stunMessage) error {
 
 // ============ CreatePermission ============
 
+// ensurePermission 确保向 remoteAddr 的发送已被 TURN 服务器授权。
+//
+// TURN 协议（RFC 5766）要求客户端向某个对端地址发送数据前，必须先
+// 用 CreatePermission 在服务器上建立对该 IP 的权限。
+//
+// ★ 438 Stale Nonce 是 TURN 服务器的正常行为（每 60 秒轮换 nonce），
+//   需要换新 nonce 重试一次。
 func (t *TURNLite) ensurePermission(ip net.IP) error {
 	key := ip.String()
 	t.permMu.Lock()
@@ -446,12 +453,38 @@ func (t *TURNLite) ensurePermission(ip net.IP) error {
 	}
 
 	peerData := xorEncodePeer(ip, 0)
+
+	// 第一次尝试
 	resp, err := t.sendRequest(msgCreatePermissionReq, []stunAttr{
 		{typ: attrXorPeerAddress, value: peerData},
 	}, true)
 	if err != nil {
 		return fmt.Errorf("CreatePermission: %w", err)
 	}
+
+	// ★ 438 Stale Nonce：换 nonce 重试一次
+	if resp.msgType != msgCreatePermissionSuc {
+		code := parseErrorCode(resp.attrs[attrErrorCode])
+		if code == 438 {
+			newNonce := resp.attrs[attrNonce]
+			if len(newNonce) > 0 {
+				t.mu.Lock()
+				t.nonce = newNonce
+				t.mu.Unlock()
+				log.Printf("[TURN-Lite] CreatePermission 收到 438，换 nonce 重试")
+
+				resp, err = t.sendRequest(msgCreatePermissionReq, []stunAttr{
+					{typ: attrXorPeerAddress, value: peerData},
+				}, true)
+				if err != nil {
+					return fmt.Errorf("CreatePermission 438 重试失败: %w", err)
+				}
+			} else {
+				log.Printf("[TURN-Lite] CreatePermission 438 但响应无 nonce")
+			}
+		}
+	}
+
 	if resp.msgType != msgCreatePermissionSuc {
 		code := parseErrorCode(resp.attrs[attrErrorCode])
 		return fmt.Errorf("CreatePermission 被拒 code=%d", code)
@@ -607,8 +640,8 @@ func (t *TURNLite) handleIncoming(data []byte) {
 
 // refreshLoop 每 60 秒刷新 TURN allocation。
 //
-// ★ 连续失败 3 次主动关闭自己，让上层 turn-reconnect（30 秒周期）
-//   检测到 IsReady()==false 并触发重建。
+// 连续失败 3 次主动关闭自己，让上层 turn-reconnect（30 秒周期）
+// 检测到 IsReady()==false 并触发重建。
 //
 // 触发场景：
 //   - TCP transport 下 TURN 服务器 idle 5 分钟断连 → Write 成功但
