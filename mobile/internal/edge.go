@@ -22,6 +22,7 @@ type PeerInfo struct {
 	VirtualIP     string
 	PubIP         string
 	PubPort       int
+	NATType       string // ← 新增：对端上报的 natType
 	TurnRelayAddr string
 	UDPAddr       *net.UDPAddr
 	lastRecvAt    int64
@@ -538,16 +539,18 @@ func (e *Edge) GetClientID() string { return e.clientId }
 func (e *Edge) GetPeersJSON() string {
 	e.peersMu.RLock()
 	type pair struct {
-		id     string
-		vip    string
-		online bool
+		id      string
+		vip     string
+		online  bool
+		natType string // ← 新增：对端的 natType
 	}
 	var list []pair
 	for id, p := range e.peers {
 		list = append(list, pair{
-			id:     id,
-			vip:    p.VirtualIP,
-			online: p.UDPAddr != nil || p.TurnRelayAddr != "",
+			id:      id,
+			vip:     p.VirtualIP,
+			online:  p.UDPAddr != nil || p.TurnRelayAddr != "",
+			natType: p.NATType, // ← 用对端的
 		})
 	}
 	e.peersMu.RUnlock()
@@ -560,18 +563,15 @@ func (e *Edge) GetPeersJSON() string {
 		}
 	}
 
-	e.mu.Lock()
-	natType := "unknown"
-	if e.natMeta != nil {
-		natType = e.natMeta.NATType
-	}
-	e.mu.Unlock()
-
 	snapshots := make([]PeerSnapshot, 0, len(list))
 	for i, item := range list {
 		connType := "unknown"
 		if e.relayMgr != nil {
 			connType = string(e.relayMgr.GetState(item.id))
+		}
+		natType := item.natType
+		if natType == "" {
+			natType = "unknown"
 		}
 		snapshots = append(snapshots, PeerSnapshot{
 			Code:      idxToCode(i),
@@ -658,10 +658,11 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 				pubIP, _ := pm["publicIp"].(string)
 				pubPort := jsonInt(pm["publicPort"])
 				relayAddr, _ := pm["turnRelayAddr"].(string)
+				natType, _ := pm["natType"].(string) // ← 新增：读对端 natType
 				if pid == "" || pip == "" {
 					continue
 				}
-				e.registerPeer(pid, pip, pubIP, pubPort)
+				e.registerPeer(pid, pip, pubIP, pubPort, natType) // ← 加参数
 				if relayAddr != "" {
 					e.peersMu.Lock()
 					if pi, ok := e.peers[pid]; ok {
@@ -669,7 +670,8 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 					}
 					e.peersMu.Unlock()
 				}
-				log.Printf("[信令] 已有节点: %s vip=%s pub=%s:%d", pid, pip, pubIP, pubPort)
+				log.Printf("[信令] 已有节点: %s vip=%s pub=%s:%d nat=%s",
+					pid, pip, pubIP, pubPort, natType)
 			}
 		}
 
@@ -682,11 +684,13 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		pubIP, _ := payload["publicIp"].(string)
 		pubPort := jsonInt(payload["publicPort"])
 		relayAddr, _ := payload["turnRelayAddr"].(string)
+		natType, _ := payload["natType"].(string) // ← 新增：读对端 natType
 
-		log.Printf("[信令] joined: from=%s vip=%s pub=%s:%d", from, pip, pubIP, pubPort)
+		log.Printf("[信令] joined: from=%s vip=%s pub=%s:%d nat=%s",
+			from, pip, pubIP, pubPort, natType)
 
 		if from != "" && pip != "" {
-			e.registerPeer(from, pip, pubIP, pubPort)
+			e.registerPeer(from, pip, pubIP, pubPort, natType) // ← 加参数
 			if relayAddr != "" {
 				e.peersMu.Lock()
 				if pi, ok := e.peers[from]; ok {
@@ -838,7 +842,8 @@ func jsonInt(v interface{}) int {
 	return 0
 }
 
-func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int) {
+// registerPeer 注册/更新对端信息。natType 为空时保留原值。
+func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string) {
 	var udpAddr *net.UDPAddr
 	if pubIP != "" && pubPort > 0 {
 		udpAddr = &net.UDPAddr{IP: net.ParseIP(pubIP), Port: pubPort}
@@ -860,10 +865,14 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int) {
 		if udpAddr != nil {
 			p.UDPAddr = udpAddr
 		}
+		if natType != "" { // ← 新增
+			p.NATType = natType
+		}
 	} else {
 		e.peers[pid] = &PeerInfo{
 			ClientID: pid, VirtualIP: vip, PubIP: pubIP,
 			PubPort: pubPort, UDPAddr: udpAddr,
+			NATType: natType, // ← 新增
 		}
 	}
 	e.peersMu.Unlock()
