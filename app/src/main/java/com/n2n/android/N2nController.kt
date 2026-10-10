@@ -16,25 +16,16 @@ object N2nController {
     private val running = AtomicBoolean(false)
     private val clientLock = Any()
 
-    // ★ 时区：只在第一次调用时生效，之后忽略（除非偏移量变化）
     @Volatile private var tzApplied = false
-    @Volatile private var tzAppliedOffset = Int.MIN_VALUE
+    @Volatile private var tzAppliedOffset = Long.MIN_VALUE
 
     fun isRunning(): Boolean = running.get()
 
-    /**
-     * 把设备当前时区偏移量传给 Go 侧。
-     *
-     * gomobile 环境下 Go 的 time.Local 默认为 UTC，无法读取 Android
-     * 系统时区。Kotlin 侧读 TimeZone.getDefault() 后传给 Go。
-     *
-     * 幂等：偏移量没变时跳过。
-     */
     fun applySystemTimezone() {
         try {
             val tz = java.util.TimeZone.getDefault()
             val offsetMs = tz.getOffset(System.currentTimeMillis())
-            val offsetSec = offsetMs / 1000
+            val offsetSec = (offsetMs / 1000).toLong()
             if (tzApplied && tzAppliedOffset == offsetSec) return
             Mobile.setTimezoneOffset(offsetSec)
             tzApplied = true
