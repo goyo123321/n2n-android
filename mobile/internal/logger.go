@@ -11,21 +11,8 @@ import (
 	"time"
 )
 
-// ============ 配置 ============
-
-// maxLogLines 内存缓冲 + 文件保留的最大行数。
-//
-// 日志现在很干净（P2P 稳定时几乎无输出），1000 行足够回顾最近的一次
-// 打洞/连接事件。超出后丢弃最旧的行。
 const maxLogLines = 1000
-
-// rewriteEvery 每 N 次追加后重写一次文件。
-//
-// 写入用 O_APPEND 性能好，但文件会无限增长。每 N 次追加后重写，
-// 只保留最近 maxLogLines 行，让文件大小稳定。
 const rewriteEvery = 1000
-
-// ============ 内部状态 ============
 
 var (
 	logBuffer   []string
@@ -38,8 +25,6 @@ var (
 	counterMu     sync.Mutex
 )
 
-// ============ 文件路径设置 ============
-
 func setLogFilePath(path string) {
 	logFileMu.Lock()
 	logFilePath = path
@@ -49,7 +34,6 @@ func setLogFilePath(path string) {
 		return
 	}
 
-	// 读回历史日志（截断到 maxLogLines）
 	if data, err := os.ReadFile(path); err == nil {
 		content := strings.TrimRight(string(data), "\n")
 		if content == "" {
@@ -65,17 +49,13 @@ func setLogFilePath(path string) {
 	}
 }
 
-// ============ 追加 ============
-
-// AppendLog 追加一行日志（带时间戳），同步写文件。
+// AppendLog 追加一行日志（带时间戳）。
 //
-// 淘汰策略：
-//   - 内存：超过 maxLogLines 时丢弃最旧的
-//   - 文件：每 rewriteEvery 次追加重写一次，只保留最近 maxLogLines 行
+// ★ 时区修复：用 time.Now().Local()，避免 gomobile 环境里
+//   time.Local 默认为 UTC 导致日志时间与 Kotlin 侧差 8 小时。
 func AppendLog(msg string) {
-	line := fmt.Sprintf("[%s] %s", time.Now().Format("15:04:05"), msg)
+	line := fmt.Sprintf("[%s] %s", time.Now().Local().Format("15:04:05"), msg)
 
-	// 更新内存缓冲
 	logBufferMu.Lock()
 	logBuffer = append(logBuffer, line)
 	if len(logBuffer) > maxLogLines {
@@ -83,7 +63,6 @@ func AppendLog(msg string) {
 	}
 	logBufferMu.Unlock()
 
-	// 写文件（追加模式）
 	logFileMu.Lock()
 	path := logFilePath
 	logFileMu.Unlock()
@@ -98,7 +77,6 @@ func AppendLog(msg string) {
 		_ = f.Close()
 	}
 
-	// 定期重写，限制文件大小
 	counterMu.Lock()
 	appendCounter++
 	needRewrite := appendCounter >= rewriteEvery
@@ -112,7 +90,6 @@ func AppendLog(msg string) {
 	}
 }
 
-// rewriteLogFile 重写文件，只保留最近 maxLogLines 行。
 func rewriteLogFile(path string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -127,7 +104,6 @@ func rewriteLogFile(path string) {
 		lines = lines[len(lines)-maxLogLines:]
 	}
 
-	// 原子写：先写临时文件再 rename
 	tmpPath := path + ".tmp"
 	if err := os.WriteFile(tmpPath, []byte(strings.Join(lines, "\n")+"\n"), 0644); err != nil {
 		return
@@ -135,9 +111,6 @@ func rewriteLogFile(path string) {
 	_ = os.Rename(tmpPath, path)
 }
 
-// ============ 读取 ============
-
-// GetLogs 每次从文件重读（这样 Kotlin ktLog 写的内容也能被看到）。
 func GetLogs() string {
 	logFileMu.Lock()
 	path := logFilePath
@@ -174,8 +147,6 @@ func GetLogs() string {
 	return sb.String()
 }
 
-// ============ 清空 ============
-
 func ClearLogs() {
 	logBufferMu.Lock()
 	logBuffer = nil
@@ -191,8 +162,6 @@ func ClearLogs() {
 	}
 }
 
-// ============ 标准库 log 重定向 ============
-
 type logWriter struct{}
 
 func (w logWriter) Write(p []byte) (int, error) {
@@ -207,9 +176,16 @@ func initLogRedirection() {
 	log.SetFlags(0)
 }
 
-// ============ 初始化 ============
-
 func init() {
+	// ★ 诊断：打印一次当前时区，便于确认 Go 侧时间基准
+	{
+		local := time.Now().Local()
+		_, offset := local.Zone()
+		fmt.Fprintf(os.Stderr,
+			"[logger] TZ=%q local=%v offset=%+d秒 now=%v\n",
+			os.Getenv("TZ"), time.Local, offset, local.Format("15:04:05"))
+	}
+
 	initLogRedirection()
 
 	candidates := []string{
