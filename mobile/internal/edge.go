@@ -22,7 +22,7 @@ type PeerInfo struct {
 	VirtualIP     string
 	PubIP         string
 	PubPort       int
-	NATType       string // ← 新增：对端上报的 natType
+	NATType       string
 	TurnRelayAddr string
 	UDPAddr       *net.UDPAddr
 	lastRecvAt    int64
@@ -65,11 +65,9 @@ type Edge struct {
 	fallbackTimers   map[string]*time.Timer
 	fallbackTimersMu sync.Mutex
 
-	// 日志节流：同一 dstIP 每 5 秒最多打一次"无匹配 peer"
 	lastNoPeerLog   map[string]int64
 	lastNoPeerLogMu sync.Mutex
 
-	// 状态变化日志：同一 peer 状态不变时不打 TUN 转发日志
 	tunStateLog   map[string]ConnType
 	tunStateLogMu sync.Mutex
 
@@ -79,7 +77,6 @@ type Edge struct {
 	mu      sync.Mutex
 }
 
-// safeGo 在 goroutine 里执行 fn，panic 时只记录日志，不让整个进程崩溃。
 func safeGo(name string, fn func()) {
 	go func() {
 		defer func() {
@@ -314,14 +311,12 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		},
 	}
 
-	// 1. TUN
 	tun, err := setupTUNFromFD(tunFd)
 	if err != nil {
 		return nil, fmt.Errorf("包装 TUN fd 失败: %w", err)
 	}
 	e.tun = tun
 
-	// 2. UDP
 	var udpConn net.PacketConn
 	if udpFd > 0 {
 		file := os.NewFile(uintptr(udpFd), "protected-udp")
@@ -355,7 +350,6 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	}
 	log.Printf("[P2P] UDP 监听端口 %d", e.udpPort)
 
-	// 3. STUN socket
 	var stunConn net.PacketConn
 	if stunFd > 0 {
 		file := os.NewFile(uintptr(stunFd), "protected-stun")
@@ -374,7 +368,6 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		log.Printf("[NAT] 无 protected STUN socket，STUN 探测可能失败")
 	}
 
-	// 4. 信令
 	ws, err := NewWSTransport(
 		cfg.SignalingURL, cfg.RoomID, clientId, cfg.ConnectToken,
 		cfg.PreferredIP, cfg.PreferredPort,
@@ -389,17 +382,14 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	}
 	e.ws = ws
 
-	// 5. TURN
 	e.turnClient = NewTURNClient(cfg.SignalingURL, cfg.ConnectToken, e)
 	e.turnClient.onMessage = func(data []byte, addr net.Addr) {
 		e.onRemotePacket(data)
 	}
 
-	// 6. 中继（必须在 SetHandlers 之前初始化）
 	e.relayMgr = NewRelayManager(ws, e.turnClient, e)
 	e.relayMgr.Report(10 * time.Second)
 
-	// 7. 回调
 	ws.SetHandlers(
 		e.handleSignaling,
 		func(data []byte) {
@@ -407,15 +397,12 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		},
 	)
 
-	// 8. 后台协程
 	safeGo("udpReadLoop", e.udpReadLoop)
 	safeGo("tunWriteLoop", e.tunWriteLoop)
 	safeGo("tunReadLoop", e.tunReadLoop)
 
-	// 启动 UDP 保活
 	e.startKeepalive()
 
-	// 9. NAT 探测
 	safeGo("nat-probe", func() {
 		log.Printf("[NAT] 开始异步 STUN 探测...")
 		var meta *NATMetadata
@@ -462,7 +449,6 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		}
 	})
 
-	// 10. TURN 异步初始化
 	safeGo("turn-init", func() {
 		time.Sleep(200 * time.Millisecond)
 		ctx, cancel := contextWithTimeout(30 * time.Second)
@@ -487,7 +473,6 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		}
 	})
 
-	// 11. TURN 后台重连循环
 	e.turnClient.StartReconnectLoop()
 
 	log.Printf("[Edge] 已启动 clientId=%s room=%s", clientId, cfg.RoomID)
@@ -542,7 +527,7 @@ func (e *Edge) GetPeersJSON() string {
 		id      string
 		vip     string
 		online  bool
-		natType string // ← 新增：对端的 natType
+		natType string
 	}
 	var list []pair
 	for id, p := range e.peers {
@@ -550,7 +535,7 @@ func (e *Edge) GetPeersJSON() string {
 			id:      id,
 			vip:     p.VirtualIP,
 			online:  p.UDPAddr != nil || p.TurnRelayAddr != "",
-			natType: p.NATType, // ← 用对端的
+			natType: p.NATType,
 		})
 	}
 	e.peersMu.RUnlock()
@@ -658,11 +643,11 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 				pubIP, _ := pm["publicIp"].(string)
 				pubPort := jsonInt(pm["publicPort"])
 				relayAddr, _ := pm["turnRelayAddr"].(string)
-				natType, _ := pm["natType"].(string) // ← 新增：读对端 natType
+				natType, _ := pm["natType"].(string)
 				if pid == "" || pip == "" {
 					continue
 				}
-				e.registerPeer(pid, pip, pubIP, pubPort, natType) // ← 加参数
+				e.registerPeer(pid, pip, pubIP, pubPort, natType)
 				if relayAddr != "" {
 					e.peersMu.Lock()
 					if pi, ok := e.peers[pid]; ok {
@@ -684,13 +669,13 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		pubIP, _ := payload["publicIp"].(string)
 		pubPort := jsonInt(payload["publicPort"])
 		relayAddr, _ := payload["turnRelayAddr"].(string)
-		natType, _ := payload["natType"].(string) // ← 新增：读对端 natType
+		natType, _ := payload["natType"].(string)
 
 		log.Printf("[信令] joined: from=%s vip=%s pub=%s:%d nat=%s",
 			from, pip, pubIP, pubPort, natType)
 
 		if from != "" && pip != "" {
-			e.registerPeer(from, pip, pubIP, pubPort, natType) // ← 加参数
+			e.registerPeer(from, pip, pubIP, pubPort, natType)
 			if relayAddr != "" {
 				e.peersMu.Lock()
 				if pi, ok := e.peers[from]; ok {
@@ -782,7 +767,6 @@ func (e *Edge) peerExists(peerID string) bool {
 	return ok
 }
 
-// reportMetadata 上报 p2p_metadata（LAN 字段已删除）。
 func (e *Edge) reportMetadata() {
 	e.mu.Lock()
 	nm := e.natMeta
@@ -810,16 +794,14 @@ func (e *Edge) reportMetadata() {
 		"regularPortsChange": nm.RegularPortsChange,
 		"behavior":           nm.Behavior,
 		"p2pEndpoint":        nm.P2PEndpoint,
-		"udpPort":            e.udpPort,
 		"multiExit":          nm.MultiExit,
-		"wsPublicIp":         serverSeenIP,
 	}
 	if nm.PublicEndpoint != "" {
 		metaPayload["publicEndpoint"] = nm.PublicEndpoint
 	}
 
-	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%q wsPublicIp=%q udpPort=%d multiExit=%v",
-		nm.NATType, nm.PublicEndpoint, serverSeenIP, e.udpPort, nm.MultiExit)
+	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%q multiExit=%v",
+		nm.NATType, nm.PublicEndpoint, nm.MultiExit)
 
 	if ws == nil {
 		return
@@ -842,7 +824,6 @@ func jsonInt(v interface{}) int {
 	return 0
 }
 
-// registerPeer 注册/更新对端信息。natType 为空时保留原值。
 func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string) {
 	var udpAddr *net.UDPAddr
 	if pubIP != "" && pubPort > 0 {
@@ -865,14 +846,14 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string)
 		if udpAddr != nil {
 			p.UDPAddr = udpAddr
 		}
-		if natType != "" { // ← 新增
+		if natType != "" {
 			p.NATType = natType
 		}
 	} else {
 		e.peers[pid] = &PeerInfo{
 			ClientID: pid, VirtualIP: vip, PubIP: pubIP,
 			PubPort: pubPort, UDPAddr: udpAddr,
-			NATType: natType, // ← 新增
+			NATType: natType,
 		}
 	}
 	e.peersMu.Unlock()
@@ -1209,6 +1190,21 @@ func (e *Edge) sendProbeTo(addr *net.UDPAddr) {
 	})
 }
 
+// hasTrafficFromTarget 检查是否从指定 peer 收到过包。
+func (e *Edge) hasTrafficFromTarget(peerID string, since int64) bool {
+	if peerID == "" {
+		return false
+	}
+	e.peersMu.RLock()
+	defer e.peersMu.RUnlock()
+	p := e.peers[peerID]
+	if p == nil || p.UDPAddr == nil {
+		return false
+	}
+	return p.lastRecvAt >= since
+}
+
+// hasTrafficFromAny 保留兼容（当前已无调用方）。
 func (e *Edge) hasTrafficFromAny(ips []net.IP, since int64) bool {
 	if len(ips) == 0 {
 		return false
