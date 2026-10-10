@@ -15,8 +15,7 @@ object N2nController {
     private var client: Client? = null
     private val running = AtomicBoolean(false)
 
-    // ★ 用同一把锁保护 client 的读写，避免 stop() 与 getter 并发时的
-    //   JNI 状态不一致（Go 侧 Stop 正在关闭 socket，Kotlin 侧同时读 peersJSON）
+    // 用同一把锁保护 client 的读写
     private val clientLock = Any()
 
     fun isRunning(): Boolean = running.get()
@@ -29,10 +28,14 @@ object N2nController {
         protector: Protector,
         onResult: (String) -> Unit
     ) {
-        if (running.get()) {
+        // ★ 修复 1：CAS 原子占用 running。
+        //    之前是 if (running.get()) 判断后再 running.set(true)，
+        //    两个并发调用可能都通过检查。CAS 保证只有一个能进入。
+        if (!running.compareAndSet(false, true)) {
             onResult("already running")
             return
         }
+
         Thread {
             var result = ""
             try {
@@ -45,22 +48,37 @@ object N2nController {
                 } catch (t: Throwable) {
                     Log.e(TAG, "setProtector failed", t)
                 }
+
                 val err = c.start(config)
                 if (err.isNotEmpty()) {
                     result = "start failed: $err"
+                    running.set(false)
                 } else {
+                    // ★ 修复 2：启动期间可能被 stop() 调过。
+                    //    在 clientLock 内检查 running 是否仍为 true，
+                    //    是 → 发布 client；否 → 回收刚起的 Client。
+                    var accepted = false
                     synchronized(clientLock) {
-                        client = c
+                        if (running.get()) {
+                            client = c
+                            accepted = true
+                        }
                     }
-                    running.set(true)
+                    if (!accepted) {
+                        Log.w(TAG, "startAsync 完成时 running 已被置 false，回收 Client")
+                        try {
+                            c.stop()
+                        } catch (t: Throwable) {
+                            Log.e(TAG, "cleanup stop failed", t)
+                        }
+                    }
                 }
             } catch (t: Throwable) {
                 Log.e(TAG, "startAsync failed", t)
                 result = "exception: ${t.message}"
+                running.set(false)
             }
 
-            // ★ 回调可能因 Activity 已销毁而抛 IllegalStateException，
-            //   这里兜底一下，避免连带把工作线程也炸了
             try {
                 onResult(result)
             } catch (t: Throwable) {
@@ -72,16 +90,20 @@ object N2nController {
     /**
      * 停止 VPN。
      *
-     * ★ 改为异步：Go 侧 Stop() 会关闭 WS / TURN / UDP / TUN，
-     *   还可能因网络回调卡住几百毫秒。这里不阻塞调用线程（通常是主线程）。
+     * ★ 修复 3：先置 running=false（无锁），再取 client。
+     *    这样 startAsync 里的 `if (running.get())` 检查与
+     *    stop() 里的 `running.set(false)` 有明确的先后关系，
+     *    不会出现"启动检查通过 → 停止置 false → 启动发布 client"的漏网。
      */
     fun stop() {
+        // 先置 false：让任何正在跑的 startAsync 检查到"已被停止"
+        running.set(false)
+
         val c: Client?
         synchronized(clientLock) {
             c = client
             client = null
         }
-        running.set(false)
 
         if (c == null) return
 
