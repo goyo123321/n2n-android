@@ -1,0 +1,163 @@
+name: Check
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  # ============ 1. Go 层编译 + vet ============
+  go-check:
+    name: Go check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache-dependency-path: mobile/go.sum
+
+      - name: go vet
+        working-directory: mobile
+        run: |
+          go mod tidy
+          go vet ./...
+
+      - name: go build (linux/amd64)
+        working-directory: mobile
+        run: |
+          GOOS=linux GOARCH=amd64 go build ./...
+
+      - name: go build (android/arm64)
+        working-directory: mobile
+        run: |
+          GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build ./...
+
+      - name: 检查悬空引用（跨文件）
+        working-directory: mobile
+        run: |
+          echo "===== 检查常见跨文件函数引用 ====="
+          for fn in isPrivateIP getAllLanIPs collectLanIPsFromSockets localLANAddrs extractLanIPs; do
+            echo "--- $fn ---"
+            defs=$(grep -rn "^func $fn\|^func (.*) $fn(" --include="*.go" . || true)
+            refs=$(grep -rn "\b$fn(" --include="*.go" . | grep -v "^.*func " || true)
+            if [ -z "$defs" ] && [ -n "$refs" ]; then
+              echo "❌ $fn 被引用但未定义："
+              echo "$refs"
+              exit 1
+            fi
+            if [ -n "$defs" ]; then
+              echo "✅ $fn 定义在：$defs"
+            fi
+          done
+
+  # ============ 2. AAR 与 Go 源码时间戳 ============
+  aar-check:
+    name: AAR staleness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: 检查 AAR 是否比 Go 源码旧
+        run: |
+          AAR=app/libs/n2nclient.aar
+          if [ ! -f "$AAR" ]; then
+            echo "❌ $AAR 不存在"
+            exit 1
+          fi
+
+          AAR_TS=$(stat -c %Y "$AAR")
+          echo "AAR 时间戳: $(date -d @$AAR_TS)"
+
+          # 找 Go 源码最新修改时间
+          LATEST_GO=$(find mobile -name "*.go" -type f -printf '%T@\n' | sort -nr | head -1 | cut -d. -f1)
+          echo "Go 源码最新修改: $(date -d @$LATEST_GO)"
+
+          if [ "$LATEST_GO" -gt "$AAR_TS" ]; then
+            DIFF=$((LATEST_GO - AAR_TS))
+            echo "❌ AAR 比 Go 源码旧 $DIFF 秒"
+            echo "   请运行 ./build-aar.sh 后提交 app/libs/n2nclient.aar"
+            exit 1
+          fi
+
+          echo "✅ AAR 比 Go 源码新 $((AAR_TS - LATEST_GO)) 秒"
+
+      - name: 检查 AAR 里的类
+        run: |
+          AAR=app/libs/n2nclient.aar
+          TMP=$(mktemp -d)
+          unzip -q "$AAR" -d "$TMP"
+
+          echo "===== AAR 内容 ====="
+          ls -la "$TMP"
+
+          echo "===== classes.jar ====="
+          if [ -f "$TMP/classes.jar" ]; then
+            unzip -l "$TMP/classes.jar" | grep -E "com/n2n/mobile/(Client|Config|Mobile|Protector)\.class" || {
+              echo "❌ AAR 里缺关键类"
+              exit 1
+            }
+            echo "✅ AAR 类检查通过"
+          else
+            echo "❌ 缺 classes.jar"
+            exit 1
+          fi
+
+          echo "===== native libs ====="
+          ls -la "$TMP/jni/" 2>/dev/null || echo "（没有 jni/ 目录）"
+
+          rm -rf "$TMP"
+
+  # ============ 3. Kotlin 编译 ============
+  kotlin-check:
+    name: Kotlin check
+    runs-on: ubuntu-latest
+    needs: aar-check
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: 检查 Kotlin 里的 import 和调用
+        run: |
+          echo "===== N2nVpnService.kt 关键 import ====="
+          for imp in "import java.io.File" "import java.io.FileDescriptor" "import java.net.DatagramSocket"; do
+            if grep -q "$imp" app/src/main/java/com/n2n/android/N2nVpnService.kt; then
+              echo "✅ $imp"
+            else
+              echo "⚠️ 缺 $imp"
+            fi
+          done
+
+          echo "===== N2nController.kt 关键调用 ====="
+          grep -n "Mobile.getLogs\|Mobile.clearLogs\|client\.start\|client\.stop" app/src/main/java/com/n2n/android/N2nController.kt || true
+
+      - name: Gradle assembleDebug
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: 上传 APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: n2n-android-check-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 3
+
+  # ============ 4. 服务端 TS 检查 ============
+  server-check:
+    name: Server check
+    runs-on: ubuntu-latest
+    if: false  # 服务端在另一个仓库，暂时关闭
+    steps:
+      - run: echo "skip"
