@@ -34,6 +34,7 @@ type TURNResponse struct {
 type TURNClient struct {
 	mu           sync.RWMutex
 	lite         *TURNLite
+	tcpAlloc     *TURNTCPAllocation
 	relayAddr    net.Addr
 	server       *TURNServerInfo
 	signalingURL string
@@ -96,11 +97,16 @@ func NewTURNClient(signalingURL string, uuid string, edge *Edge) *TURNClient {
 func (tc *TURNClient) IsReady() bool {
 	tc.mu.RLock()
 	lite := tc.lite
+	tcpAlloc := tc.tcpAlloc
 	tc.mu.RUnlock()
-	if lite == nil {
-		return false
+
+	if lite != nil && lite.IsAlive() {
+		return true
 	}
-	return lite.IsAlive()
+	if tcpAlloc != nil && tcpAlloc.IsAlive() {
+		return true
+	}
+	return false
 }
 
 func (tc *TURNClient) FetchAndSetup(ctx context.Context) (err error) {
@@ -190,8 +196,22 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 		lite2 := NewTURNLiteWithTCP(turnAddr, srv.Username, srv.Password, true)
 		lite2.onMessage = tc.wrapOnMessage()
 		if err2 := lite2.Allocate(); err2 != nil {
-			log.Printf("[TURN] UDP+TCP transport 都失败: %v", err2)
-			return fmt.Errorf("TURN 完全不可用: %v", err2)
+			log.Printf("[TURN] TURN over TCP 失败: %v，尝试 RFC 6062 TCP allocation", err2)
+
+			tcpAlloc := NewTURNTCPAllocation(turnAddr, srv.Username, srv.Password)
+			tcpAlloc.onMessage = tc.wrapOnMessage()
+			if err3 := tcpAlloc.Allocate(); err3 != nil {
+				log.Printf("[TURN] RFC 6062 TCP allocation 也失败: %v", err3)
+				return fmt.Errorf("TURN 完全不可用: %v", err3)
+			}
+
+			tc.mu.Lock()
+			tc.tcpAlloc = tcpAlloc
+			tc.relayAddr = tcpAlloc.relayAddr
+			tc.mu.Unlock()
+
+			log.Printf("[TURN] ✅ RFC 6062 TCP allocation 就绪: %s", tcpAlloc.GetRelayAddr())
+			return nil
 		}
 		lite = lite2
 	}
@@ -202,7 +222,7 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 	tc.mu.Unlock()
 
 	if lite.useTCP {
-		log.Printf("[TURN] ✅ TCP transport 就绪: %s", tc.relayAddr)
+		log.Printf("[TURN] ✅ TURN over TCP 就绪: %s", tc.relayAddr)
 	} else {
 		log.Printf("[TURN] ✅ UDP transport 就绪: %s", tc.relayAddr)
 	}
@@ -264,15 +284,21 @@ func (tc *TURNClient) StartReconnectLoop() {
 func (tc *TURNClient) Send(data []byte, remoteAddr net.Addr) error {
 	tc.mu.RLock()
 	lite := tc.lite
+	tcpAlloc := tc.tcpAlloc
 	tc.mu.RUnlock()
-	if lite == nil {
-		return fmt.Errorf("TURN 未就绪")
-	}
+
 	udp, ok := remoteAddr.(*net.UDPAddr)
 	if !ok {
 		return fmt.Errorf("TURN 只支持 UDP 地址")
 	}
-	return lite.SendTo(data, udp)
+
+	if lite != nil && lite.IsAlive() {
+		return lite.SendTo(data, udp)
+	}
+	if tcpAlloc != nil && tcpAlloc.IsAlive() {
+		return tcpAlloc.SendTo(udp, data)
+	}
+	return fmt.Errorf("TURN 未就绪")
 }
 
 func (tc *TURNClient) GetRelayAddr() string {
@@ -294,6 +320,10 @@ func (tc *TURNClient) Close() {
 	if tc.lite != nil {
 		tc.lite.Close()
 		tc.lite = nil
+	}
+	if tc.tcpAlloc != nil {
+		tc.tcpAlloc.Close()
+		tc.tcpAlloc = nil
 	}
 }
 
