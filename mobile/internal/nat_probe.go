@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"encoding/binary"
 	"log"
 	"net"
 	"strconv"
@@ -12,6 +13,7 @@ import (
 type NATMetadata struct {
 	P2PEndpoint        string
 	PublicEndpoint     string
+	AllEndpoints       []string // ★ 所有 STUN 结果（多时刻）
 	NATType            string
 	PortsDifference    int
 	RegularPortsChange bool
@@ -38,6 +40,50 @@ const minStunSamples = 2
 type natProbeResult struct {
 	ip   string
 	port int
+}
+
+// parseSTUNResponse 解析 STUN Binding Response 里的 XOR-MAPPED-ADDRESS。
+//
+// 输入：udpConn 收到的任意 UDP 包
+// 输出：(publicIP, publicPort, ok)
+//
+// 只识别 msgType=0x0101（Binding Success Response），其他一律返回 false。
+func parseSTUNResponse(data []byte) (string, int, bool) {
+	if len(data) < 20 {
+		return "", 0, false
+	}
+	// Binding Success Response: msgType = 0x0101
+	if data[0] != 0x01 || data[1] != 0x01 {
+		return "", 0, false
+	}
+	// magic cookie 校验
+	if binary.BigEndian.Uint32(data[4:8]) != 0x2112A442 {
+		return "", 0, false
+	}
+
+	msgLen := int(binary.BigEndian.Uint16(data[2:4]))
+	end := 20 + msgLen
+	if end > len(data) {
+		end = len(data)
+	}
+
+	offset := 20
+	for offset+4 <= end {
+		typ := binary.BigEndian.Uint16(data[offset : offset+2])
+		l := int(binary.BigEndian.Uint16(data[offset+2 : offset+4]))
+		if offset+4+l > end {
+			break
+		}
+		// XOR-MAPPED-ADDRESS = 0x0020
+		if typ == 0x0020 {
+			ip, port, err := xorDecodePeer(data[offset+4 : offset+4+l])
+			if err == nil && ip.To4() != nil {
+				return ip.To4().String(), port, true
+			}
+		}
+		offset += 4 + ((l + 3) &^ 3)
+	}
+	return "", 0, false
 }
 
 func probeNATWithConn(conn net.PacketConn, stunServers []string) *NATMetadata {
@@ -149,6 +195,16 @@ func fillNATMetadata(meta *NATMetadata, results []natProbeResult) {
 	meta.PublicEndpoint = net.JoinHostPort(results[0].ip, strconv.Itoa(results[0].port))
 	meta.P2PEndpoint = meta.PublicEndpoint
 
+	// ★ 收集所有端点（去重）
+	seen := make(map[string]bool)
+	for _, r := range results {
+		ep := net.JoinHostPort(r.ip, strconv.Itoa(r.port))
+		if !seen[ep] {
+			seen[ep] = true
+			meta.AllEndpoints = append(meta.AllEndpoints, ep)
+		}
+	}
+
 	firstPort := results[0].port
 	allSame := true
 	for _, r := range results {
@@ -171,7 +227,7 @@ func fillNATMetadata(meta *NATMetadata, results []natProbeResult) {
 		meta.Behavior = "BehaviorPortChanged"
 	}
 
-	log.Printf("[NAT] %s pub=%s", meta.NATType, meta.PublicEndpoint)
+	log.Printf("[NAT] %s pub=%s endpoints=%d", meta.NATType, meta.PublicEndpoint, len(meta.AllEndpoints))
 }
 
 func probeNAT(localUDPPort int, stunServers []string) *NATMetadata {
