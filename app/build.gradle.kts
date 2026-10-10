@@ -20,6 +20,9 @@ android {
     }
 
     buildTypes {
+        debug {
+            isMinifyEnabled = false
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(
@@ -38,6 +41,13 @@ android {
     }
     buildFeatures {
         viewBinding = true
+    }
+
+    // ★ Android 15+ 对 16KB page 有要求；显式关闭 legacy packaging
+    packaging {
+        jniLibs {
+            useLegacyPackaging = false
+        }
     }
 }
 
