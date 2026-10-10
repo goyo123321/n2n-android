@@ -55,8 +55,10 @@ class N2nVpnService : VpnService() {
 
     private var protectedUdpSocket: DatagramSocket? = null
     private var protectedStunSocket: DatagramSocket? = null
-    private val udpFdHandedOff = AtomicBoolean(false)
-    private val stunFdHandedOff = AtomicBoolean(false)
+
+    // ★ 用 @Volatile 而不是 AtomicBoolean：只是标记，不需要 CAS
+    @Volatile private var udpFdHandedOff = false
+    @Volatile private var stunFdHandedOff = false
 
     inner class ServiceProtector : Protector {
         override fun protect(fd: Long): Boolean {
@@ -119,8 +121,24 @@ class N2nVpnService : VpnService() {
         }
     }
 
+    // ============================================================
+    // 生命周期
+    // ============================================================
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         ktLog("onStartCommand action=${intent?.action}")
+
+        // ★★★ 关键修复：无论 action 是什么，先无条件 startForeground。
+        //     Android 12+ 规定 startForegroundService() 启动的服务
+        //     必须在 5 秒内调用 startForeground()，否则抛
+        //     ForegroundServiceDidNotStartInTimeException 直接杀 App。
+        //     之前所有"提前 return / stopSelf" 的分支都会踩这个坑。
+        if (!startForegroundSafe()) {
+            ktLog("startForeground 失败，stopSelf")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
         try {
             when (intent?.action) {
                 ACTION_START -> handleStart(intent)
@@ -137,6 +155,30 @@ class N2nVpnService : VpnService() {
             try { handleStop() } catch (_: Throwable) {}
         }
         return START_NOT_STICKY
+    }
+
+    /**
+     * 幂等的 startForeground 包装。
+     * Android 14+ 要求显式声明 FGS type；manifest 里已声明 specialUse，
+     * 2 参数版本会读取 manifest 声明，但用 try-catch 兜底系统策略变化。
+     */
+    private fun startForegroundSafe(): Boolean {
+        return try {
+            val notif = buildNotification("n2n 组网启动中")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                // Android 14+：显式传 FGS type，与 manifest 保持一致
+                startForeground(
+                    NOTIF_ID, notif,
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                )
+            } else {
+                startForeground(NOTIF_ID, notif)
+            }
+            true
+        } catch (t: Throwable) {
+            Log.e(TAG, "startForegroundSafe failed", t)
+            false
+        }
     }
 
     override fun onRevoke() {
@@ -160,7 +202,7 @@ class N2nVpnService : VpnService() {
         val signalingUrl = intent.getStringExtra(EXTRA_SIGNALING_URL) ?: run {
             ktLog("handleStart: 无 signalingUrl，退出")
             starting.set(false)
-            stopSelf()
+            stopVpn()
             return
         }
         val preferredIp = intent.getStringExtra(EXTRA_PREFERRED_IP) ?: ""
@@ -171,13 +213,14 @@ class N2nVpnService : VpnService() {
 
         ktLog("参数读取完成 room=$roomId token=${if (connectToken.isEmpty()) "<empty>" else "***"}")
 
+        // ★ 已在 onStartCommand 顶部调过 startForeground，这里只更新文案
         try {
-            startForeground(NOTIF_ID, buildNotification("正在获取虚拟 IP..."))
+            updateNotification("正在获取虚拟 IP...")
             acquireLocks()
-            ktLog("startForeground + acquireLocks 完成")
+            ktLog("acquireLocks 完成")
         } catch (t: Throwable) {
-            ktLog("startForeground 崩溃: ${t.message}")
-            Log.e(TAG, "startForeground failed", t)
+            ktLog("acquireLocks 失败: ${t.message}")
+            Log.e(TAG, "acquireLocks failed", t)
             starting.set(false)
             stopVpn()
             return
@@ -244,8 +287,8 @@ class N2nVpnService : VpnService() {
                         val stunFd = createProtectedStunSocket()
                         ktLog("STUN fd=$stunFd")
 
-                        udpFdHandedOff.set(true)
-                        if (stunFd > 0) stunFdHandedOff.set(true)
+                        udpFdHandedOff = true
+                        if (stunFd > 0) stunFdHandedOff = true
 
                         ktLog("调用 startAsync")
                         N2nController.startAsync(
@@ -287,7 +330,7 @@ class N2nVpnService : VpnService() {
     }
 
     // ============================================================
-    // 从 DatagramSocket 提取 fd
+    // 从 DatagramSocket 提取 fd（不变）
     // ============================================================
     private fun extractFdFromDatagramSocket(socket: DatagramSocket): Int {
         try {
@@ -415,7 +458,9 @@ class N2nVpnService : VpnService() {
         }
         try {
             ktLog("handleStop 开始")
-            handler.removeCallbacks(updateIpRunnable)
+
+            // ★ 一次性清掉所有 pending runnable（updateIpRunnable、延迟 stopVpn 等）
+            try { handler.removeCallbacksAndMessages(null) } catch (_: Throwable) {}
 
             if (started) {
                 try { N2nController.stop() } catch (t: Throwable) {
@@ -430,11 +475,11 @@ class N2nVpnService : VpnService() {
 
             try { protectedUdpSocket?.close() } catch (_: Throwable) {}
             protectedUdpSocket = null
-            udpFdHandedOff.set(false)
+            udpFdHandedOff = false
 
             try { protectedStunSocket?.close() } catch (_: Throwable) {}
             protectedStunSocket = null
-            stunFdHandedOff.set(false)
+            stunFdHandedOff = false
 
             releaseLocks()
             ktLog("handleStop 清理完成")
@@ -547,7 +592,7 @@ class N2nVpnService : VpnService() {
 
     override fun onDestroy() {
         ktLog("onDestroy")
-        try { handler.removeCallbacks(updateIpRunnable) } catch (_: Throwable) {}
+        try { handler.removeCallbacksAndMessages(null) } catch (_: Throwable) {}
         handleStop()
         try { super.onDestroy() } catch (_: Throwable) {}
     }
