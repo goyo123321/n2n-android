@@ -75,7 +75,7 @@ type Edge struct {
 	tunStateLog   map[string]ConnType
 	tunStateLogMu sync.Mutex
 
-	lastMetadataReportAt int64 // 30 秒节流用（atomic）
+	lastMetadataReportAt int64
 
 	doneCh  chan struct{}
 	closeMu sync.Mutex
@@ -636,6 +636,21 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 
 	if t == "_reconnected" {
 		log.Printf("[信令] WebSocket 重连成功，重新上报元数据")
+
+		natHoleActiveMu.Lock()
+		count := len(failCounts)
+		if count > 0 {
+			failCounts = make(map[string]int)
+		}
+		natHoleActiveMu.Unlock()
+		if count > 0 {
+			log.Printf("[NAT-HOLE] WS 重连，清空 %d 个 peer 的失败计数", count)
+		}
+
+		if e.relayMgr != nil {
+			e.relayMgr.ClearAll()
+		}
+
 		e.reportMetadata()
 		atomic.StoreInt64(&e.lastMetadataReportAt, time.Now().UnixMilli())
 		return
@@ -687,7 +702,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 					continue
 				}
 
-				// ★ 检测对端出口变化 → 重置 failCounts，允许重新尝试打洞
 				e.maybeResetFailCountForPeer(pid, pubIP, pubPort)
 
 				e.registerPeer(pid, pip, pubIP, pubPort, natType, assisted)
@@ -727,7 +741,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			from, pip, pubIP, pubPort, natType, len(assisted))
 
 		if from != "" && pip != "" {
-			// ★ 检测对端出口变化 → 重置 failCounts，允许重新尝试打洞
 			e.maybeResetFailCountForPeer(from, pubIP, pubPort)
 
 			e.registerPeer(from, pip, pubIP, pubPort, natType, assisted)
@@ -799,9 +812,20 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 
 	case "left":
 		log.Printf("[信令] 节点离开: %s", from)
+
+		if e.relayMgr != nil {
+			e.relayMgr.ClearPeer(from)
+		}
+
+		natHoleActiveMu.Lock()
+		delete(failCounts, from)
+		delete(natHoleActive, from)
+		natHoleActiveMu.Unlock()
+
 		e.peersMu.Lock()
 		delete(e.peers, from)
 		e.peersMu.Unlock()
+
 		e.cancelFallbackTimer(from)
 		e.lastNoPeerLogMu.Lock()
 		delete(e.lastNoPeerLog, from)
@@ -814,9 +838,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 }
 
 // maybeResetFailCountForPeer 检测对端 pubSocket 是否变化。
-//
-// 变化时重置该 peer 的 failCounts，允许重新尝试打洞。
-// 触发场景：对端换网络（移动 → 电信），出口 IP/端口变化。
 func (e *Edge) maybeResetFailCountForPeer(peerID, newPubIP string, newPubPort int) {
 	if peerID == "" || newPubIP == "" || newPubPort <= 0 {
 		return
@@ -840,8 +861,54 @@ func (e *Edge) maybeResetFailCountForPeer(peerID, newPubIP string, newPubPort in
 	delete(failCounts, peerID)
 	natHoleActiveMu.Unlock()
 
+	if e.relayMgr != nil {
+		e.relayMgr.ClearPeer(peerID)
+	}
+
 	log.Printf("[NAT-HOLE] %s 出口变化 %s:%d → %s:%d，重置失败计数 (was=%d)",
 		peerID, oldPubIP, oldPubPort, newPubIP, newPubPort, hadCount)
+}
+
+// maybeResetOwnFailCounts 检测本机出口 IP 是否变化。
+func (e *Edge) maybeResetOwnFailCounts(newEndpoint string) {
+	if newEndpoint == "" {
+		return
+	}
+
+	newIP := extractIPFromEndpoint(newEndpoint)
+	if newIP == "" {
+		return
+	}
+
+	e.mu.Lock()
+	oldEndpoint := ""
+	if e.natMeta != nil {
+		oldEndpoint = e.natMeta.PublicEndpoint
+	}
+	e.mu.Unlock()
+
+	oldIP := extractIPFromEndpoint(oldEndpoint)
+
+	if oldIP == "" || oldIP == newIP {
+		return
+	}
+
+	e.mu.Lock()
+	if e.natMeta != nil {
+		e.natMeta.PublicEndpoint = newEndpoint
+		e.natMeta.P2PEndpoint = newEndpoint
+	}
+	e.mu.Unlock()
+
+	natHoleActiveMu.Lock()
+	count := len(failCounts)
+	if count > 0 {
+		failCounts = make(map[string]int)
+	}
+	natHoleActiveMu.Unlock()
+
+	log.Printf("[NAT-HOLE] 本机出口 IP 变化 %s → %s，重置所有失败计数 (count=%d)",
+		oldIP, newIP, count)
 }
 
 func (e *Edge) peerExists(peerID string) bool {
@@ -982,10 +1049,6 @@ func (e *Edge) scheduleFallbackTimer(peerID string) {
 		}
 		state := e.relayMgr.GetState(peerID)
 		if state != ConnUnknown {
-			// 只在 P2P 时打日志（其他状态是正常的 turn/relay，不重复刷）
-			if state != ConnP2P {
-				// 静默跳过
-			}
 			return
 		}
 		log.Printf("[fallback-timer] %s 8s 内未收到打洞指令，主动降级", peerID)
@@ -1093,7 +1156,6 @@ func (e *Edge) udpReadLoop() {
 			continue
 		}
 
-		// STUN Binding Response（0x0101）
 		if buf[0] == 0x01 && buf[1] == 0x01 {
 			if ip, port, ok := parseSTUNResponse(buf[:n]); ok {
 				e.addAssistedEndpoint(ip, port)
@@ -1101,7 +1163,6 @@ func (e *Edge) udpReadLoop() {
 			continue
 		}
 
-		// N2NP probe
 		if buf[0] == 'N' && buf[1] == '2' && buf[2] == 'N' && buf[3] == 'P' {
 			if ua, ok := addr.(*net.UDPAddr); ok {
 				e.notePeerProbe(ua)
@@ -1109,7 +1170,6 @@ func (e *Edge) udpReadLoop() {
 			continue
 		}
 
-		// IPv4 数据帧
 		if buf[0]>>4 == 4 {
 			if ua, ok := addr.(*net.UDPAddr); ok {
 				e.notePeerTraffic(ua)
@@ -1389,6 +1449,8 @@ func (e *Edge) addAssistedEndpoint(ip string, port int) {
 	e.natMeta.AllEndpoints = append(e.natMeta.AllEndpoints, ep)
 	count := len(e.natMeta.AllEndpoints)
 	e.mu.Unlock()
+
+	e.maybeResetOwnFailCounts(ep)
 
 	log.Printf("[NAT] +assisted: %s (total=%d)", ep, count)
 	e.reportMetadataThrottled()
