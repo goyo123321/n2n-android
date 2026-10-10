@@ -23,7 +23,30 @@ var (
 
 	appendCounter int
 	counterMu     sync.Mutex
+
+	// ★ 时区：由 Kotlin 侧通过 SetTimezoneOffset 设置
+	tzMu            sync.Mutex
+	tzOffsetSeconds int
+	tzSet           bool
 )
+
+// SetTimezoneOffset 由 Kotlin 侧设置设备时区偏移量（秒）。
+//
+// gomobile 环境下 time.Local 默认为 UTC，且没有可靠途径读取 Android
+// 系统时区。Kotlin 侧读取 TimeZone.getDefault() 后传入。
+//
+// 允许重复调用（设备时区切换时会重新调用）。
+func SetTimezoneOffset(seconds int) {
+	tzMu.Lock()
+	defer tzMu.Unlock()
+	if tzSet && tzOffsetSeconds == seconds {
+		return
+	}
+	tzOffsetSeconds = seconds
+	tzSet = true
+	time.Local = time.FixedZone("Local", seconds)
+	fmt.Fprintf(os.Stderr, "[logger] 设置时区偏移: %+d 秒\n", seconds)
+}
 
 func setLogFilePath(path string) {
 	logFileMu.Lock()
@@ -51,10 +74,10 @@ func setLogFilePath(path string) {
 
 // AppendLog 追加一行日志（带时间戳）。
 //
-// 时区修复：用 time.Now().Local()，避免 gomobile 环境里
-// time.Local 默认为 UTC 导致日志时间与 Kotlin 侧差 8 小时。
+// 时区：time.Local 已在 SetTimezoneOffset 里改为设备本地时区，
+// 因此直接 time.Now().Format 即为本地时间。
 func AppendLog(msg string) {
-	line := fmt.Sprintf("[%s] %s", time.Now().Local().Format("15:04:05"), msg)
+	line := fmt.Sprintf("[%s] %s", time.Now().Format("15:04:05"), msg)
 
 	logBufferMu.Lock()
 	logBuffer = append(logBuffer, line)
@@ -178,11 +201,11 @@ func initLogRedirection() {
 
 func init() {
 	{
-		local := time.Now().Local()
+		local := time.Now()
 		_, offset := local.Zone()
 		fmt.Fprintf(os.Stderr,
-			"[logger] TZ=%q local=%v offset=%+d秒 now=%v\n",
-			os.Getenv("TZ"), time.Local, offset, local.Format("15:04:05"))
+			"[logger] 初始 TZ=%q local=%v offset=%+d秒\n",
+			os.Getenv("TZ"), time.Local, offset)
 	}
 
 	initLogRedirection()
