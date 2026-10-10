@@ -20,7 +20,9 @@ object Prefs {
     private const val DEFAULT_ROOM_ID = "default-room"
     private const val DEFAULT_NODE_NAME = "Android"
 
-    const val DEFAULT_CONNECT_TOKEN = ""
+    // ★ 从 public const 降为 private：全项目只有本文件的 defaultConfig() 用，
+    //   外部没有调用方，public 暴露没有意义
+    private const val DEFAULT_CONNECT_TOKEN = ""
 
     data class Config(
         val signalingUrl: String,
@@ -30,7 +32,7 @@ object Prefs {
         val connectToken: String,
     )
 
-    // 双层 fallback：主 SP 打不开时降级到备用 SP
+    // 双层 fallback：主 SP 打不开时降级到备用 SP，保证 UI 不崩
     private fun sp(ctx: Context) =
         try {
             ctx.getSharedPreferences(NAME, Context.MODE_PRIVATE)
@@ -122,17 +124,9 @@ object Prefs {
         }
     }
 
-    // ★ 用 hex 而不是 take(8)：UUID 里 '-' 不会落在前 8 位，但显式过滤更稳
+    // 用 hex 而不是 take(8)：UUID 里 '-' 不会落在前 8 位，但显式过滤更稳
     private fun generateFallbackId(): String {
         val raw = UUID.randomUUID().toString().replace("-", "")
         return "android-" + raw.take(8)
-    }
-
-    // ============ 清空（可选） ============
-
-    fun clearAll(ctx: Context) {
-        try {
-            sp(ctx)?.edit()?.clear()?.apply()
-        } catch (_: Throwable) {}
     }
 }
