@@ -496,6 +496,9 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 
 	e.turnClient.StartReconnectLoop()
 
+	// ★ 每 5 分钟清一次 failCounts，让降级到 TURN 后有机会自动升回 P2P
+	e.startFailCountResetLoop()
+
 	log.Printf("[Edge] 已启动 clientId=%s room=%s", clientId, cfg.RoomID)
 	return e, nil
 }
@@ -837,7 +840,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	}
 }
 
-// maybeResetFailCountForPeer 检测对端 pubSocket 是否变化。
 func (e *Edge) maybeResetFailCountForPeer(peerID, newPubIP string, newPubPort int) {
 	if peerID == "" || newPubIP == "" || newPubPort <= 0 {
 		return
@@ -869,7 +871,6 @@ func (e *Edge) maybeResetFailCountForPeer(peerID, newPubIP string, newPubPort in
 		peerID, oldPubIP, oldPubPort, newPubIP, newPubPort, hadCount)
 }
 
-// maybeResetOwnFailCounts 检测本机出口 IP 是否变化。
 func (e *Edge) maybeResetOwnFailCounts(newEndpoint string) {
 	if newEndpoint == "" {
 		return
