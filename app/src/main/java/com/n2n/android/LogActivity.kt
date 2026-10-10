@@ -18,7 +18,6 @@ class LogActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityLogBinding
 
-    // ★ ticking 标记：防止 onStop 后 ticker 又把自己 post 回来
     @Volatile private var ticking = false
 
     private val ticker = object : Runnable {
