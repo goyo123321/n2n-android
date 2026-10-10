@@ -28,6 +28,7 @@ type PeerInfo struct {
 	lastRecvAt    int64
 	loggedReady   bool
 	hasRealData   bool
+	probeReplied  bool
 }
 
 type PeerSnapshot struct {
@@ -384,7 +385,23 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 
 	e.turnClient = NewTURNClient(cfg.SignalingURL, cfg.ConnectToken, e)
 	e.turnClient.onMessage = func(data []byte, addr net.Addr) {
-		e.onRemotePacket(data)
+		ua, ok := addr.(*net.UDPAddr)
+		if !ok {
+			e.onRemotePacket(data)
+			return
+		}
+		// probe 判定（首 4 字节 "N2NP"）
+		if len(data) >= 4 &&
+			data[0] == 'N' && data[1] == '2' && data[2] == 'N' && data[3] == 'P' {
+			e.notePeerProbeTURN(ua)
+			return
+		}
+		// 真实 IPv4 数据帧
+		if len(data) > 0 && data[0]>>4 == 4 {
+			e.notePeerTrafficTURN(ua)
+			e.onRemotePacket(data)
+			return
+		}
 	}
 
 	e.relayMgr = NewRelayManager(ws, e.turnClient, e)
@@ -604,6 +621,12 @@ func lastIndexByte(s string, c byte) int {
 // ============ 信令 ============
 
 func (e *Edge) handleSignaling(msg map[string]interface{}) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[信令] handleSignaling panic: %v\n%s", r, debug.Stack())
+		}
+	}()
+
 	t, _ := msg["type"].(string)
 	from, _ := msg["from"].(string)
 
@@ -1106,16 +1129,38 @@ func (e *Edge) onRemotePacket(data []byte) {
 	e.enqueueTUN(data)
 }
 
+// ============ peer 探测处理 ============
+
 func (e *Edge) notePeerProbe(addr *net.UDPAddr) {
-	e.notePeerCommon(addr, false)
+	e.notePeerCommon(addr, false, false)
+}
+
+func (e *Edge) notePeerProbeTURN(addr *net.UDPAddr) {
+	e.notePeerCommon(addr, false, true)
 }
 
 func (e *Edge) notePeerTraffic(addr *net.UDPAddr) {
-	e.notePeerCommon(addr, true)
+	e.notePeerCommon(addr, true, false)
 }
 
-func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool) {
+func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
+	e.notePeerCommon(addr, true, true)
+}
+
+// notePeerCommon 处理来自对端的 UDP 包。
+//
+// viaTURN：
+//   - false：从本地 UDP socket 收到 → 回包走本地 socket
+//   - true：从 TURN 中继收到 → 回包走 TURN（按原路）
+//
+// 首次收到 probe 的处理顺序：
+//   1. 立即上报 P2P（MarkP2P）
+//   2. 并发启动 5 轮 probe 回包（每 100ms 一次）
+//
+// 后续收到的 probe 只刷新 lastRecvAt，不再重复回包。
+func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool) {
 	now := time.Now().UnixMilli()
+
 	e.peersMu.Lock()
 	var best *PeerInfo
 	bestScore := -1
@@ -1143,54 +1188,82 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool) {
 	best.UDPAddr = &net.UDPAddr{IP: addr.IP, Port: addr.Port}
 	clientID := best.ClientID
 	ip := addr.IP.String()
+
+	needReply := false
+	if !isRealData && !best.probeReplied {
+		best.probeReplied = true
+		needReply = true
+	}
 	e.peersMu.Unlock()
 
 	if e.relayMgr == nil {
 		return
 	}
 
-	if !isRealData {
-		e.sendProbeTo(addr)
-	}
-
-	state := e.relayMgr.GetState(clientID)
 	if isRealData {
+		state := e.relayMgr.GetState(clientID)
 		if state != ConnP2P {
 			log.Printf("[P2P] 从 %s (%s) 收到真实数据帧，升级为 P2P", clientID, ip)
 			e.relayMgr.MarkP2P(clientID)
 		}
 		return
 	}
-	if state != ConnP2P {
-		log.Printf("[P2P] 从 %s (%s) 收到打洞探测，UDP 通道可用，升级为 P2P", clientID, ip)
-		e.relayMgr.MarkP2P(clientID)
-	}
-}
 
-func (e *Edge) sendProbeTo(addr *net.UDPAddr) {
-	if e.udpConn == nil || addr == nil {
+	if !needReply {
 		return
 	}
-	target := &net.UDPAddr{IP: addr.IP, Port: addr.Port}
-	vip := e.GetVirtualIP()
 
-	safeGo("probe-reply", func() {
-		probe := buildPunchProbe(vip)
+	// ★ 首次收到该 peer 的 probe：
+	//    1. 立即上报 P2P
+	//    2. 并发回 5 轮（每 100ms 一次）
+	if e.relayMgr.GetState(clientID) != ConnP2P {
+		log.Printf("[P2P] 从 %s (%s) 收到打洞探测，上报 P2P 并回 5 轮", clientID, ip)
+		e.relayMgr.MarkP2P(clientID)
+	}
+
+	safeGo("probe-reply-5", func() {
+		probe := buildPunchProbe(e.GetVirtualIP())
 		for i := 0; i < 5; i++ {
 			select {
 			case <-e.doneCh:
 				return
 			default:
 			}
-			if _, err := e.udpConn.WriteTo(probe, target); err != nil {
-				return
+			e.writeProbe(addr, probe, viaTURN)
+			if i < 4 {
+				time.Sleep(100 * time.Millisecond)
 			}
-			time.Sleep(100 * time.Millisecond)
 		}
 	})
 }
 
-// hasTrafficFromTarget 检查是否从指定 peer 收到过包。
+// writeProbe 按原路写一个 probe 包。
+func (e *Edge) writeProbe(addr *net.UDPAddr, probe []byte, viaTURN bool) {
+	if addr == nil {
+		return
+	}
+	if viaTURN {
+		if e.turnClient == nil || !e.turnClient.IsReady() {
+			return
+		}
+		_ = e.turnClient.Send(probe, addr)
+		return
+	}
+	if e.udpConn == nil {
+		return
+	}
+	_, _ = e.udpConn.WriteTo(probe, addr)
+}
+
+// sendProbeTo 保留兼容（当前无调用方）。
+func (e *Edge) sendProbeTo(addr *net.UDPAddr) {
+	if e.udpConn == nil || addr == nil {
+		return
+	}
+	probe := buildPunchProbe(e.GetVirtualIP())
+	e.writeProbe(addr, probe, false)
+}
+
 func (e *Edge) hasTrafficFromTarget(peerID string, since int64) bool {
 	if peerID == "" {
 		return false
