@@ -15,6 +15,8 @@ import (
 	"time"
 )
 
+// ============ STUN 常量 ============
+
 const stunMagicCookie = 0x2112A442
 
 const (
@@ -52,6 +54,8 @@ const (
 	turnRefreshInterval = 60 * time.Second
 	turnRequestTimeout  = 5 * time.Second
 )
+
+// ============ 内部结构 ============
 
 type stunAttr struct {
 	typ   uint16
@@ -109,6 +113,8 @@ func NewTURNLiteWithTCP(serverAddr, username, password string, useTCP bool) *TUR
 	}
 }
 
+// ============ 辅助 ============
+
 func isNetworkUnreachable(err error) bool {
 	if err == nil {
 		return false
@@ -124,6 +130,8 @@ func (t *TURNLite) IsAlive() bool {
 	defer t.mu.Unlock()
 	return !t.stopped
 }
+
+// ============ STUN 编解码 ============
 
 func buildSTUNMsg(msgType uint16, txid [12]byte, attrs []stunAttr) []byte {
 	total := 20
@@ -176,6 +184,8 @@ func parseSTUNMsg(data []byte) (*stunMessage, error) {
 		attrs:   attrs,
 	}, nil
 }
+
+// ============ XOR 地址 ============
 
 var magicBytes = [4]byte{0x21, 0x12, 0xA4, 0x42}
 
@@ -230,6 +240,8 @@ func xorDecodePeer(data []byte) (net.IP, int, error) {
 	return nil, 0, fmt.Errorf("未知地址族 0x%02x", family)
 }
 
+// ============ HMAC-SHA1 签名 ============
+
 func (t *TURNLite) sign(msg []byte) []byte {
 	if t.key == nil {
 		return msg
@@ -259,6 +271,8 @@ func randTxID() [12]byte {
 	_, _ = rand.Read(t[:])
 	return t
 }
+
+// ============ 发送 + 等待（按 txid 分发） ============
 
 func (t *TURNLite) sendRequest(msgType uint16, attrs []stunAttr, withAuth bool) (*stunMessage, error) {
 	txid := randTxID()
@@ -320,6 +334,8 @@ func (t *TURNLite) dispatch(msg *stunMessage) {
 	}
 }
 
+// ============ Allocate ============
+
 func (t *TURNLite) Allocate() error {
 	protectedDialer := newProtectedDialer()
 
@@ -328,6 +344,11 @@ func (t *TURNLite) Allocate() error {
 		conn, err := protectedDialer.Dial("tcp", t.serverAddr)
 		if err != nil {
 			return fmt.Errorf("TCP 连接失败: %w", err)
+		}
+		// ★ TCP keepalive：尽早检测对端断开
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			_ = tcpConn.SetKeepAlive(true)
+			_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
 		}
 		t.conn = conn
 	} else {
@@ -412,6 +433,8 @@ func (t *TURNLite) extractAllocateResult(resp *stunMessage) error {
 	return nil
 }
 
+// ============ CreatePermission ============
+
 func (t *TURNLite) ensurePermission(ip net.IP) error {
 	key := ip.String()
 	t.permMu.Lock()
@@ -440,6 +463,8 @@ func (t *TURNLite) ensurePermission(ip net.IP) error {
 	return nil
 }
 
+// ============ 发送 ============
+
 func (t *TURNLite) SendTo(data []byte, peerAddr *net.UDPAddr) error {
 	if t.conn == nil {
 		return fmt.Errorf("TURN 未就绪")
@@ -463,6 +488,8 @@ func (t *TURNLite) SendTo(data []byte, peerAddr *net.UDPAddr) error {
 	_, err := t.conn.Write(msg)
 	return err
 }
+
+// ============ 读循环 ============
 
 func (t *TURNLite) readLoop() {
 	defer func() {
@@ -576,12 +603,25 @@ func (t *TURNLite) handleIncoming(data []byte) {
 	}
 }
 
+// ============ 定时刷新 ============
+
+// refreshLoop 每 60 秒刷新 TURN allocation。
+//
+// ★ 连续失败 3 次主动关闭自己，让上层 turn-reconnect（30 秒周期）
+//   检测到 IsReady()==false 并触发重建。
+//
+// 触发场景：
+//   - TCP transport 下 TURN 服务器 idle 5 分钟断连 → Write 成功但
+//     Read 超时 → 连续失败 → Close → 重建
+//   - UDP transport 下临时网络抖动 → 大概率单次失败自愈，不会到 3 次
 func (t *TURNLite) refreshLoop() {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[TURN-Lite] refreshLoop panic: %v\n%s", r, debug.Stack())
 		}
 	}()
+
+	consecutiveFails := 0
 
 	ticker := time.NewTicker(turnRefreshInterval)
 	defer ticker.Stop()
@@ -601,9 +641,19 @@ func (t *TURNLite) refreshLoop() {
 				if isNetworkUnreachable(err) {
 					return
 				}
-				log.Printf("[TURN-Lite] Refresh 失败: %v", err)
+				consecutiveFails++
+				log.Printf("[TURN-Lite] Refresh 失败 (%d/3): %v", consecutiveFails, err)
+				if consecutiveFails >= 3 {
+					log.Printf("[TURN-Lite] Refresh 连续失败 %d 次，关闭等待重建", consecutiveFails)
+					go t.Close()
+					return
+				}
 				continue
 			}
+
+			// 成功清零计数
+			consecutiveFails = 0
+
 			if resp.msgType == msgRefreshSuccess {
 				continue
 			}
@@ -630,6 +680,8 @@ func (t *TURNLite) refreshLoop() {
 		}
 	}
 }
+
+// ============ 查询 / 关闭 ============
 
 func (t *TURNLite) GetRelayAddr() string {
 	if t.relayAddr == nil {
