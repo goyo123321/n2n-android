@@ -30,19 +30,28 @@ class MainActivity : AppCompatActivity() {
 
     private var lastPeersJson: String = ""
 
+    // ★ ticking 标记：防止 onStop 后 ticker 又把自己 post 回来
+    @Volatile private var statusTicking = false
+    @Volatile private var peersTicking = false
+
+    // ★ 深链 auto=1 的延迟启动，需要在 onStop/onDestroy 取消
+    private var pendingAutoStart: Runnable? = null
+
     private val peersTicker = object : Runnable {
         override fun run() {
+            if (!peersTicking) return
             if (isFinishing || isDestroyed || !::binding.isInitialized) return
             if (N2nController.isRunning()) refreshPeers()
-            binding.root.postDelayed(this, 3000)
+            if (peersTicking) binding.root.postDelayed(this, 3000)
         }
     }
 
     private val statusTicker = object : Runnable {
         override fun run() {
+            if (!statusTicking) return
             if (isFinishing || isDestroyed || !::binding.isInitialized) return
             refreshStatus()
-            binding.root.postDelayed(this, 1000)
+            if (statusTicking) binding.root.postDelayed(this, 1000)
         }
     }
 
@@ -99,14 +108,18 @@ class MainActivity : AppCompatActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        // ★ 同步 getIntent()，避免后续读取到旧 intent
+        setIntent(intent)
         handleIntentParams(intent)
     }
 
     override fun onStart() {
         super.onStart()
         if (!::binding.isInitialized) return
-        binding.root.removeCallbacks(peersTicker)
         binding.root.removeCallbacks(statusTicker)
+        binding.root.removeCallbacks(peersTicker)
+        statusTicking = true
+        peersTicking = true
         binding.root.postDelayed(statusTicker, 1000)
         binding.root.postDelayed(peersTicker, 3000)
     }
@@ -124,12 +137,19 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStop() {
         super.onStop()
+        statusTicking = false
+        peersTicking = false
+        // ★ 取消深链触发的延迟启动，避免 Activity 已后台还弹 VPN 权限
+        cancelPendingAutoStart()
         if (!::binding.isInitialized) return
         binding.root.removeCallbacks(peersTicker)
         binding.root.removeCallbacks(statusTicker)
     }
 
     override fun onDestroy() {
+        statusTicking = false
+        peersTicking = false
+        cancelPendingAutoStart()
         if (::binding.isInitialized) {
             binding.root.removeCallbacks(peersTicker)
             binding.root.removeCallbacks(statusTicker)
@@ -149,6 +169,31 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ============================================================
+    // 深链延迟启动
+    // ============================================================
+
+    private fun scheduleAutoStart(delayMs: Long = 300) {
+        cancelPendingAutoStart()
+        if (!::binding.isInitialized) return
+        val r = Runnable {
+            pendingAutoStart = null
+            if (isFinishing || isDestroyed || !::binding.isInitialized) return@Runnable
+            requestVpnPermission()
+        }
+        pendingAutoStart = r
+        binding.root.postDelayed(r, delayMs)
+    }
+
+    private fun cancelPendingAutoStart() {
+        pendingAutoStart?.let { r ->
+            if (::binding.isInitialized) {
+                try { binding.root.removeCallbacks(r) } catch (_: Throwable) {}
+            }
+        }
+        pendingAutoStart = null
+    }
+
+    // ============================================================
     // 主题
     // ============================================================
 
@@ -158,7 +203,6 @@ class MainActivity : AppCompatActivity() {
             2 -> AppCompatDelegate.MODE_NIGHT_YES
             else -> AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM
         }
-        // ★ 同一模式跳过：避免 onCreate 里重复触发 recreate
         if (AppCompatDelegate.getDefaultNightMode() != nightMode) {
             AppCompatDelegate.setDefaultNightMode(nightMode)
         }
@@ -187,7 +231,11 @@ class MainActivity : AppCompatActivity() {
 
     private fun requestNotifPermissionIfNeeded() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            try {
+                notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            } catch (t: Throwable) {
+                Log.w(TAG, "notifPermissionLauncher.launch failed", t)
+            }
         }
     }
 
@@ -225,7 +273,7 @@ class MainActivity : AppCompatActivity() {
             .setTitle(getString(R.string.first_use_title))
             .setMessage(getString(R.string.first_use_message))
             .setPositiveButton(getString(R.string.first_use_fill)) { _, _ ->
-                if (!::binding.isInitialized) return@setPositiveButton
+                if (isFinishing || isDestroyed || !::binding.isInitialized) return@setPositiveButton
                 binding.etSignalingUrl.requestFocus()
                 binding.etSignalingUrl.setSelection(
                     binding.etSignalingUrl.text?.length ?: 0
@@ -288,7 +336,7 @@ class MainActivity : AppCompatActivity() {
 
                     saveCurrentInput()
                     if (data.getQueryParameter("auto") == "1") {
-                        binding.root.postDelayed({ requestVpnPermission() }, 300)
+                        scheduleAutoStart(300)
                     }
                     return
                 }
@@ -314,7 +362,7 @@ class MainActivity : AppCompatActivity() {
                 toast(getString(R.string.dialog_external_updated))
             }
             if (intent.getBooleanExtra("auto_start", false)) {
-                binding.root.postDelayed({ requestVpnPermission() }, 300)
+                scheduleAutoStart(300)
             }
         } catch (t: Throwable) {
             Log.e(TAG, "handleIntentParams failed", t)
@@ -350,6 +398,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun requestVpnPermission() {
+        // ★ 关键：Activity 已销毁时不能调 registerForActivityResult 的 launcher
+        if (isFinishing || isDestroyed) return
         if (!::binding.isInitialized) return
         val url = binding.etSignalingUrl.text.toString().trim()
 
@@ -383,7 +433,13 @@ class MainActivity : AppCompatActivity() {
         try {
             val intent = VpnService.prepare(this)
             if (intent != null) {
-                vpnPermissionLauncher.launch(intent)
+                try {
+                    vpnPermissionLauncher.launch(intent)
+                } catch (t: Throwable) {
+                    // Activity 状态不对时抛 IllegalStateException，这里兜底
+                    Log.e(TAG, "vpnPermissionLauncher.launch failed", t)
+                    toast("无法请求 VPN 权限，请回到 App 重试")
+                }
             } else {
                 startVpnService()
             }
@@ -400,6 +456,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startVpnService() {
+        if (isFinishing || isDestroyed) return
         if (!::binding.isInitialized) return
         try {
             val preferredIp = binding.etPreferredIp.text.toString().trim()
