@@ -21,31 +21,6 @@ object N2nController {
 
     fun isRunning(): Boolean = running.get()
 
-    fun start(tunFd: Int, udpFd: Int, stunFd: Int, protector: Protector, config: Config): String {
-        if (running.get()) return "already running"
-        return try {
-            val c = Client()
-            c.setTunFD(tunFd.toLong())
-            if (udpFd > 0) c.setUdpFD(udpFd.toLong())
-            if (stunFd > 0) c.setStunFD(stunFd.toLong())
-            try {
-                c.setProtector(protector)
-            } catch (t: Throwable) {
-                Log.e(TAG, "setProtector failed", t)
-            }
-            val err = c.start(config)
-            if (err.isNotEmpty()) return "start failed: $err"
-            synchronized(clientLock) {
-                client = c
-            }
-            running.set(true)
-            ""
-        } catch (t: Throwable) {
-            Log.e(TAG, "start failed", t)
-            "exception: ${t.message}"
-        }
-    }
-
     fun startAsync(
         tunFd: Int,
         udpFd: Int,
@@ -122,13 +97,6 @@ object N2nController {
     // ============================================================
     // getter：全部 try-catch，跨 JNI 调用不能把异常抛回 UI
     // ============================================================
-
-    fun getStatus(): String = try {
-        synchronized(clientLock) { client }?.status ?: "not running"
-    } catch (t: Throwable) {
-        Log.e(TAG, "getStatus failed", t)
-        "not running"
-    }
 
     fun getVirtualIP(): String = try {
         synchronized(clientLock) { client }?.virtualIP ?: ""
