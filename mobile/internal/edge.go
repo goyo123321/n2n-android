@@ -18,17 +18,18 @@ import (
 )
 
 type PeerInfo struct {
-	ClientID      string
-	VirtualIP     string
-	PubIP         string
-	PubPort       int
-	NATType       string
-	TurnRelayAddr string
-	UDPAddr       *net.UDPAddr
-	lastRecvAt    int64
-	loggedReady   bool
-	hasRealData   bool
-	probeReplied  bool
+	ClientID          string
+	VirtualIP         string
+	PubIP             string
+	PubPort           int
+	NATType           string
+	TurnRelayAddr     string
+	UDPAddr           *net.UDPAddr
+	lastRecvAt        int64
+	loggedReady       bool
+	hasRealData       bool
+	probeReplied      bool
+	AssistedEndpoints []string // ★ 对端上报的所有 STUN 端点
 }
 
 type PeerSnapshot struct {
@@ -390,13 +391,11 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 			e.onRemotePacket(data)
 			return
 		}
-		// probe 判定（首 4 字节 "N2NP"）
 		if len(data) >= 4 &&
 			data[0] == 'N' && data[1] == '2' && data[2] == 'N' && data[3] == 'P' {
 			e.notePeerProbeTURN(ua)
 			return
 		}
-		// 真实 IPv4 数据帧
 		if len(data) > 0 && data[0]>>4 == 4 {
 			e.notePeerTrafficTURN(ua)
 			e.onRemotePacket(data)
@@ -457,8 +456,8 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		wsRef := e.ws
 		e.mu.Unlock()
 
-		log.Printf("[NAT] 探测完成: %s pub=%s multiExit=%v",
-			meta.NATType, meta.PublicEndpoint, meta.MultiExit)
+		log.Printf("[NAT] 探测完成: %s pub=%s endpoints=%d multiExit=%v",
+			meta.NATType, meta.PublicEndpoint, len(meta.AllEndpoints), meta.MultiExit)
 
 		if wsRef != nil {
 			e.reportMetadata()
@@ -667,10 +666,21 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 				pubPort := jsonInt(pm["publicPort"])
 				relayAddr, _ := pm["turnRelayAddr"].(string)
 				natType, _ := pm["natType"].(string)
+
+				// ★ 读 assistedEndpoints
+				var assisted []string
+				if raw, ok := pm["assistedEndpoints"].([]interface{}); ok {
+					for _, v := range raw {
+						if s, ok := v.(string); ok && s != "" {
+							assisted = append(assisted, s)
+						}
+					}
+				}
+
 				if pid == "" || pip == "" {
 					continue
 				}
-				e.registerPeer(pid, pip, pubIP, pubPort, natType)
+				e.registerPeer(pid, pip, pubIP, pubPort, natType, assisted)
 				if relayAddr != "" {
 					e.peersMu.Lock()
 					if pi, ok := e.peers[pid]; ok {
@@ -678,8 +688,8 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 					}
 					e.peersMu.Unlock()
 				}
-				log.Printf("[信令] 已有节点: %s vip=%s pub=%s:%d nat=%s",
-					pid, pip, pubIP, pubPort, natType)
+				log.Printf("[信令] 已有节点: %s vip=%s pub=%s:%d nat=%s assisted=%d",
+					pid, pip, pubIP, pubPort, natType, len(assisted))
 			}
 		}
 
@@ -694,11 +704,21 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		relayAddr, _ := payload["turnRelayAddr"].(string)
 		natType, _ := payload["natType"].(string)
 
-		log.Printf("[信令] joined: from=%s vip=%s pub=%s:%d nat=%s",
-			from, pip, pubIP, pubPort, natType)
+		// ★ 读 assistedEndpoints
+		var assisted []string
+		if raw, ok := payload["assistedEndpoints"].([]interface{}); ok {
+			for _, v := range raw {
+				if s, ok := v.(string); ok && s != "" {
+					assisted = append(assisted, s)
+				}
+			}
+		}
+
+		log.Printf("[信令] joined: from=%s vip=%s pub=%s:%d nat=%s assisted=%d",
+			from, pip, pubIP, pubPort, natType, len(assisted))
 
 		if from != "" && pip != "" {
-			e.registerPeer(from, pip, pubIP, pubPort, natType)
+			e.registerPeer(from, pip, pubIP, pubPort, natType, assisted)
 			if relayAddr != "" {
 				e.peersMu.Lock()
 				if pi, ok := e.peers[from]; ok {
@@ -822,9 +842,13 @@ func (e *Edge) reportMetadata() {
 	if nm.PublicEndpoint != "" {
 		metaPayload["publicEndpoint"] = nm.PublicEndpoint
 	}
+	// ★ 上报所有 STUN 端点
+	if len(nm.AllEndpoints) > 0 {
+		metaPayload["assistedEndpoints"] = nm.AllEndpoints
+	}
 
-	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%q multiExit=%v",
-		nm.NATType, nm.PublicEndpoint, nm.MultiExit)
+	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%q endpoints=%d multiExit=%v",
+		nm.NATType, nm.PublicEndpoint, len(nm.AllEndpoints), nm.MultiExit)
 
 	if ws == nil {
 		return
@@ -847,7 +871,7 @@ func jsonInt(v interface{}) int {
 	return 0
 }
 
-func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string) {
+func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string, assisted []string) {
 	var udpAddr *net.UDPAddr
 	if pubIP != "" && pubPort > 0 {
 		udpAddr = &net.UDPAddr{IP: net.ParseIP(pubIP), Port: pubPort}
@@ -872,11 +896,18 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string)
 		if natType != "" {
 			p.NATType = natType
 		}
+		if len(assisted) > 0 {
+			p.AssistedEndpoints = assisted
+		}
 	} else {
 		e.peers[pid] = &PeerInfo{
-			ClientID: pid, VirtualIP: vip, PubIP: pubIP,
-			PubPort: pubPort, UDPAddr: udpAddr,
-			NATType: natType,
+			ClientID:          pid,
+			VirtualIP:         vip,
+			PubIP:             pubIP,
+			PubPort:           pubPort,
+			UDPAddr:           udpAddr,
+			NATType:           natType,
+			AssistedEndpoints: assisted,
 		}
 	}
 	e.peersMu.Unlock()
@@ -949,9 +980,15 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 		if instr.TargetVirtualIp != "" {
 			p.VirtualIP = instr.TargetVirtualIp
 		}
+		if len(instr.TargetAssistedEndpoints) > 0 {
+			p.AssistedEndpoints = instr.TargetAssistedEndpoints
+		}
 	} else {
 		e.peers[instr.TargetMac] = &PeerInfo{
-			ClientID: instr.TargetMac, VirtualIP: instr.TargetVirtualIp, UDPAddr: udpAddr,
+			ClientID:          instr.TargetMac,
+			VirtualIP:         instr.TargetVirtualIp,
+			UDPAddr:           udpAddr,
+			AssistedEndpoints: instr.TargetAssistedEndpoints,
 		}
 	}
 }
@@ -1147,17 +1184,6 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 	e.notePeerCommon(addr, true, true)
 }
 
-// notePeerCommon 处理来自对端的 UDP 包。
-//
-// viaTURN：
-//   - false：从本地 UDP socket 收到 → 回包走本地 socket
-//   - true：从 TURN 中继收到 → 回包走 TURN（按原路）
-//
-// 首次收到 probe 的处理顺序：
-//   1. 立即上报 P2P（MarkP2P）
-//   2. 并发启动 5 轮 probe 回包（每 100ms 一次）
-//
-// 后续收到的 probe 只刷新 lastRecvAt，不再重复回包。
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool) {
 	now := time.Now().UnixMilli()
 
@@ -1213,9 +1239,6 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool) 
 		return
 	}
 
-	// ★ 首次收到该 peer 的 probe：
-	//    1. 立即上报 P2P
-	//    2. 并发回 5 轮（每 100ms 一次）
 	if e.relayMgr.GetState(clientID) != ConnP2P {
 		log.Printf("[P2P] 从 %s (%s) 收到打洞探测，上报 P2P 并回 5 轮", clientID, ip)
 		e.relayMgr.MarkP2P(clientID)
@@ -1237,7 +1260,6 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool) 
 	})
 }
 
-// writeProbe 按原路写一个 probe 包。
 func (e *Edge) writeProbe(addr *net.UDPAddr, probe []byte, viaTURN bool) {
 	if addr == nil {
 		return
@@ -1255,7 +1277,6 @@ func (e *Edge) writeProbe(addr *net.UDPAddr, probe []byte, viaTURN bool) {
 	_, _ = e.udpConn.WriteTo(probe, addr)
 }
 
-// sendProbeTo 保留兼容（当前无调用方）。
 func (e *Edge) sendProbeTo(addr *net.UDPAddr) {
 	if e.udpConn == nil || addr == nil {
 		return
@@ -1277,7 +1298,6 @@ func (e *Edge) hasTrafficFromTarget(peerID string, since int64) bool {
 	return p.lastRecvAt >= since
 }
 
-// hasTrafficFromAny 保留兼容（当前已无调用方）。
 func (e *Edge) hasTrafficFromAny(ips []net.IP, since int64) bool {
 	if len(ips) == 0 {
 		return false
