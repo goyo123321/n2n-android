@@ -15,8 +15,6 @@ import (
 	"time"
 )
 
-// ============ STUN 常量 ============
-
 const stunMagicCookie = 0x2112A442
 
 const (
@@ -55,8 +53,6 @@ const (
 	turnRequestTimeout  = 5 * time.Second
 )
 
-// ============ 内部结构 ============
-
 type stunAttr struct {
 	typ   uint16
 	value []byte
@@ -94,7 +90,7 @@ type TURNLite struct {
 	mu       sync.Mutex
 	stopped  bool
 	stopCh   chan struct{}
-	stopOnce sync.Once // ★ 新增
+	stopOnce sync.Once
 }
 
 func NewTURNLite(serverAddr, username, password string) *TURNLite {
@@ -113,8 +109,6 @@ func NewTURNLiteWithTCP(serverAddr, username, password string, useTCP bool) *TUR
 	}
 }
 
-// ============ 辅助 ============
-
 func isNetworkUnreachable(err error) bool {
 	if err == nil {
 		return false
@@ -130,8 +124,6 @@ func (t *TURNLite) IsAlive() bool {
 	defer t.mu.Unlock()
 	return !t.stopped
 }
-
-// ============ STUN 编解码 ============
 
 func buildSTUNMsg(msgType uint16, txid [12]byte, attrs []stunAttr) []byte {
 	total := 20
@@ -184,8 +176,6 @@ func parseSTUNMsg(data []byte) (*stunMessage, error) {
 		attrs:   attrs,
 	}, nil
 }
-
-// ============ XOR 地址 ============
 
 var magicBytes = [4]byte{0x21, 0x12, 0xA4, 0x42}
 
@@ -240,8 +230,6 @@ func xorDecodePeer(data []byte) (net.IP, int, error) {
 	return nil, 0, fmt.Errorf("未知地址族 0x%02x", family)
 }
 
-// ============ HMAC-SHA1 签名 ============
-
 func (t *TURNLite) sign(msg []byte) []byte {
 	if t.key == nil {
 		return msg
@@ -271,8 +259,6 @@ func randTxID() [12]byte {
 	_, _ = rand.Read(t[:])
 	return t
 }
-
-// ============ 发送 + 等待 ============
 
 func (t *TURNLite) sendRequest(msgType uint16, attrs []stunAttr, withAuth bool) (*stunMessage, error) {
 	txid := randTxID()
@@ -334,8 +320,6 @@ func (t *TURNLite) dispatch(msg *stunMessage) {
 	}
 }
 
-// ============ Allocate ============
-
 func (t *TURNLite) Allocate() error {
 	protectedDialer := newProtectedDialer()
 
@@ -355,7 +339,6 @@ func (t *TURNLite) Allocate() error {
 		t.conn = conn
 	}
 
-	// ★ 用 safeGo 起 readLoop：panic 时 Close 自己
 	safeGo("turn-lite-readLoop", t.readLoop)
 
 	reqTransport := []byte{transportUDP, 0, 0, 0}
@@ -425,12 +408,9 @@ func (t *TURNLite) extractAllocateResult(resp *stunMessage) error {
 
 	log.Printf("[TURN-Lite] ✅ Allocation 成功: relay=%s", t.relayAddr)
 
-	// ★ 用 safeGo 起 refreshLoop
 	safeGo("turn-lite-refresh", t.refreshLoop)
 	return nil
 }
-
-// ============ CreatePermission ============
 
 func (t *TURNLite) ensurePermission(ip net.IP) error {
 	key := ip.String()
@@ -460,8 +440,6 @@ func (t *TURNLite) ensurePermission(ip net.IP) error {
 	return nil
 }
 
-// ============ 发送 ============
-
 func (t *TURNLite) SendTo(data []byte, peerAddr *net.UDPAddr) error {
 	if t.conn == nil {
 		return fmt.Errorf("TURN 未就绪")
@@ -485,8 +463,6 @@ func (t *TURNLite) SendTo(data []byte, peerAddr *net.UDPAddr) error {
 	_, err := t.conn.Write(msg)
 	return err
 }
-
-// ============ 读循环 ============
 
 func (t *TURNLite) readLoop() {
 	defer func() {
@@ -586,7 +562,6 @@ func (t *TURNLite) handleIncoming(data []byte) {
 			return
 		}
 		if t.onMessage != nil {
-			// ★ 独立 recover：即使调用方没包 recover，也不会崩穿 readLoop
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
@@ -600,8 +575,6 @@ func (t *TURNLite) handleIncoming(data []byte) {
 		t.dispatch(msg)
 	}
 }
-
-// ============ 定时刷新 ============
 
 func (t *TURNLite) refreshLoop() {
 	defer func() {
@@ -658,8 +631,6 @@ func (t *TURNLite) refreshLoop() {
 	}
 }
 
-// ============ 查询 / 关闭 ============
-
 func (t *TURNLite) GetRelayAddr() string {
 	if t.relayAddr == nil {
 		return ""
@@ -668,7 +639,6 @@ func (t *TURNLite) GetRelayAddr() string {
 }
 
 func (t *TURNLite) Close() {
-	// ★ sync.Once 保证 stopCh 只关一次
 	t.stopOnce.Do(func() {
 		t.mu.Lock()
 		t.stopped = true
