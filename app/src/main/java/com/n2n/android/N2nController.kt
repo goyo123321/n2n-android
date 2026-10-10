@@ -14,8 +14,6 @@ object N2nController {
     @Volatile
     private var client: Client? = null
     private val running = AtomicBoolean(false)
-
-    // 用同一把锁保护 client 的读写
     private val clientLock = Any()
 
     fun isRunning(): Boolean = running.get()
@@ -28,9 +26,6 @@ object N2nController {
         protector: Protector,
         onResult: (String) -> Unit
     ) {
-        // ★ 修复 1：CAS 原子占用 running。
-        //    之前是 if (running.get()) 判断后再 running.set(true)，
-        //    两个并发调用可能都通过检查。CAS 保证只有一个能进入。
         if (!running.compareAndSet(false, true)) {
             onResult("already running")
             return
@@ -54,9 +49,6 @@ object N2nController {
                     result = "start failed: $err"
                     running.set(false)
                 } else {
-                    // ★ 修复 2：启动期间可能被 stop() 调过。
-                    //    在 clientLock 内检查 running 是否仍为 true，
-                    //    是 → 发布 client；否 → 回收刚起的 Client。
                     var accepted = false
                     synchronized(clientLock) {
                         if (running.get()) {
@@ -87,16 +79,7 @@ object N2nController {
         }.apply { name = "n2n-start" }.start()
     }
 
-    /**
-     * 停止 VPN。
-     *
-     * ★ 修复 3：先置 running=false（无锁），再取 client。
-     *    这样 startAsync 里的 `if (running.get())` 检查与
-     *    stop() 里的 `running.set(false)` 有明确的先后关系，
-     *    不会出现"启动检查通过 → 停止置 false → 启动发布 client"的漏网。
-     */
     fun stop() {
-        // 先置 false：让任何正在跑的 startAsync 检查到"已被停止"
         running.set(false)
 
         val c: Client?
@@ -115,10 +98,6 @@ object N2nController {
             }
         }.apply { name = "n2n-stop" }.start()
     }
-
-    // ============================================================
-    // getter：全部 try-catch，跨 JNI 调用不能把异常抛回 UI
-    // ============================================================
 
     fun getVirtualIP(): String = try {
         synchronized(clientLock) { client }?.virtualIP ?: ""
