@@ -64,11 +64,9 @@ type Edge struct {
 	fallbackTimers   map[string]*time.Timer
 	fallbackTimersMu sync.Mutex
 
-	// 日志节流：同一 dstIP 每 5 秒最多打一次"无匹配 peer"
 	lastNoPeerLog   map[string]int64
 	lastNoPeerLogMu sync.Mutex
 
-	// 状态变化日志：同一 peer 状态不变时不打 TUN 转发日志
 	tunStateLog   map[string]ConnType
 	tunStateLogMu sync.Mutex
 
@@ -78,7 +76,7 @@ type Edge struct {
 	mu      sync.Mutex
 }
 
-// safeGo 在 goroutine 里执行 fn，panic 时只记录日志，不让整个进程崩溃。
+// safeGo 包 goroutine，panic 时只记录日志，不让整个进程崩溃。
 func safeGo(name string, fn func()) {
 	go func() {
 		defer func() {
@@ -411,7 +409,6 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	safeGo("tunWriteLoop", e.tunWriteLoop)
 	safeGo("tunReadLoop", e.tunReadLoop)
 
-	// 启动 UDP 保活
 	e.startKeepalive()
 
 	// 9. NAT 探测
@@ -461,7 +458,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		}
 	})
 
-	// 10. TURN 异步初始化
+	// 10. TURN 异步初始化（带独立 recover）
 	safeGo("turn-init", func() {
 		time.Sleep(200 * time.Millisecond)
 		ctx, cancel := contextWithTimeout(30 * time.Second)
@@ -470,10 +467,25 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		if e.turnClient == nil {
 			return
 		}
-		if err := e.turnClient.FetchAndSetup(ctx); err != nil {
-			log.Printf("[TURN] 初始化失败: %v", err)
+
+		// FetchAndSetup 内部可能会 native crash（protect fd 时），
+		// 用独立 recover 兜底
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[panic] turn-fetch: %v\n%s", r, debug.Stack())
+				}
+			}()
+			if err := e.turnClient.FetchAndSetup(ctx); err != nil {
+				log.Printf("[TURN] 初始化失败: %v", err)
+				return
+			}
+		}()
+
+		if !e.turnClient.IsReady() {
 			return
 		}
+
 		log.Printf("[TURN] 就绪: %s", e.turnClient.GetRelayAddr())
 		if e.relayMgr != nil {
 			e.relayMgr.UpgradeRelaysToTURN()
@@ -487,7 +499,14 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	})
 
 	// 11. TURN 后台重连循环
-	e.turnClient.StartReconnectLoop()
+	safeGo("turn-reconnect", func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[panic] turn-reconnect: %v\n%s", r, debug.Stack())
+			}
+		}()
+		e.turnClient.StartReconnectLoop()
+	})
 
 	log.Printf("[Edge] 已启动 clientId=%s room=%s", clientId, cfg.RoomID)
 	return e, nil
@@ -778,7 +797,6 @@ func (e *Edge) peerExists(peerID string) bool {
 	return ok
 }
 
-// reportMetadata 上报 p2p_metadata（LAN 字段已删除）。
 func (e *Edge) reportMetadata() {
 	e.mu.Lock()
 	nm := e.natMeta
