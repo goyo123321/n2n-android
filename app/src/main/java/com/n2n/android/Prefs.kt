@@ -30,7 +30,7 @@ object Prefs {
         val connectToken: String,
     )
 
-    // ★ 双层 fallback：主 SP 打不开时降级到备用 SP，保证 UI 不崩
+    // 双层 fallback：主 SP 打不开时降级到备用 SP
     private fun sp(ctx: Context) =
         try {
             ctx.getSharedPreferences(NAME, Context.MODE_PRIVATE)
@@ -114,7 +114,7 @@ object Prefs {
             val s = sp(ctx) ?: return generateFallbackId()
             val existing = s.getString(KEY_AUTO_CLIENT_ID, null)
             if (!existing.isNullOrEmpty()) return existing
-            val newId = "android-" + UUID.randomUUID().toString().take(8)
+            val newId = generateFallbackId()
             s.edit().putString(KEY_AUTO_CLIENT_ID, newId).apply()
             newId
         } catch (t: Throwable) {
@@ -122,6 +122,17 @@ object Prefs {
         }
     }
 
-    private fun generateFallbackId(): String =
-        "android-" + UUID.randomUUID().toString().take(8)
+    // ★ 用 hex 而不是 take(8)：UUID 里 '-' 不会落在前 8 位，但显式过滤更稳
+    private fun generateFallbackId(): String {
+        val raw = UUID.randomUUID().toString().replace("-", "")
+        return "android-" + raw.take(8)
+    }
+
+    // ============ 清空（可选） ============
+
+    fun clearAll(ctx: Context) {
+        try {
+            sp(ctx)?.edit()?.clear()?.apply()
+        } catch (_: Throwable) {}
+    }
 }
