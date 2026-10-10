@@ -51,8 +51,8 @@ func setLogFilePath(path string) {
 
 // AppendLog 追加一行日志（带时间戳）。
 //
-// ★ 时区修复：用 time.Now().Local()，避免 gomobile 环境里
-//   time.Local 默认为 UTC 导致日志时间与 Kotlin 侧差 8 小时。
+// 时区修复：用 time.Now().Local()，避免 gomobile 环境里
+// time.Local 默认为 UTC 导致日志时间与 Kotlin 侧差 8 小时。
 func AppendLog(msg string) {
 	line := fmt.Sprintf("[%s] %s", time.Now().Local().Format("15:04:05"), msg)
 
@@ -177,7 +177,6 @@ func initLogRedirection() {
 }
 
 func init() {
-	// ★ 诊断：打印一次当前时区，便于确认 Go 侧时间基准
 	{
 		local := time.Now().Local()
 		_, offset := local.Zone()
