@@ -16,7 +16,25 @@ object N2nController {
     private val running = AtomicBoolean(false)
     private val clientLock = Any()
 
+    @Volatile private var tzApplied = false
+    @Volatile private var tzAppliedOffset = Long.MIN_VALUE
+
     fun isRunning(): Boolean = running.get()
+
+    fun applySystemTimezone() {
+        try {
+            val tz = java.util.TimeZone.getDefault()
+            val offsetMs = tz.getOffset(System.currentTimeMillis())
+            val offsetSec = (offsetMs / 1000).toLong()
+            if (tzApplied && tzAppliedOffset == offsetSec) return
+            Mobile.setTimezoneOffset(offsetSec)
+            tzApplied = true
+            tzAppliedOffset = offsetSec
+            Log.i(TAG, "applySystemTimezone: ${tz.id} offset=${offsetSec}s")
+        } catch (t: Throwable) {
+            Log.e(TAG, "applySystemTimezone failed", t)
+        }
+    }
 
     fun startAsync(
         tunFd: Int,
