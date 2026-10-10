@@ -18,11 +18,15 @@ class LogActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityLogBinding
 
+    // ★ ticking 标记：防止 onStop 后 ticker 又把自己 post 回来
+    @Volatile private var ticking = false
+
     private val ticker = object : Runnable {
         override fun run() {
+            if (!ticking) return
             if (isFinishing || isDestroyed || !::binding.isInitialized) return
             refresh()
-            binding.root.postDelayed(this, 1000)
+            if (ticking) binding.root.postDelayed(this, 1000)
         }
     }
 
@@ -81,16 +85,19 @@ class LogActivity : AppCompatActivity() {
         super.onStart()
         if (!::binding.isInitialized) return
         binding.root.removeCallbacks(ticker)
+        ticking = true
         binding.root.postDelayed(ticker, 1000)
     }
 
     override fun onStop() {
         super.onStop()
+        ticking = false
         if (!::binding.isInitialized) return
         binding.root.removeCallbacks(ticker)
     }
 
     override fun onDestroy() {
+        ticking = false
         if (::binding.isInitialized) {
             binding.root.removeCallbacks(ticker)
         }
