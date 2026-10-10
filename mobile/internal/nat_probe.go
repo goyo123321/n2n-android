@@ -12,6 +12,7 @@ import (
 type NATMetadata struct {
 	P2PEndpoint        string
 	PublicEndpoint     string
+	AllEndpoints       []string // ★ 所有 STUN 结果（去重）
 	NATType            string
 	PortsDifference    int
 	RegularPortsChange bool
@@ -34,6 +35,7 @@ var stunServersDomain = []string{
 }
 
 const minStunSamples = 2
+const stunProbeTotalTimeout = 5 * time.Second // ★ 总探测时间上限
 
 type natProbeResult struct {
 	ip   string
@@ -69,10 +71,21 @@ func probeNATWithConn(conn net.PacketConn, stunServers []string) *NATMetadata {
 	return meta
 }
 
+// probeConn 遍历所有 STUN 服务器，收集所有响应端点。
+//
+// ★ 改动：不再"拿到 2 个样本就 break"，改为"总耗时上限 5 秒"。
+//   目的是收集多个不同时刻的端口，供打洞时作为精确候选。
 func probeConn(conn net.PacketConn, servers []string) []natProbeResult {
 	var results []natProbeResult
+	deadline := time.Now().Add(stunProbeTotalTimeout)
 
 	for _, server := range servers {
+		if time.Now().After(deadline) {
+			log.Printf("[NAT] 总探测时间超 %v，停止（已收集 %d 个端点）",
+				stunProbeTotalTimeout, len(results))
+			break
+		}
+
 		serverAddr, err := net.ResolveUDPAddr("udp4", server)
 		if err != nil {
 			continue
@@ -88,9 +101,9 @@ func probeConn(conn net.PacketConn, servers []string) []natProbeResult {
 		buf := make([]byte, 1500)
 		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 
-		deadline := time.Now().Add(2 * time.Second)
+		deadlineConn := time.Now().Add(2 * time.Second)
 		for {
-			remaining := time.Until(deadline)
+			remaining := time.Until(deadlineConn)
 			if remaining <= 0 {
 				log.Printf("[NAT] STUN %s 超时", server)
 				break
@@ -127,10 +140,6 @@ func probeConn(conn net.PacketConn, servers []string) []natProbeResult {
 			log.Printf("[NAT] STUN %s → %s:%d", server, ip4.String(), xorAddr.Port)
 			break
 		}
-
-		if len(results) >= minStunSamples {
-			break
-		}
 	}
 
 	return results
@@ -148,6 +157,16 @@ func sameUDPAddr(a, b net.Addr) bool {
 func fillNATMetadata(meta *NATMetadata, results []natProbeResult) {
 	meta.PublicEndpoint = net.JoinHostPort(results[0].ip, strconv.Itoa(results[0].port))
 	meta.P2PEndpoint = meta.PublicEndpoint
+
+	// ★ 收集所有端点（去重）
+	seen := make(map[string]bool)
+	for _, r := range results {
+		ep := net.JoinHostPort(r.ip, strconv.Itoa(r.port))
+		if !seen[ep] {
+			seen[ep] = true
+			meta.AllEndpoints = append(meta.AllEndpoints, ep)
+		}
+	}
 
 	firstPort := results[0].port
 	allSame := true
@@ -171,7 +190,8 @@ func fillNATMetadata(meta *NATMetadata, results []natProbeResult) {
 		meta.Behavior = "BehaviorPortChanged"
 	}
 
-	log.Printf("[NAT] %s pub=%s", meta.NATType, meta.PublicEndpoint)
+	log.Printf("[NAT] %s pub=%s endpoints=%d",
+		meta.NATType, meta.PublicEndpoint, len(meta.AllEndpoints))
 }
 
 func probeNAT(localUDPPort int, stunServers []string) *NATMetadata {
@@ -188,8 +208,13 @@ func probeNAT(localUDPPort int, stunServers []string) *NATMetadata {
 	}
 
 	var results []natProbeResult
+	deadline := time.Now().Add(stunProbeTotalTimeout)
 
 	for _, server := range servers {
+		if time.Now().After(deadline) {
+			break
+		}
+
 		c, err := stun.Dial("udp", server)
 		if err != nil {
 			continue
@@ -225,10 +250,6 @@ func probeNAT(localUDPPort int, stunServers []string) *NATMetadata {
 		}
 		results = append(results, natProbeResult{ip: ip4.String(), port: xorAddr.Port})
 		log.Printf("[NAT] STUN %s → %s:%d", server, ip4.String(), xorAddr.Port)
-
-		if len(results) >= minStunSamples {
-			break
-		}
 	}
 
 	if len(results) == 0 {
