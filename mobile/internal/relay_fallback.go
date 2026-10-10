@@ -1,13 +1,8 @@
-package main
-
-// 注意：Android 端此文件的 package 是 internal。
-// 完整路径：mobile/internal/relay_fallback.go
-// package internal
+package internal
 
 import (
 	"log"
 	"net"
-	"runtime/debug"
 	"sync"
 	"time"
 )
@@ -21,16 +16,7 @@ const (
 	ConnUnknown ConnType = "unknown"
 )
 
-func safeGo(name string, fn func()) {
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("[panic] %s: %v\n%s", name, r, debug.Stack())
-			}
-		}()
-		fn()
-	}()
-}
+// 注意：safeGo 定义在 edge.go 里，此处不重复定义。
 
 type RelayManager struct {
 	mu         sync.RWMutex
@@ -182,6 +168,10 @@ func (rm *RelayManager) DowngradeToWS(peerId string, reason string) {
 	}
 }
 
+func (rm *RelayManager) MarkRelay(peerId string) {
+	rm.MarkFallback(peerId)
+}
+
 func (rm *RelayManager) ShouldRelay(peerId string) bool {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
@@ -192,6 +182,24 @@ func (rm *RelayManager) ShouldRelay(peerId string) bool {
 	return s == ConnTURN || s == ConnRelay
 }
 
+func (rm *RelayManager) IsP2P(peerId string) bool {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+	return rm.states[peerId] == ConnP2P
+}
+
+func (rm *RelayManager) IsTURN(peerId string) bool {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+	return rm.states[peerId] == ConnTURN
+}
+
+func (rm *RelayManager) IsWSRelay(peerId string) bool {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+	return rm.states[peerId] == ConnRelay
+}
+
 func (rm *RelayManager) GetState(peerId string) ConnType {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
@@ -199,6 +207,10 @@ func (rm *RelayManager) GetState(peerId string) ConnType {
 		return s
 	}
 	return ConnUnknown
+}
+
+func (rm *RelayManager) SendViaRelay(data []byte) error {
+	return rm.ws.SendBinary(data)
 }
 
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
