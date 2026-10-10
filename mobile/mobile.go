@@ -39,14 +39,6 @@ type Client struct {
 
 func NewClient() *Client { return &Client{} }
 
-// SetTimezoneOffset 由 Kotlin 侧调用，设置设备时区偏移量（秒）。
-//
-// gomobile 环境下 Go 无法读取 Android 系统时区，需要在 App 启动时
-// 由 Kotlin 侧读 TimeZone.getDefault() 后传入。
-func SetTimezoneOffset(seconds int) {
-	internal.SetTimezoneOffset(seconds)
-}
-
 func (c *Client) SetTunFD(fd int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -65,7 +57,6 @@ func (c *Client) SetStunFD(fd int) {
 	c.stunFd = fd
 }
 
-// SetProtector 注册 VpnService.protect 桥。p == nil 时注销。
 func (c *Client) SetProtector(p Protector) {
 	c.mu.Lock()
 	c.protector = p
