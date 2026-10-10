@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/url"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,24 +24,20 @@ type WSTransport struct {
 	onMessage func(map[string]interface{})
 	onBinary  func([]byte)
 
-	// ★ 早期消息缓冲：onMessage / onBinary 未设置前收到的消息暂存这里
-	//   修复 "ready 消息在 handler 设置前到达被丢弃" 的问题
 	earlyText   []map[string]interface{}
 	earlyBinary [][]byte
 	handlersSet bool
 
-	fullURL     string
-	dialer      *websocket.Dialer
-	stopCh      chan struct{}
-	reconnectMu sync.Mutex
-	stopping    bool
+	fullURL  string
+	dialer   *websocket.Dialer
+	stopCh   chan struct{}
+	stopOnce sync.Once
+
+	reconnectMu  sync.Mutex
+	stopping     bool
+	reconnecting bool
 }
 
-// SetHandlers 设置 onMessage / onBinary 回调，并重放缓冲消息。
-//
-// ★ 替换原来直接赋值 ws.onMessage = xxx 的写法。
-//   必须在 WS 建立后尽快调用，重放前收到的消息都在缓冲区里。
-//   这是修复"ready 丢失导致 VIP / serverSeenIP 拿不到"的关键。
 func (ws *WSTransport) SetHandlers(
 	onMessage func(map[string]interface{}),
 	onBinary func([]byte),
@@ -58,18 +55,52 @@ func (ws *WSTransport) SetHandlers(
 	if len(textBuf) > 0 {
 		log.Printf("[WS] 重放 %d 条早期文本消息", len(textBuf))
 		for _, msg := range textBuf {
-			if onMessage != nil {
-				onMessage(msg)
-			}
+			ws.routeText(msg)
 		}
 	}
 	if len(binBuf) > 0 {
 		log.Printf("[WS] 重放 %d 条早期二进制消息", len(binBuf))
 		for _, data := range binBuf {
-			if onBinary != nil {
-				onBinary(data)
-			}
+			ws.routeBinary(data)
 		}
+	}
+}
+
+func (ws *WSTransport) routeText(msg map[string]interface{}) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[WS] onMessage panic: %v\n%s", r, debug.Stack())
+		}
+	}()
+	ws.mu.Lock()
+	ready := ws.handlersSet && ws.onMessage != nil
+	handler := ws.onMessage
+	if !ready {
+		ws.earlyText = append(ws.earlyText, msg)
+	}
+	ws.mu.Unlock()
+	if ready {
+		handler(msg)
+	}
+}
+
+func (ws *WSTransport) routeBinary(data []byte) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[WS] onBinary panic: %v\n%s", r, debug.Stack())
+		}
+	}()
+	ws.mu.Lock()
+	ready := ws.handlersSet && ws.onBinary != nil
+	handler := ws.onBinary
+	if !ready {
+		cp := make([]byte, len(data))
+		copy(cp, data)
+		ws.earlyBinary = append(ws.earlyBinary, cp)
+	}
+	ws.mu.Unlock()
+	if ready {
+		handler(data)
 	}
 }
 
@@ -138,8 +169,9 @@ func NewWSTransport(signalingURL, roomId, clientId, connectToken, preferredIP st
 		dialer:   dialer,
 		stopCh:   make(chan struct{}),
 	}
-	go ws.readLoop(conn)
-	go ws.heartbeat(20 * time.Second)
+
+	safeGo("ws-readLoop", func() { ws.readLoop(conn) })
+	safeGo("ws-heartbeat", func() { ws.heartbeat(20 * time.Second) })
 	return ws, nil
 }
 
@@ -155,6 +187,18 @@ func maskToken(u string) string {
 }
 
 func (ws *WSTransport) readLoop(conn *websocket.Conn) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[WS] readLoop panic: %v\n%s", r, debug.Stack())
+			ws.reconnectMu.Lock()
+			stopping := ws.stopping
+			ws.reconnectMu.Unlock()
+			if !stopping {
+				safeGo("ws-reconnect", ws.tryReconnect)
+			}
+		}
+	}()
+
 	for {
 		msgType, data, err := conn.ReadMessage()
 		if err != nil {
@@ -167,7 +211,7 @@ func (ws *WSTransport) readLoop(conn *websocket.Conn) {
 			if stopping {
 				return
 			}
-			go ws.tryReconnect()
+			safeGo("ws-reconnect", ws.tryReconnect)
 			return
 		}
 		if msgType == websocket.TextMessage {
@@ -175,39 +219,30 @@ func (ws *WSTransport) readLoop(conn *websocket.Conn) {
 			if err := json.Unmarshal(data, &msg); err != nil {
 				continue
 			}
-			ws.mu.Lock()
-			if ws.handlersSet && ws.onMessage != nil {
-				handler := ws.onMessage
-				ws.mu.Unlock()
-				handler(msg)
-			} else {
-				// ★ 缓冲早期消息（handler 还没设置）
-				ws.earlyText = append(ws.earlyText, msg)
-				ws.mu.Unlock()
-			}
+			ws.routeText(msg)
 		} else if msgType == websocket.BinaryMessage {
-			ws.mu.Lock()
-			if ws.handlersSet && ws.onBinary != nil {
-				handler := ws.onBinary
-				ws.mu.Unlock()
-				handler(data)
-			} else {
-				// ★ 缓冲早期二进制消息
-				cp := make([]byte, len(data))
-				copy(cp, data)
-				ws.earlyBinary = append(ws.earlyBinary, cp)
-				ws.mu.Unlock()
-			}
+			ws.routeBinary(data)
 		}
 	}
 }
 
 func (ws *WSTransport) tryReconnect() {
 	ws.reconnectMu.Lock()
-	defer ws.reconnectMu.Unlock()
-	if ws.stopping {
+	if ws.stopping || ws.reconnecting {
+		ws.reconnectMu.Unlock()
 		return
 	}
+	ws.reconnecting = true
+	ws.reconnectMu.Unlock()
+
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[WS] tryReconnect panic: %v\n%s", r, debug.Stack())
+		}
+		ws.reconnectMu.Lock()
+		ws.reconnecting = false
+		ws.reconnectMu.Unlock()
+	}()
 
 	delays := []time.Duration{1, 2, 5, 10, 30, 60, 60, 60, 60, 60}
 	for i, d := range delays {
@@ -225,14 +260,11 @@ func (ws *WSTransport) tryReconnect() {
 		}
 		ws.mu.Lock()
 		ws.conn = conn
-		handler := ws.onMessage
 		ws.mu.Unlock()
 		log.Printf("[WS] ✅ 重连成功")
-		go ws.readLoop(conn)
-		go ws.heartbeat(20 * time.Second)
-		if handler != nil {
-			handler(map[string]interface{}{"type": "_reconnected"})
-		}
+		safeGo("ws-readLoop", func() { ws.readLoop(conn) })
+		safeGo("ws-heartbeat", func() { ws.heartbeat(20 * time.Second) })
+		ws.routeText(map[string]interface{}{"type": "_reconnected"})
 		return
 	}
 
@@ -240,6 +272,11 @@ func (ws *WSTransport) tryReconnect() {
 }
 
 func (ws *WSTransport) heartbeat(interval time.Duration) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[WS] heartbeat panic: %v\n%s", r, debug.Stack())
+		}
+	}()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for range ticker.C {
@@ -290,13 +327,15 @@ func (ws *WSTransport) SendBinary(data []byte) error {
 
 func (ws *WSTransport) Close() error {
 	ws.reconnectMu.Lock()
-	if ws.stopping {
-		ws.reconnectMu.Unlock()
+	already := ws.stopping
+	ws.stopping = true
+	ws.reconnectMu.Unlock()
+
+	ws.stopOnce.Do(func() { close(ws.stopCh) })
+
+	if already {
 		return nil
 	}
-	ws.stopping = true
-	close(ws.stopCh)
-	ws.reconnectMu.Unlock()
 
 	ws.mu.Lock()
 	conn := ws.conn
