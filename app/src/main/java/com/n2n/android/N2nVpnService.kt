@@ -60,7 +60,6 @@ class N2nVpnService : VpnService() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
 
-    // ★ 仅作为 Kotlin 侧引用。fd 所有权归 Go（detachFd 已转移）
     private var protectedUdpSocket: DatagramSocket? = null
     private var protectedStunSocket: DatagramSocket? = null
 
@@ -74,10 +73,6 @@ class N2nVpnService : VpnService() {
             }
         }
     }
-
-    // ============================================================
-    // 崩溃捕获
-    // ============================================================
 
     private fun installCrashHandler() {
         if (!crashHandlerInstalled.compareAndSet(false, true)) return
@@ -96,10 +91,6 @@ class N2nVpnService : VpnService() {
             try { default?.uncaughtException(thread, throwable) } catch (_: Throwable) {}
         }
     }
-
-    // ============================================================
-    // 日志
-    // ============================================================
 
     private fun ktLog(msg: String) {
         try {
@@ -124,10 +115,6 @@ class N2nVpnService : VpnService() {
         } catch (_: Throwable) {}
         Log.i(TAG, msg)
     }
-
-    // ============================================================
-    // 通知刷新
-    // ============================================================
 
     private val updateIpRunnable = object : Runnable {
         private var attempts = 0
@@ -154,10 +141,6 @@ class N2nVpnService : VpnService() {
         }
     }
 
-    // ============================================================
-    // 生命周期
-    // ============================================================
-
     override fun onCreate() {
         super.onCreate()
         installCrashHandler()
@@ -167,7 +150,6 @@ class N2nVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         ktLog("onStartCommand action=${intent?.action} started=$started")
 
-        // ★ Android 12+ 5 秒内必须 startForeground
         if (!safeStartForeground()) {
             ktLog("startForeground 失败，stopSelf")
             stopSelf()
@@ -224,7 +206,6 @@ class N2nVpnService : VpnService() {
             return
         }
 
-        // Service 新实例但 Controller 还在跑 → 强制停旧的
         if (N2nController.isRunning()) {
             ktLog("handleStart: Controller 仍在 running，先强制停止")
             try { N2nController.stop() } catch (t: Throwable) {
@@ -423,9 +404,6 @@ class N2nVpnService : VpnService() {
             }
         } catch (_: Throwable) {}
 
-        // 不走 DatagramSocket.impl.fd 反射路径：
-        //   impl.fd 是 socket 自己的 fd，反射不改所有权，
-        //   socket finalizer 仍会 close 它。
         return -1
     }
 
@@ -493,10 +471,6 @@ class N2nVpnService : VpnService() {
         try { handleStop() } catch (t: Throwable) { Log.e(TAG, "stopVpn failed", t) }
     }
 
-    // ============================================================
-    // handleStop
-    // ============================================================
-
     private fun handleStop() {
         if (!stopping.compareAndSet(false, true)) {
             ktLog("handleStop: 已在清理中，忽略")
@@ -504,15 +478,11 @@ class N2nVpnService : VpnService() {
         }
         ktLog("handleStop 开始")
 
-        // 先停通知刷新
         notificationActive = false
         try { handler.removeCallbacks(updateIpRunnable) } catch (_: Throwable) {}
 
         Thread {
             try {
-                // ★ 无条件调 N2nController.stop()
-                //   启动进行中时 started 还是 false，但 running 可能已 true，
-                //   必须通知 Controller 取消，否则 Client 泄漏
                 try {
                     N2nController.stop()
                 } catch (t: Throwable) {
@@ -521,15 +491,9 @@ class N2nVpnService : VpnService() {
                 started = false
                 starting.set(false)
 
-                // TUN PFD：Go 已 detachFd，PFD 的 mFd 为 null，
-                // close() 是 no-op
                 try { tunInterface?.close() } catch (_: Throwable) {}
                 tunInterface = null
 
-                // ★ 不 close protectedUdpSocket / protectedStunSocket：
-                //   底层 fd 的所有权已通过 detachFd 转移给 Go，
-                //   Go 在 Edge.Stop() 里 close 它。
-                //   Kotlin 侧仅置空引用（socket 对象及其原 fd 会被 GC 兜底）。
                 protectedUdpSocket = null
                 protectedStunSocket = null
 
@@ -552,10 +516,6 @@ class N2nVpnService : VpnService() {
             }
         }.apply { name = "n2n-stop" }.start()
     }
-
-    // ============================================================
-    // 锁
-    // ============================================================
 
     private fun acquireLocks() {
         try {
@@ -585,10 +545,6 @@ class N2nVpnService : VpnService() {
         wifiLock = null
     }
 
-    // ============================================================
-    // TUN
-    // ============================================================
-
     private fun buildTunInterface(vip: String): ParcelFileDescriptor? {
         return try {
             ktLog("建立 TUN（仅组网段），绑定 IP: $vip")
@@ -611,10 +567,6 @@ class N2nVpnService : VpnService() {
             null
         }
     }
-
-    // ============================================================
-    // 通知
-    // ============================================================
 
     private fun buildNotification(text: String): Notification {
         createChannelIfNeeded()
