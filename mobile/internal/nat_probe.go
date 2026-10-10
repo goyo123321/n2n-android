@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"encoding/binary"
 	"log"
 	"net"
 	"strconv"
@@ -12,7 +13,7 @@ import (
 type NATMetadata struct {
 	P2PEndpoint        string
 	PublicEndpoint     string
-	AllEndpoints       []string // ★ 所有 STUN 结果（去重）
+	AllEndpoints       []string // ★ 所有 STUN 结果（多时刻）
 	NATType            string
 	PortsDifference    int
 	RegularPortsChange bool
@@ -35,11 +36,54 @@ var stunServersDomain = []string{
 }
 
 const minStunSamples = 2
-const stunProbeTotalTimeout = 5 * time.Second // ★ 总探测时间上限
 
 type natProbeResult struct {
 	ip   string
 	port int
+}
+
+// parseSTUNResponse 解析 STUN Binding Response 里的 XOR-MAPPED-ADDRESS。
+//
+// 输入：udpConn 收到的任意 UDP 包
+// 输出：(publicIP, publicPort, ok)
+//
+// 只识别 msgType=0x0101（Binding Success Response），其他一律返回 false。
+func parseSTUNResponse(data []byte) (string, int, bool) {
+	if len(data) < 20 {
+		return "", 0, false
+	}
+	// Binding Success Response: msgType = 0x0101
+	if data[0] != 0x01 || data[1] != 0x01 {
+		return "", 0, false
+	}
+	// magic cookie 校验
+	if binary.BigEndian.Uint32(data[4:8]) != 0x2112A442 {
+		return "", 0, false
+	}
+
+	msgLen := int(binary.BigEndian.Uint16(data[2:4]))
+	end := 20 + msgLen
+	if end > len(data) {
+		end = len(data)
+	}
+
+	offset := 20
+	for offset+4 <= end {
+		typ := binary.BigEndian.Uint16(data[offset : offset+2])
+		l := int(binary.BigEndian.Uint16(data[offset+2 : offset+4]))
+		if offset+4+l > end {
+			break
+		}
+		// XOR-MAPPED-ADDRESS = 0x0020
+		if typ == 0x0020 {
+			ip, port, err := xorDecodePeer(data[offset+4 : offset+4+l])
+			if err == nil && ip.To4() != nil {
+				return ip.To4().String(), port, true
+			}
+		}
+		offset += 4 + ((l + 3) &^ 3)
+	}
+	return "", 0, false
 }
 
 func probeNATWithConn(conn net.PacketConn, stunServers []string) *NATMetadata {
@@ -71,21 +115,10 @@ func probeNATWithConn(conn net.PacketConn, stunServers []string) *NATMetadata {
 	return meta
 }
 
-// probeConn 遍历所有 STUN 服务器，收集所有响应端点。
-//
-// ★ 改动：不再"拿到 2 个样本就 break"，改为"总耗时上限 5 秒"。
-//   目的是收集多个不同时刻的端口，供打洞时作为精确候选。
 func probeConn(conn net.PacketConn, servers []string) []natProbeResult {
 	var results []natProbeResult
-	deadline := time.Now().Add(stunProbeTotalTimeout)
 
 	for _, server := range servers {
-		if time.Now().After(deadline) {
-			log.Printf("[NAT] 总探测时间超 %v，停止（已收集 %d 个端点）",
-				stunProbeTotalTimeout, len(results))
-			break
-		}
-
 		serverAddr, err := net.ResolveUDPAddr("udp4", server)
 		if err != nil {
 			continue
@@ -101,9 +134,9 @@ func probeConn(conn net.PacketConn, servers []string) []natProbeResult {
 		buf := make([]byte, 1500)
 		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 
-		deadlineConn := time.Now().Add(2 * time.Second)
+		deadline := time.Now().Add(2 * time.Second)
 		for {
-			remaining := time.Until(deadlineConn)
+			remaining := time.Until(deadline)
 			if remaining <= 0 {
 				log.Printf("[NAT] STUN %s 超时", server)
 				break
@@ -138,6 +171,10 @@ func probeConn(conn net.PacketConn, servers []string) []natProbeResult {
 
 			results = append(results, natProbeResult{ip: ip4.String(), port: xorAddr.Port})
 			log.Printf("[NAT] STUN %s → %s:%d", server, ip4.String(), xorAddr.Port)
+			break
+		}
+
+		if len(results) >= minStunSamples {
 			break
 		}
 	}
@@ -190,8 +227,7 @@ func fillNATMetadata(meta *NATMetadata, results []natProbeResult) {
 		meta.Behavior = "BehaviorPortChanged"
 	}
 
-	log.Printf("[NAT] %s pub=%s endpoints=%d",
-		meta.NATType, meta.PublicEndpoint, len(meta.AllEndpoints))
+	log.Printf("[NAT] %s pub=%s endpoints=%d", meta.NATType, meta.PublicEndpoint, len(meta.AllEndpoints))
 }
 
 func probeNAT(localUDPPort int, stunServers []string) *NATMetadata {
@@ -208,13 +244,8 @@ func probeNAT(localUDPPort int, stunServers []string) *NATMetadata {
 	}
 
 	var results []natProbeResult
-	deadline := time.Now().Add(stunProbeTotalTimeout)
 
 	for _, server := range servers {
-		if time.Now().After(deadline) {
-			break
-		}
-
 		c, err := stun.Dial("udp", server)
 		if err != nil {
 			continue
@@ -250,6 +281,10 @@ func probeNAT(localUDPPort int, stunServers []string) *NATMetadata {
 		}
 		results = append(results, natProbeResult{ip: ip4.String(), port: xorAddr.Port})
 		log.Printf("[NAT] STUN %s → %s:%d", server, ip4.String(), xorAddr.Port)
+
+		if len(results) >= minStunSamples {
+			break
+		}
 	}
 
 	if len(results) == 0 {
