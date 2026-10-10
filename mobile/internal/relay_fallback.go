@@ -1,8 +1,13 @@
-package internal
+package main
+
+// 注意：Android 端此文件的 package 是 internal。
+// 完整路径：mobile/internal/relay_fallback.go
+// package internal
 
 import (
 	"log"
 	"net"
+	"runtime/debug"
 	"sync"
 	"time"
 )
@@ -15,6 +20,17 @@ const (
 	ConnRelay   ConnType = "relay"
 	ConnUnknown ConnType = "unknown"
 )
+
+func safeGo(name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[panic] %s: %v\n%s", name, r, debug.Stack())
+			}
+		}()
+		fn()
+	}()
+}
 
 type RelayManager struct {
 	mu         sync.RWMutex
@@ -105,6 +121,28 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.cancelFallbackTimer(peerId)
 }
 
+// ClearPeer 清空某个 peer 的连接状态。
+//
+// 对端离线时调用。避免新会话继承旧状态（如 TURN）导致
+// MarkFallback 被跳过。
+func (rm *RelayManager) ClearPeer(peerID string) {
+	if peerID == "" {
+		return
+	}
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	delete(rm.states, peerID)
+}
+
+// ClearAll 清空所有 peer 的连接状态。
+//
+// WS 重连时调用（服务端会清所有 pair，客户端对应清）。
+func (rm *RelayManager) ClearAll() {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	rm.states = make(map[string]ConnType)
+}
+
 func (rm *RelayManager) cancelFallbackTimer(peerID string) {
 	if rm.edge == nil {
 		return
@@ -139,7 +177,7 @@ func (rm *RelayManager) DowngradeToWS(peerId string, reason string) {
 		return
 	}
 	if rm.states[peerId] != ConnRelay {
-		log.Printf("[连接] %s → WS 中继 (%s)", peerId, reason)
+		log.Printf("[连接] %s → WS 中继 (TURN 失败: %s)", peerId, reason)
 		rm.states[peerId] = ConnRelay
 	}
 }
@@ -163,10 +201,6 @@ func (rm *RelayManager) GetState(peerId string) ConnType {
 	return ConnUnknown
 }
 
-// SendToPeer 三级降级：P2P → TURN → WS。
-//
-// ★ TURN 失败时不降级状态：单帧用 WS 兜底，状态保持 ConnTURN。
-//   TURN 30 秒后恢复后，下一帧自动走 TURN，无需手动回切。
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
 	state := rm.GetState(peerId)
 
@@ -194,7 +228,6 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 				if sendErr := rm.turnClient.Send(data, relayAddr); sendErr == nil {
 					return true
 				} else {
-					// ★ 只是这一帧失败，不降级状态。TURN 30 秒后可能恢复。
 					log.Printf("[TURN] 发送到 %s 失败（临时）: %v", peerId, sendErr)
 					if rm.ws != nil {
 						_ = rm.ws.SendBinary(data)
@@ -205,7 +238,6 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 				log.Printf("[TURN] 解析中继地址 %q 失败: %v", target.TurnRelayAddr, err)
 			}
 		}
-		// 兜底：WS 发当前帧，状态保持 ConnTURN
 		if rm.ws != nil {
 			return rm.ws.SendBinary(data) == nil
 		}
