@@ -96,6 +96,15 @@ func extractPortFromEndpoint(ep string) int {
 	return port
 }
 
+func lastIndexByte(s string, c byte) int {
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
+}
+
 func (e *Edge) chooseScanTiers(targetAddr *net.UDPAddr) (tiers []int, sameStun bool, portDiff int, halfWidth int) {
 	e.mu.Lock()
 	ep := ""
@@ -128,6 +137,40 @@ func (e *Edge) chooseScanTiers(targetAddr *net.UDPAddr) (tiers []int, sameStun b
 
 	hw := diff + 100
 	return buildTiers(hw), true, diff, hw
+}
+
+// startFailCountResetLoop 定期清空 failCounts。
+//
+// 触发场景：长时间降级到 TURN 后，网络环境可能已变化，应该给一次
+// 重试机会。5 分钟清一次。
+//
+// 效果：
+//   - 打洞失败 5 次 → failCounts 满 → 后续指令跳过（改用 TURN）
+//   - 5 分钟后自动清空 → 服务端重新协调 → 客户端重新尝试打洞
+//   - 若环境已恢复（NAT 漂移回原值 / 对端地址稳定），可能升回 P2P
+//
+// 副作用：每 5 分钟尝试一次（5~10 秒 CPU/流量），可接受。
+func (e *Edge) startFailCountResetLoop() {
+	safeGo("fail-count-reset", func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-e.doneCh:
+				return
+			case <-ticker.C:
+				natHoleActiveMu.Lock()
+				count := len(failCounts)
+				if count > 0 {
+					failCounts = make(map[string]int)
+				}
+				natHoleActiveMu.Unlock()
+				if count > 0 {
+					log.Printf("[NAT-HOLE] 定期清空 %d 个 target 的失败计数（5 分钟）", count)
+				}
+			}
+		}
+	})
 }
 
 func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
@@ -206,7 +249,7 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		time.Sleep(time.Duration(instr.SendDelayMs) * time.Millisecond)
 	}
 
-	probe := buildPunchProbe(e.virtualIP)
+	probe := buildPunchProbe(e.GetVirtualIP())
 	var attempts uint32
 
 	tiers, sameStun, portDiff, halfWidth := e.chooseScanTiers(targetAddr)
@@ -271,6 +314,7 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 					attempts++
 				}
 			}
+
 			if e.hasTrafficFromTarget(instr.TargetMac, startAt) {
 				success = true
 				break
@@ -402,4 +446,37 @@ func buildPunchProbe(virtualIP string) []byte {
 		copy(buf[4:8], ip.To4())
 	}
 	return buf
+}
+
+func (e *Edge) hasTrafficFromTarget(peerID string, since int64) bool {
+	if peerID == "" {
+		return false
+	}
+	e.peersMu.RLock()
+	defer e.peersMu.RUnlock()
+	p := e.peers[peerID]
+	if p == nil || p.UDPAddr == nil {
+		return false
+	}
+	return p.lastRecvAt >= since
+}
+
+// hasTrafficFromAny 保留兼容（当前无调用方）。
+func (e *Edge) hasTrafficFromAny(ips []net.IP, since int64) bool {
+	if len(ips) == 0 {
+		return false
+	}
+	e.peersMu.RLock()
+	defer e.peersMu.RUnlock()
+	for _, p := range e.peers {
+		if p.UDPAddr == nil || p.lastRecvAt < since {
+			continue
+		}
+		for _, ip := range ips {
+			if p.UDPAddr.IP.Equal(ip) {
+				return true
+			}
+		}
+	}
+	return false
 }
