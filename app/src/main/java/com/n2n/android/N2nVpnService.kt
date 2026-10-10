@@ -51,6 +51,9 @@ class N2nVpnService : VpnService() {
     private val stopping = AtomicBoolean(false)
     private val handler = Handler(Looper.getMainLooper())
 
+    // ★ 修复：onDestroy 后置 true，迟到的 startAsync 回调会检查它
+    @Volatile private var destroyed = false
+
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
 
@@ -294,6 +297,11 @@ class N2nVpnService : VpnService() {
                         ) { err ->
                             handler.post {
                                 try {
+                                    // ★ 修复：服务已销毁或正在停止 → 忽略回调
+                                    if (destroyed || stopping.get()) {
+                                        ktLog("startAsync 回调到达时服务已停止，忽略 (err=$err)")
+                                        return@post
+                                    }
                                     if (err.isNotEmpty()) {
                                         ktLog("startAsync 失败: $err")
                                         updateNotification("启动失败: $err")
@@ -460,12 +468,16 @@ class N2nVpnService : VpnService() {
             // ★ 一次性清掉所有 pending runnable（updateIpRunnable、延迟 stopVpn 等）
             try { handler.removeCallbacksAndMessages(null) } catch (_: Throwable) {}
 
-            if (started) {
-                try { N2nController.stop() } catch (t: Throwable) {
-                    Log.e(TAG, "N2nController.stop failed", t)
-                }
-                started = false
+            // ★ 修复 4：无条件调 N2nController.stop()。
+            //    之前只在 started=true 时调用，如果启动还在进行中（started 仍为 false）
+            //    就不会通知 startAsync 取消，导致 Client 泄漏。
+            //    N2nController.stop() 内部对 client==null 是安全的。
+            try {
+                N2nController.stop()
+            } catch (t: Throwable) {
+                Log.e(TAG, "N2nController.stop failed", t)
             }
+            started = false
             starting.set(false)
 
             try { tunInterface?.close() } catch (_: Throwable) {}
@@ -588,6 +600,7 @@ class N2nVpnService : VpnService() {
 
     override fun onDestroy() {
         ktLog("onDestroy")
+        destroyed = true  // ★ 修复：标记服务已销毁
         try { handler.removeCallbacksAndMessages(null) } catch (_: Throwable) {}
         handleStop()
         try { super.onDestroy() } catch (_: Throwable) {}
