@@ -75,7 +75,7 @@ type Edge struct {
 	tunStateLog   map[string]ConnType
 	tunStateLogMu sync.Mutex
 
-	lastMetadataReportAt int64 // ★ 30 秒节流用（atomic）
+	lastMetadataReportAt int64 // 30 秒节流用（atomic）
 
 	doneCh  chan struct{}
 	closeMu sync.Mutex
@@ -686,6 +686,10 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 				if pid == "" || pip == "" {
 					continue
 				}
+
+				// ★ 检测对端出口变化 → 重置 failCounts，允许重新尝试打洞
+				e.maybeResetFailCountForPeer(pid, pubIP, pubPort)
+
 				e.registerPeer(pid, pip, pubIP, pubPort, natType, assisted)
 				if relayAddr != "" {
 					e.peersMu.Lock()
@@ -723,6 +727,9 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			from, pip, pubIP, pubPort, natType, len(assisted))
 
 		if from != "" && pip != "" {
+			// ★ 检测对端出口变化 → 重置 failCounts，允许重新尝试打洞
+			e.maybeResetFailCountForPeer(from, pubIP, pubPort)
+
 			e.registerPeer(from, pip, pubIP, pubPort, natType, assisted)
 			if relayAddr != "" {
 				e.peersMu.Lock()
@@ -806,6 +813,37 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	}
 }
 
+// maybeResetFailCountForPeer 检测对端 pubSocket 是否变化。
+//
+// 变化时重置该 peer 的 failCounts，允许重新尝试打洞。
+// 触发场景：对端换网络（移动 → 电信），出口 IP/端口变化。
+func (e *Edge) maybeResetFailCountForPeer(peerID, newPubIP string, newPubPort int) {
+	if peerID == "" || newPubIP == "" || newPubPort <= 0 {
+		return
+	}
+
+	e.peersMu.RLock()
+	oldPubIP := ""
+	oldPubPort := 0
+	if p, ok := e.peers[peerID]; ok {
+		oldPubIP = p.PubIP
+		oldPubPort = p.PubPort
+	}
+	e.peersMu.RUnlock()
+
+	if oldPubIP == "" || (oldPubIP == newPubIP && oldPubPort == newPubPort) {
+		return
+	}
+
+	natHoleActiveMu.Lock()
+	hadCount := failCounts[peerID]
+	delete(failCounts, peerID)
+	natHoleActiveMu.Unlock()
+
+	log.Printf("[NAT-HOLE] %s 出口变化 %s:%d → %s:%d，重置失败计数 (was=%d)",
+		peerID, oldPubIP, oldPubPort, newPubIP, newPubPort, hadCount)
+}
+
 func (e *Edge) peerExists(peerID string) bool {
 	if peerID == "" {
 		return false
@@ -848,7 +886,6 @@ func (e *Edge) reportMetadata() {
 	if nm.PublicEndpoint != "" {
 		metaPayload["publicEndpoint"] = nm.PublicEndpoint
 	}
-	// ★ 上报所有 STUN 端点
 	if len(nm.AllEndpoints) > 0 {
 		metaPayload["assistedEndpoints"] = nm.AllEndpoints
 	}
@@ -909,7 +946,7 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string,
 		e.peers[pid] = &PeerInfo{
 			ClientID: pid, VirtualIP: vip, PubIP: pubIP,
 			PubPort: pubPort, UDPAddr: udpAddr,
-			NATType: natType,
+			NATType:           natType,
 			AssistedEndpoints: assisted,
 		}
 	}
@@ -945,8 +982,9 @@ func (e *Edge) scheduleFallbackTimer(peerID string) {
 		}
 		state := e.relayMgr.GetState(peerID)
 		if state != ConnUnknown {
+			// 只在 P2P 时打日志（其他状态是正常的 turn/relay，不重复刷）
 			if state != ConnP2P {
-				log.Printf("[fallback-timer] %s 已有状态 %s，跳过降级", peerID, state)
+				// 静默跳过
 			}
 			return
 		}
@@ -1055,7 +1093,7 @@ func (e *Edge) udpReadLoop() {
 			continue
 		}
 
-		// ★ STUN Binding Response（0x0101）—— 从保活探测得到 CGNAT 映射
+		// STUN Binding Response（0x0101）
 		if buf[0] == 0x01 && buf[1] == 0x01 {
 			if ip, port, ok := parseSTUNResponse(buf[:n]); ok {
 				e.addAssistedEndpoint(ip, port)
@@ -1328,10 +1366,6 @@ func (e *Edge) hasTrafficFromAny(ips []net.IP, since int64) bool {
 
 // ============ 多 STUN 端点收集 ============
 
-// addAssistedEndpoint 把一个 STUN 探测到的映射端点加入 AllEndpoints。
-//
-// 去重 + 上限 5 个（FIFO 淘汰最旧）。
-// 变化后触发一次节流上报（30 秒内最多一次）。
 func (e *Edge) addAssistedEndpoint(ip string, port int) {
 	if ip == "" || port <= 0 {
 		return
@@ -1360,7 +1394,6 @@ func (e *Edge) addAssistedEndpoint(ip string, port int) {
 	e.reportMetadataThrottled()
 }
 
-// reportMetadataThrottled 30 秒内最多上报一次 p2p_metadata。
 func (e *Edge) reportMetadataThrottled() {
 	now := time.Now().UnixMilli()
 	last := atomic.LoadInt64(&e.lastMetadataReportAt)
