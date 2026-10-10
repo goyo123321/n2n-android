@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,9 +31,6 @@ type TURNResponse struct {
 	Error   string           `json:"error,omitempty"`
 }
 
-// TURNClient TURN 主控。
-//
-// 只做 UDP transport（RFC 5766）+ TCP transport 兜底，不做 RFC 6062。
 type TURNClient struct {
 	mu           sync.RWMutex
 	lite         *TURNLite
@@ -43,6 +41,7 @@ type TURNClient struct {
 	edge         *Edge
 	onMessage    func([]byte, net.Addr)
 	stopCh       chan struct{}
+	stopOnce     sync.Once
 
 	httpClient *http.Client
 }
@@ -94,11 +93,6 @@ func NewTURNClient(signalingURL string, uuid string, edge *Edge) *TURNClient {
 	}
 }
 
-// IsReady 检查 TURN 是否可用。
-//
-// ★ 改为检测 lite.IsAlive()，而不是 lite != nil。
-//   网络切换后 lite.Close() 把 stopped 置 true，
-//   但 tc.lite 指针仍非空，旧逻辑会误判"就绪"。
 func (tc *TURNClient) IsReady() bool {
 	tc.mu.RLock()
 	lite := tc.lite
@@ -109,8 +103,14 @@ func (tc *TURNClient) IsReady() bool {
 	return lite.IsAlive()
 }
 
-func (tc *TURNClient) FetchAndSetup(ctx context.Context) error {
-	// ★ 已有活着的 lite 就不重复建
+func (tc *TURNClient) FetchAndSetup(ctx context.Context) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[TURN] FetchAndSetup panic: %v\n%s", r, debug.Stack())
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+
 	if tc.IsReady() {
 		return nil
 	}
@@ -184,19 +184,11 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 
 	log.Printf("[TURN] 尝试 UDP transport: %s", turnAddr)
 	lite := NewTURNLiteWithTCP(turnAddr, srv.Username, srv.Password, false)
-	lite.onMessage = func(data []byte, addr net.Addr) {
-		if tc.onMessage != nil {
-			tc.onMessage(data, addr)
-		}
-	}
+	lite.onMessage = tc.wrapOnMessage()
 	if err := lite.Allocate(); err != nil {
 		log.Printf("[TURN] UDP transport 失败: %v，尝试 TCP transport", err)
 		lite2 := NewTURNLiteWithTCP(turnAddr, srv.Username, srv.Password, true)
-		lite2.onMessage = func(data []byte, addr net.Addr) {
-			if tc.onMessage != nil {
-				tc.onMessage(data, addr)
-			}
-		}
+		lite2.onMessage = tc.wrapOnMessage()
 		if err2 := lite2.Allocate(); err2 != nil {
 			log.Printf("[TURN] UDP+TCP transport 都失败: %v", err2)
 			return fmt.Errorf("TURN 完全不可用: %v", err2)
@@ -217,13 +209,19 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 	return nil
 }
 
-// StartReconnectLoop 后台重连：每 30 秒检查 lite 是否还在，不在就重建。
-//
-// 触发场景：
-//   - 网络接口切换（WiFi ↔ 4G）→ 旧 socket 绑定失效 → lite.Close()
-//   - TURN 服务器重启 → Refresh 失败 → lite.Close()
-//
-// 重建成功后重新上报 relayAddr，让服务端广播给对端。
+func (tc *TURNClient) wrapOnMessage() func([]byte, net.Addr) {
+	return func(data []byte, addr net.Addr) {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[TURN] onMessage panic: %v\n%s", r, debug.Stack())
+			}
+		}()
+		if tc.onMessage != nil {
+			tc.onMessage(data, addr)
+		}
+	}
+}
+
 func (tc *TURNClient) StartReconnectLoop() {
 	safeGo("turn-reconnect", func() {
 		ticker := time.NewTicker(30 * time.Second)
@@ -233,7 +231,6 @@ func (tc *TURNClient) StartReconnectLoop() {
 			case <-tc.stopCh:
 				return
 			case <-ticker.C:
-				// 已就绪（lite 存活）就跳过
 				if tc.IsReady() {
 					continue
 				}
@@ -288,11 +285,10 @@ func (tc *TURNClient) GetRelayAddr() string {
 }
 
 func (tc *TURNClient) Close() {
-	select {
-	case <-tc.stopCh:
-	default:
+	tc.stopOnce.Do(func() {
 		close(tc.stopCh)
-	}
+	})
+
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	if tc.lite != nil {
