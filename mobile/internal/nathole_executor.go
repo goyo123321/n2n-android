@@ -96,10 +96,6 @@ func extractPortFromEndpoint(ep string) int {
 	return port
 }
 
-// startFailCountResetLoop 定期清空 failCounts。
-//
-// 触发场景：长时间降级到 TURN 后，网络环境可能已变化，应该给一次
-// 重试机会。5 分钟清一次。
 func (e *Edge) startFailCountResetLoop() {
 	safeGo("fail-count-reset", func() {
 		ticker := time.NewTicker(5 * time.Minute)
@@ -123,6 +119,15 @@ func (e *Edge) startFailCountResetLoop() {
 	})
 }
 
+// chooseScanTiers 根据本机 STUN 出口和 target 选择扫描策略。
+//
+// 返回：
+//   - tiers     分级数组
+//   - sameStun  是否同 STUN IP
+//   - portDiff  端口差（仅同 STUN 时有意义）
+//   - halfWidth 精准扫描的半径
+//               - 0  → 全端口扫描
+//               - -1 → 放弃（端口差过大，打洞无意义）
 func (e *Edge) chooseScanTiers(targetAddr *net.UDPAddr) (tiers []int, sameStun bool, portDiff int, halfWidth int) {
 	e.mu.Lock()
 	ep := ""
@@ -147,6 +152,11 @@ func (e *Edge) chooseScanTiers(targetAddr *net.UDPAddr) (tiers []int, sameStun b
 	diff := myPort - targetPort
 	if diff < 0 {
 		diff = -diff
+	}
+
+	// ★ 端口差 > 5000：CGNAT 漂移太大，打洞无意义
+	if diff > 5000 {
+		return nil, true, diff, -1
 	}
 
 	if diff >= 100 {
@@ -237,6 +247,19 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 	var attempts uint32
 
 	tiers, sameStun, portDiff, halfWidth := e.chooseScanTiers(targetAddr)
+
+	// ★ 端口差过大，直接放弃（走 TURN）
+	if sameStun && halfWidth < 0 {
+		res.State = PunchStateFailed
+		res.Detail = fmt.Sprintf("端口差过大 (%d)，放弃打洞", portDiff)
+		log.Printf("[NAT-HOLE] ❌ 端口差=%d 过大（>5000），放弃打洞（直接走 TURN）", portDiff)
+
+		natHoleActiveMu.Lock()
+		failCounts[instr.TargetMac] = maxConsecutiveFails
+		natHoleActiveMu.Unlock()
+
+		return res
+	}
 
 	if sameStun && halfWidth > 0 {
 		log.Printf("[NAT-HOLE] 模式：同 STUN IP，端口差=%d，精准扫描 targetPort±%d，分级 %v",
@@ -461,7 +484,3 @@ func buildPunchProbe(virtualIP string) []byte {
 	}
 	return buf
 }
-
-// 注意：
-// - lastIndexByte / hasTrafficFromTarget / hasTrafficFromAny
-//   在 Android 端定义在 edge.go，本文件不重复定义。
