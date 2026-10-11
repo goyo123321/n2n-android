@@ -416,10 +416,6 @@ func (t *TURNLite) extractAllocateResult(resp *stunMessage) error {
 	return nil
 }
 
-// ensurePermission 确保向 remoteAddr 的发送已被 TURN 服务器授权。
-//
-// ★ 修复：438 Stale Nonce 换 nonce 重试；如果重试也失败，主动 Close，
-//   让上层 turn-reconnect 检测到 IsReady()==false 并重建。
 func (t *TURNLite) ensurePermission(ip net.IP) error {
 	key := ip.String()
 	t.permMu.Lock()
@@ -453,7 +449,6 @@ func (t *TURNLite) ensurePermission(ip net.IP) error {
 					{typ: attrXorPeerAddress, value: peerData},
 				}, true)
 				if err != nil {
-					// ★ 438 重试也失败 → 标记失效
 					log.Printf("[TURN-Lite] 438 重试失败: %v，关闭等待重建", err)
 					go t.Close()
 					return fmt.Errorf("CreatePermission 438 重试失败: %w", err)
@@ -611,6 +606,10 @@ func (t *TURNLite) handleIncoming(data []byte) {
 	}
 }
 
+// refreshLoop 处理 Refresh 响应：
+//   - 438 Stale Nonce：换 nonce 重试一次
+//   - 437 Allocation Mismatch：主动 Close，让上层重建
+//   - 连续失败 3 次：主动 Close
 func (t *TURNLite) refreshLoop() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -655,7 +654,8 @@ func (t *TURNLite) refreshLoop() {
 			}
 
 			code := parseErrorCode(resp.attrs[attrErrorCode])
-			if code == 438 {
+			switch code {
+			case 438:
 				newNonce := resp.attrs[attrNonce]
 				if len(newNonce) > 0 {
 					t.mu.Lock()
@@ -670,7 +670,13 @@ func (t *TURNLite) refreshLoop() {
 				} else {
 					log.Printf("[TURN-Lite] 438 但响应无 nonce")
 				}
-			} else {
+
+			case 437:
+				log.Printf("[TURN-Lite] Refresh 被拒 437 (Allocation Mismatch)，关闭等待重建")
+				go t.Close()
+				return
+
+			default:
 				log.Printf("[TURN-Lite] Refresh 被拒: code=%d", code)
 			}
 		}
