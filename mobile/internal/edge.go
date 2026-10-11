@@ -132,7 +132,7 @@ const keepaliveInterval = 5 * time.Second
 var keepaliveServers = []string{
 	"74.125.250.129:19302",
 	"162.159.207.0:3478",
-	"74.125.204.127:19302",
+	"stun.miwifi.com:3478",
 }
 
 func buildSTUNBindingRequest() []byte {
@@ -207,15 +207,16 @@ func (e *Edge) startKeepalive() {
 
 // ============ 日志节流 ============
 
+// logNoPeerThrottled 5 秒内只打一条"无匹配 peer"日志。
 func (e *Edge) logNoPeerThrottled(dstIP string, n int) {
 	now := time.Now().UnixMilli()
 	e.lastNoPeerLogMu.Lock()
-	last := e.lastNoPeerLog[dstIP]
+	last := e.lastNoPeerLog["__global__"]
 	if now-last < 5000 {
 		e.lastNoPeerLogMu.Unlock()
 		return
 	}
-	e.lastNoPeerLog[dstIP] = now
+	e.lastNoPeerLog["__global__"] = now
 	e.lastNoPeerLogMu.Unlock()
 	log.Printf("[TUN] 无匹配 peer，dst=%s len=%d", dstIP, n)
 }
@@ -495,8 +496,6 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	})
 
 	e.turnClient.StartReconnectLoop()
-
-	// ★ 每 5 分钟清一次 failCounts，让降级到 TURN 后有机会自动升回 P2P
 	e.startFailCountResetLoop()
 
 	log.Printf("[Edge] 已启动 clientId=%s room=%s", clientId, cfg.RoomID)
@@ -1235,7 +1234,18 @@ func (e *Edge) tunReadLoop() {
 				_ = e.ws.SendBinary(buf[:n])
 			}
 		} else {
-			e.logNoPeerThrottled(dstIP, n)
+			// ★ 短 UDP 包（广播/网段扫描）静默处理
+			proto := 0
+			if n >= 10 {
+				proto = int(buf[9])
+			}
+			if proto == 17 && n < 200 {
+				if e.ws != nil {
+					_ = e.ws.SendBinary(buf[:n])
+				}
+			} else {
+				e.logNoPeerThrottled(dstIP, n)
+			}
 		}
 	}
 }
