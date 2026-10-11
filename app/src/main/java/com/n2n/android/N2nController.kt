@@ -124,6 +124,14 @@ object N2nController {
         ""
     }
 
+    // ★ 新增：暴露虚拟网段（Go Client.GetVirtualNetwork → Kotlin 属性 virtualNetwork）
+    fun getVirtualNetwork(): String = try {
+        synchronized(clientLock) { client }?.virtualNetwork ?: ""
+    } catch (t: Throwable) {
+        Log.e(TAG, "getVirtualNetwork failed", t)
+        ""
+    }
+
     fun getClientID(): String = try {
         synchronized(clientLock) { client }?.clientID ?: ""
     } catch (t: Throwable) {
