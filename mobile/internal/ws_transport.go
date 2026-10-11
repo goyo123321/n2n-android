@@ -226,6 +226,10 @@ func (ws *WSTransport) readLoop(conn *websocket.Conn) {
 	}
 }
 
+// tryReconnect 无限重试，指数退避封顶 5 分钟。
+//
+// ★ 修复：旧版只用 10 次重试，用完后永久放弃，导致移动网络下必须
+//   手动重启 App。现在无限重试，最长 5 分钟一次。
 func (ws *WSTransport) tryReconnect() {
 	ws.reconnectMu.Lock()
 	if ws.stopping || ws.reconnecting {
@@ -244,31 +248,54 @@ func (ws *WSTransport) tryReconnect() {
 		ws.reconnectMu.Unlock()
 	}()
 
-	delays := []time.Duration{1, 2, 5, 10, 30, 60, 60, 60, 60, 60}
-	for i, d := range delays {
+	backoff := 1 * time.Second
+	const maxBackoff = 5 * time.Minute
+	attempt := 0
+
+	for {
 		select {
 		case <-ws.stopCh:
+			log.Printf("[WS] 收到停止信号，退出重连")
 			return
-		case <-time.After(d * time.Second):
+		case <-time.After(backoff):
 		}
-		log.Printf("[WS] 重连 (%d/10)...", i+1)
+
+		attempt++
+		log.Printf("[WS] 重连 (第 %d 次, 等待 %v)...", attempt, backoff)
 
 		conn, _, err := ws.dialer.Dial(ws.fullURL, nil)
 		if err != nil {
 			log.Printf("[WS] 重连失败: %v", err)
+
+			// 指数退避：1s → 2s → 5s → 10s → 30s → 60s → 2m → 5m (封顶)
+			switch {
+			case backoff < 2*time.Second:
+				backoff = 2 * time.Second
+			case backoff < 5*time.Second:
+				backoff = 5 * time.Second
+			case backoff < 10*time.Second:
+				backoff = 10 * time.Second
+			case backoff < 30*time.Second:
+				backoff = 30 * time.Second
+			case backoff < 60*time.Second:
+				backoff = 60 * time.Second
+			case backoff < 2*time.Minute:
+				backoff = 2 * time.Minute
+			default:
+				backoff = maxBackoff
+			}
 			continue
 		}
+
 		ws.mu.Lock()
 		ws.conn = conn
 		ws.mu.Unlock()
-		log.Printf("[WS] ✅ 重连成功")
+		log.Printf("[WS] ✅ 重连成功（第 %d 次尝试）", attempt)
 		safeGo("ws-readLoop", func() { ws.readLoop(conn) })
 		safeGo("ws-heartbeat", func() { ws.heartbeat(20 * time.Second) })
 		ws.routeText(map[string]interface{}{"type": "_reconnected"})
 		return
 	}
-
-	log.Printf("[WS] 重连 10 次全部失败，放弃")
 }
 
 func (ws *WSTransport) heartbeat(interval time.Duration) {
