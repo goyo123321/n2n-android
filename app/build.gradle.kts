@@ -24,11 +24,18 @@ android {
             isMinifyEnabled = false
         }
         release {
+            // ★ 当前关闭混淆：gomobile AAR 里的 Go 桥接类反射调用较多，
+            //   虽然 proguard-rules.pro 已覆盖 com.n2n.mobile.**，但为了
+            //   避免首次上线的兼容风险，保守起见先不开。
+            //   若要开启，改成 isMinifyEnabled = true 并跑一遍真机验证。
             isMinifyEnabled = false
-            proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro"
-            )
+
+            // 混淆关闭时 proguardFiles 不生效，先注释掉避免误导。
+            // 开启混淆后取消注释：
+            // proguardFiles(
+            //     getDefaultProguardFile("proguard-android-optimize.txt"),
+            //     "proguard-rules.pro"
+            // )
         }
     }
 
