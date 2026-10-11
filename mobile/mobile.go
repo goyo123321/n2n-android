@@ -26,23 +26,20 @@ type Protector interface {
 }
 
 type Client struct {
-	mu        sync.Mutex
-	tunFd     int
-	udpFd     int
-	stunFd    int
-	running   bool
-	virtualIP string
-	clientID  string
-	edge      *internal.Edge
-	protector Protector
+	mu             sync.Mutex
+	tunFd          int
+	udpFd          int
+	stunFd         int
+	running        bool
+	virtualIP      string
+	virtualNetwork string // ★ 新增：虚拟网段
+	clientID       string
+	edge           *internal.Edge
+	protector      Protector
 }
 
 func NewClient() *Client { return &Client{} }
 
-// SetTimezoneOffset 由 Kotlin 侧调用，设置设备时区偏移量（秒）。
-//
-// gomobile 环境下 Go 无法读取 Android 系统时区，需要在 App 启动时
-// 由 Kotlin 侧读 TimeZone.getDefault() 后传入。
 func SetTimezoneOffset(seconds int) {
 	internal.SetTimezoneOffset(seconds)
 }
@@ -65,7 +62,6 @@ func (c *Client) SetStunFD(fd int) {
 	c.stunFd = fd
 }
 
-// SetProtector 注册 VpnService.protect 桥。p == nil 时注销。
 func (c *Client) SetProtector(p Protector) {
 	c.mu.Lock()
 	c.protector = p
@@ -88,6 +84,7 @@ func (c *Client) SetProtector(p Protector) {
 	})
 }
 
+// FetchVirtualIP 返回 "vip|cidr" 格式，例如 "172.16.0.2|172.16.0.0/20"
 func (c *Client) FetchVirtualIP(cfg *Config) (result string) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -151,6 +148,7 @@ func (c *Client) Start(cfg *Config) (errMsg string) {
 	c.mu.Lock()
 	c.edge = edge
 	c.running = true
+	c.virtualNetwork = edge.GetVirtualNetwork() // ★ 初次拿到虚拟网段
 	if cfg.ClientID != "" {
 		c.clientID = cfg.ClientID
 	} else {
@@ -179,6 +177,12 @@ func (c *Client) Start(cfg *Config) (errMsg string) {
 				c.virtualIP = vip
 				c.mu.Unlock()
 			}
+			// ★ 同步虚拟网段（服务端可能中途变更，虽然少见）
+			if vn := edgeRef.GetVirtualNetwork(); vn != "" {
+				c.mu.Lock()
+				c.virtualNetwork = vn
+				c.mu.Unlock()
+			}
 			select {
 			case <-edgeRef.Done():
 				return
@@ -197,6 +201,7 @@ func (c *Client) Stop() {
 	c.edge = nil
 	c.running = false
 	c.virtualIP = ""
+	c.virtualNetwork = ""
 	c.mu.Unlock()
 	if edge != nil {
 		edge.Stop()
@@ -220,6 +225,13 @@ func (c *Client) GetVirtualIP() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.virtualIP
+}
+
+// ★ 新增：暴露虚拟网段
+func (c *Client) GetVirtualNetwork() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.virtualNetwork
 }
 
 func (c *Client) GetClientID() string {
