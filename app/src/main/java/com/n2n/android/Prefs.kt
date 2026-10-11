@@ -15,13 +15,11 @@ object Prefs {
     private const val KEY_CONNECT_TOKEN = "connect_token"
     private const val KEY_THEME_MODE = "theme_mode"
     private const val KEY_AUTO_CLIENT_ID = "auto_client_id"
+    private const val KEY_FIRST_USE_SEEN = "first_use_seen"   // ★ 新增
 
     private const val DEFAULT_SIGNALING_URL = ""
     private const val DEFAULT_ROOM_ID = "default-room"
     private const val DEFAULT_NODE_NAME = "Android"
-
-    // ★ 从 public const 降为 private：全项目只有本文件的 defaultConfig() 用，
-    //   外部没有调用方，public 暴露没有意义
     private const val DEFAULT_CONNECT_TOKEN = ""
 
     data class Config(
@@ -32,7 +30,6 @@ object Prefs {
         val connectToken: String,
     )
 
-    // 双层 fallback：主 SP 打不开时降级到备用 SP，保证 UI 不崩
     private fun sp(ctx: Context) =
         try {
             ctx.getSharedPreferences(NAME, Context.MODE_PRIVATE)
@@ -124,9 +121,24 @@ object Prefs {
         }
     }
 
-    // 用 hex 而不是 take(8)：UUID 里 '-' 不会落在前 8 位，但显式过滤更稳
     private fun generateFallbackId(): String {
         val raw = UUID.randomUUID().toString().replace("-", "")
         return "android-" + raw.take(8)
+    }
+
+    // ============ 首用提示对话框 ============
+
+    // ★ 新增：只在首次启动时提示用户填 WSS 地址，避免每次冷启动都弹
+    fun hasSeenFirstUseDialog(ctx: Context): Boolean =
+        try {
+            sp(ctx)?.getBoolean(KEY_FIRST_USE_SEEN, false) ?: false
+        } catch (t: Throwable) {
+            false
+        }
+
+    fun markFirstUseDialogSeen(ctx: Context) {
+        try {
+            sp(ctx)?.edit()?.putBoolean(KEY_FIRST_USE_SEEN, true)?.apply()
+        } catch (_: Throwable) {}
     }
 }
