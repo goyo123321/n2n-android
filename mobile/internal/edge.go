@@ -48,6 +48,7 @@ type Edge struct {
 	clientId  string
 	nodeName  string
 	virtualIP string
+	virtualCIDR string // ★ 新增：服务端下发的虚拟网段（如 "172.16.0.0/20"）
 	roomId    string
 
 	serverSeenIP string
@@ -207,7 +208,6 @@ func (e *Edge) startKeepalive() {
 
 // ============ 日志节流 ============
 
-// logNoPeerThrottled 5 秒内只打一条"无匹配 peer"日志。
 func (e *Edge) logNoPeerThrottled(dstIP string, n int) {
 	now := time.Now().UnixMilli()
 	e.lastNoPeerLogMu.Lock()
@@ -243,6 +243,10 @@ func (e *Edge) forgetTunState(peerID string) {
 
 // ============ 主流程 ============
 
+// FetchVirtualIP 返回 "vip|cidr" 格式，例如 "172.16.0.2|172.16.0.0/20"
+//
+// Kotlin 侧按 '|' split 拿 vip 和 cidr。
+// 失败返回空字符串。
 func FetchVirtualIP(cfg *Config) string {
 	if cfg.SignalingURL == "" {
 		return ""
@@ -261,23 +265,33 @@ func FetchVirtualIP(cfg *Config) string {
 	}
 	defer ws.Close()
 
-	done := make(chan string, 1)
+	// ★ 用两个元素的数组传 (vip, cidr)
+	type result struct {
+		vip  string
+		cidr string
+	}
+	done := make(chan result, 1)
+
 	ws.SetHandlers(func(msg map[string]interface{}) {
 		t, _ := msg["type"].(string)
 		if t == "ready" {
 			payload, _ := msg["payload"].(map[string]interface{})
 			vip, _ := payload["virtualIp"].(string)
+			cidr, _ := payload["virtualNetwork"].(string)
+			if cidr == "" {
+				cidr = "10.64.0.0/24" // 兜底
+			}
 			select {
-			case done <- vip:
+			case done <- result{vip: vip, cidr: cidr}:
 			default:
 			}
 		}
 	}, nil)
 
 	select {
-	case vip := <-done:
-		log.Printf("[FetchVIP] 拿到虚拟 IP: %s", vip)
-		return vip
+	case r := <-done:
+		log.Printf("[FetchVIP] 拿到虚拟 IP: %s（网段 %s）", r.vip, r.cidr)
+		return r.vip + "|" + r.cidr
 	case <-time.After(15 * time.Second):
 		log.Printf("[FetchVIP] 超时")
 		return ""
@@ -306,6 +320,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		clientId:       clientId,
 		nodeName:       nodeName,
 		roomId:         cfg.RoomID,
+		virtualCIDR:    "10.64.0.0/24", // 兜底
 		peers:          make(map[string]*PeerInfo),
 		fallbackTimers: make(map[string]*time.Timer),
 		lastNoPeerLog:  make(map[string]int64),
@@ -498,7 +513,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	e.turnClient.StartReconnectLoop()
 	e.startFailCountResetLoop()
 
-	log.Printf("[Edge] 已启动 clientId=%s room=%s", clientId, cfg.RoomID)
+	log.Printf("[Edge] 已启动 clientId=%s room=%s cidr=%s", clientId, cfg.RoomID, e.virtualCIDR)
 	return e, nil
 }
 
@@ -540,6 +555,13 @@ func (e *Edge) GetVirtualIP() string {
 	e.peersMu.RLock()
 	defer e.peersMu.RUnlock()
 	return e.virtualIP
+}
+
+// ★ 新增：暴露虚拟网段
+func (e *Edge) GetVirtualNetwork() string {
+	e.peersMu.RLock()
+	defer e.peersMu.RUnlock()
+	return e.virtualCIDR
 }
 
 func (e *Edge) GetClientID() string { return e.clientId }
@@ -663,9 +685,14 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		payload, _ := msg["payload"].(map[string]interface{})
 		e.peersMu.Lock()
 		e.virtualIP, _ = payload["virtualIp"].(string)
+		// ★ 读取服务端下发的虚拟网段
+		if cidr, ok := payload["virtualNetwork"].(string); ok && cidr != "" {
+			e.virtualCIDR = cidr
+		}
 		vip := e.virtualIP
+		cidr := e.virtualCIDR
 		e.peersMu.Unlock()
-		log.Printf("[信令] 分配虚拟 IP: %s", vip)
+		log.Printf("[信令] 分配虚拟 IP: %s（网段 %s）", vip, cidr)
 
 		if serverIP, ok := payload["yourPublicIp"].(string); ok && serverIP != "" {
 			e.mu.Lock()
@@ -1234,7 +1261,6 @@ func (e *Edge) tunReadLoop() {
 				_ = e.ws.SendBinary(buf[:n])
 			}
 		} else {
-			// ★ 短 UDP 包（广播/网段扫描）静默处理
 			proto := 0
 			if n >= 10 {
 				proto = int(buf[9])
