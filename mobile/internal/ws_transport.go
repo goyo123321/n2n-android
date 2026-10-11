@@ -186,6 +186,11 @@ func maskToken(u string) string {
 	return parts[0] + "token=***"
 }
 
+// readLoop 读循环。
+//
+// ★ 改动：socket 读错误时先判断 ws.stopping，主动关闭（Close 时关掉
+//   socket）不再打错误日志。旧版先打日志再判断，会在每次正常关闭时
+//   输出 "use of closed network connection"，误导为异常。
 func (ws *WSTransport) readLoop(conn *websocket.Conn) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -202,8 +207,7 @@ func (ws *WSTransport) readLoop(conn *websocket.Conn) {
 	for {
 		msgType, data, err := conn.ReadMessage()
 		if err != nil {
-			log.Printf("[WS] 读取错误: %v", err)
-
+			// ★ 先判 stopping：主动 Close 时静默退出
 			ws.reconnectMu.Lock()
 			stopping := ws.stopping
 			ws.reconnectMu.Unlock()
@@ -211,6 +215,8 @@ func (ws *WSTransport) readLoop(conn *websocket.Conn) {
 			if stopping {
 				return
 			}
+
+			log.Printf("[WS] 读取错误: %v", err)
 			safeGo("ws-reconnect", ws.tryReconnect)
 			return
 		}
@@ -227,9 +233,6 @@ func (ws *WSTransport) readLoop(conn *websocket.Conn) {
 }
 
 // tryReconnect 无限重试，指数退避封顶 5 分钟。
-//
-// ★ 修复：旧版只用 10 次重试，用完后永久放弃，导致移动网络下必须
-//   手动重启 App。现在无限重试，最长 5 分钟一次。
 func (ws *WSTransport) tryReconnect() {
 	ws.reconnectMu.Lock()
 	if ws.stopping || ws.reconnecting {
