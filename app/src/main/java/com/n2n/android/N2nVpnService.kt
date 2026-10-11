@@ -37,6 +37,9 @@ class N2nVpnService : VpnService() {
         private const val NOTIF_CHANNEL_ID = "n2n_vpn"
         private const val NOTIF_ID = 1001
 
+        // ★ 默认虚拟网段（与服务端 DEFAULT_VIRTUAL_NETWORK 保持一致）
+        private const val DEFAULT_VIRTUAL_NETWORK = "10.64.0.0/24"
+
         const val ACTION_START = "com.n2n.android.START"
         const val ACTION_STOP = "com.n2n.android.STOP"
 
@@ -65,7 +68,6 @@ class N2nVpnService : VpnService() {
     private var protectedUdpSocket: DatagramSocket? = null
     private var protectedStunSocket: DatagramSocket? = null
 
-    // ★ 时区变化广播（用户旅行 / 手动切换时区）
     private val tzReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == Intent.ACTION_TIMEZONE_CHANGED) {
@@ -155,12 +157,9 @@ class N2nVpnService : VpnService() {
     override fun onCreate() {
         super.onCreate()
 
-        // ★ 设置时区（Go 日志和 Kotlin 日志时间一致）
         N2nController.applySystemTimezone()
-
         installCrashHandler()
 
-        // ★ 注册时区变化广播
         try {
             registerReceiver(
                 tzReceiver,
@@ -291,15 +290,20 @@ class N2nVpnService : VpnService() {
         ktLog("Config 构造完成")
 
         Thread {
+            // ★ virtualNetwork 与 vip 一起从 fetchVirtualIP 的复合返回值拆出
             var vip = ""
+            var virtualNetwork = DEFAULT_VIRTUAL_NETWORK
             var fetchOk = false
             var tmpClient: Client? = null
             try {
                 ktLog("开始 FetchVIP")
                 tmpClient = Client()
-                vip = tmpClient.fetchVirtualIP(config) ?: ""
-                fetchOk = true
-                ktLog("FetchVIP 返回: '$vip'")
+                val raw = tmpClient.fetchVirtualIP(config) ?: ""
+                val parsed = parseReadyPayload(raw)
+                vip = parsed.first
+                virtualNetwork = parsed.second
+                fetchOk = vip.isNotEmpty()   // ★ 显式判定
+                ktLog("FetchVIP 返回: vip='$vip' cidr='$virtualNetwork'（原始='$raw'）")
             } catch (t: Throwable) {
                 ktLog("FetchVIP 崩溃: ${t.message}")
             } finally {
@@ -327,7 +331,7 @@ class N2nVpnService : VpnService() {
                     }
 
                     ktLog("开始建立 TUN")
-                    val pfd = buildTunInterface(vip)
+                    val pfd = buildTunInterface(vip, virtualNetwork)
                     if (pfd == null) {
                         ktLog("TUN 建立失败")
                         updateNotification("建立 TUN 失败")
@@ -388,23 +392,33 @@ class N2nVpnService : VpnService() {
     }
 
     // ============================================================
-    // 从 DatagramSocket 提取 fd —— 必须 detachFd
+    // 解析 fetchVirtualIP 的复合返回值 "172.16.0.2|172.16.0.0/20"
     // ============================================================
     //
-    // ParcelFileDescriptor.fromDatagramSocket(socket) 会 dup socket 的 fd，
-    // 返回持有 dup fd 的新 PFD。PFD 被 GC 时 finalizer 会 close 这个 fd。
-    //
-    // 若只反射读 mFd.descriptor 而不 detach：
-    //   - PFD 仍持有 dup fd
-    //   - GC → finalizer close(dup fd)
-    //   - fd 号被系统回收 → 分配给新 socket（WS / TURN 等）
-    //   - Go 继续按旧 fd 号读写 → 数据错乱或误关无关 socket
-    //
-    // detachFd() 把 fd 从 PFD 摘出，PFD 的 mFd 置 null，
-    // finalizer 不再 close 它。fd 所有权转移到调用方（Go）。
-    //
+    // 约定：
+    //   - 空串               → ("", DEFAULT)，调用方按失败处理
+    //   - "vip"（无分隔符）  → (vip, DEFAULT)，兼容老服务端
+    //   - "vip|cidr"         → (vip, cidr)
+    //   - "vip|"（cidr 空）  → (vip, DEFAULT)
+    private fun parseReadyPayload(raw: String): Pair<String, String> {
+        if (raw.isEmpty()) return "" to DEFAULT_VIRTUAL_NETWORK
+
+        val idx = raw.indexOf('|')
+        if (idx < 0) {
+            ktLog("fetchVirtualIP 无 CIDR（老服务端？），回退 $DEFAULT_VIRTUAL_NETWORK")
+            return raw.trim() to DEFAULT_VIRTUAL_NETWORK
+        }
+
+        val vip = raw.substring(0, idx).trim()
+        val cidr = raw.substring(idx + 1).trim()
+
+        return vip to (cidr.ifEmpty { DEFAULT_VIRTUAL_NETWORK })
+    }
+
+    // ============================================================
+    // 从 DatagramSocket 提取 fd —— 必须 detachFd
+    // ============================================================
     private fun extractFdFromDatagramSocket(socket: DatagramSocket): Int {
-        // 路径 1：API 30+ 公开 API
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             try {
                 val pfd = ParcelFileDescriptor.fromDatagramSocket(socket)
@@ -415,7 +429,6 @@ class N2nVpnService : VpnService() {
             } catch (_: Throwable) {}
         }
 
-        // 路径 2：反射（Android 10 及以下）
         try {
             val m = ParcelFileDescriptor::class.java.getDeclaredMethod(
                 "fromDatagramSocket", DatagramSocket::class.java
@@ -569,19 +582,34 @@ class N2nVpnService : VpnService() {
         wifiLock = null
     }
 
-    private fun buildTunInterface(vip: String): ParcelFileDescriptor? {
+    // ============================================================
+    // 建立 TUN —— 按服务端下发的网段动态配置
+    // ============================================================
+    private fun buildTunInterface(vip: String, virtualNetwork: String): ParcelFileDescriptor? {
         return try {
-            ktLog("建立 TUN（仅组网段），绑定 IP: $vip")
+            val parsed = parseCidr(virtualNetwork)
+                ?: run {
+                    ktLog("virtualNetwork 非法: '$virtualNetwork'，回退 $DEFAULT_VIRTUAL_NETWORK")
+                    parseCidr(DEFAULT_VIRTUAL_NETWORK)!!
+                }
+            val (networkAddr, prefixLen) = parsed
+
+            if (!isSameSubnet(vip, networkAddr, prefixLen)) {
+                ktLog("VIP $vip 不属于 $networkAddr/$prefixLen，拒绝建立 TUN")
+                return null
+            }
+
+            ktLog("建立 TUN（仅组网段），绑定 IP: $vip，网段 $networkAddr/$prefixLen")
 
             val builder = Builder()
                 .setSession("n2n-client")
                 .setMtu(1280)
-                .addAddress(vip, 24)
-                .addRoute("10.64.0.0", 24)
+                .addAddress(vip, prefixLen)
+                .addRoute(networkAddr, prefixLen)
 
             try { builder.addDisallowedApplication(packageName) } catch (_: Throwable) {}
 
-            ktLog("TUN 仅接管 10.64.0.0/24，其他流量走系统默认")
+            ktLog("TUN 仅接管 $networkAddr/$prefixLen，其他流量走系统默认")
 
             val pfd = builder.setBlocking(true).establish()
             ktLog("TUN establish 成功")
@@ -590,6 +618,38 @@ class N2nVpnService : VpnService() {
             ktLog("establish TUN 失败: ${t.message}")
             null
         }
+    }
+
+    // "10.64.0.0/24" → ("10.64.0.0", 24)，自动对齐网络地址
+    private fun parseCidr(cidr: String): Pair<String, Int>? {
+        val parts = cidr.trim().split("/")
+        if (parts.length != 2) return null
+        val prefix = parts[1].toIntOrNull() ?: return null
+        if (prefix < 0 || prefix > 32) return null
+
+        val ipInt = ipToInt(parts[0]) ?: return null
+        val mask = if (prefix == 0) 0 else (-1 shl (32 - prefix))
+        val netInt = ipInt and mask
+
+        val normalized =
+            "${(netInt ushr 24) and 0xFF}.${(netInt ushr 16) and 0xFF}." +
+            "${(netInt ushr 8) and 0xFF}.${netInt and 0xFF}"
+        return normalized to prefix
+    }
+
+    private fun isSameSubnet(ip: String, networkAddr: String, prefixLen: Int): Boolean {
+        val ipInt = ipToInt(ip) ?: return false
+        val netInt = ipToInt(networkAddr) ?: return false
+        val mask = if (prefixLen == 0) 0 else (-1 shl (32 - prefixLen))
+        return (ipInt and mask) == (netInt and mask)
+    }
+
+    private fun ipToInt(ip: String): Int? {
+        val octets = ip.trim().split(".")
+        if (octets.size != 4) return null
+        val nums = octets.map { it.toIntOrNull() ?: return null }
+        if (nums.any { it !in 0..255 }) return null
+        return (nums[0] shl 24) or (nums[1] shl 16) or (nums[2] shl 8) or nums[3]
     }
 
     private fun buildNotification(text: String): Notification {
@@ -636,7 +696,6 @@ class N2nVpnService : VpnService() {
         destroyed = true
         notificationActive = false
 
-        // ★ 注销时区广播
         try { unregisterReceiver(tzReceiver) } catch (_: Throwable) {}
 
         try { handler.removeCallbacksAndMessages(null) } catch (_: Throwable) {}
