@@ -302,7 +302,7 @@ class N2nVpnService : VpnService() {
                 val parsed = parseReadyPayload(raw)
                 vip = parsed.first
                 virtualNetwork = parsed.second
-                fetchOk = vip.isNotEmpty()   // ★ 显式判定
+                fetchOk = vip.isNotEmpty()
                 ktLog("FetchVIP 返回: vip='$vip' cidr='$virtualNetwork'（原始='$raw'）")
             } catch (t: Throwable) {
                 ktLog("FetchVIP 崩溃: ${t.message}")
@@ -621,9 +621,12 @@ class N2nVpnService : VpnService() {
     }
 
     // "10.64.0.0/24" → ("10.64.0.0", 24)，自动对齐网络地址
+    //
+    // ★ Kotlin 里 String.split() 返回 List<String>，长度属性是 .size
+    //   （不是 Java 的 .length），这里和 ipToInt 保持一致。
     private fun parseCidr(cidr: String): Pair<String, Int>? {
         val parts = cidr.trim().split("/")
-        if (parts.length != 2) return null
+        if (parts.size != 2) return null
         val prefix = parts[1].toIntOrNull() ?: return null
         if (prefix < 0 || prefix > 32) return null
 
