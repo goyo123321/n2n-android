@@ -7,12 +7,11 @@
     android:paddingHorizontal="4dp"
     android:paddingVertical="10dp">
 
-    <!-- 节点代号 A/B/C -->
     <TextView
         android:id="@+id/tvPeerCode"
         android:layout_width="32dp"
         android:layout_height="32dp"
-        android:background="@color/brand_surface_2"
+        android:background="@drawable/bg_peer_code"
         android:gravity="center"
         android:text="A"
         android:textColor="@color/brand_text"
@@ -44,12 +43,11 @@
             android:textSize="11sp" />
     </LinearLayout>
 
-    <!-- 连接方式徽章 -->
     <TextView
         android:id="@+id/tvPeerBadge"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:background="@color/badge_p2p_bg"
+        android:background="@drawable/bg_badge"
         android:paddingHorizontal="8dp"
         android:paddingVertical="3dp"
         android:text="P2P"
