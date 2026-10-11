@@ -248,6 +248,36 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		log.Printf("[NAT-HOLE] 模式：不同 STUN IP，全端口扫描，分级 %v", tiers)
 	}
 
+	// ★ 优化：先只扫 assisted 端点，命中则跳过整个 tier 扫描
+	if len(assistedTargets) > 0 {
+		log.Printf("[NAT-HOLE] 优先扫描 %d 个 assisted 端点", len(assistedTargets))
+		for _, t := range assistedTargets {
+			if _, err := e.udpConn.WriteTo(probe, t); err == nil {
+				attempts++
+			}
+		}
+
+		select {
+		case <-e.doneCh:
+			res.State = PunchStateFailed
+			res.Detail = "aborted: edge stopped"
+			return res
+		case <-time.After(300 * time.Millisecond):
+		}
+
+		if e.hasTrafficFromTarget(instr.TargetMac, startAt) {
+			res.State = PunchStateSucceeded
+			res.Attempts = attempts
+			res.Detail = fmt.Sprintf("assisted 命中 (%d 个端点)", len(assistedTargets))
+			e.recordP2PSuccess(instr, targetAddr)
+			log.Printf("[NAT-HOLE] ✅ 成功 (assisted) role=%d target=%s attempts=%d",
+				instr.Role, targetAddr.IP, attempts)
+			e.resetFailCount(instr.TargetMac)
+			return res
+		}
+		log.Printf("[NAT-HOLE] assisted 未命中，进入 tier 扫描")
+	}
+
 	lastHalf := 0
 	receiverPort := targetAddr.Port
 
@@ -431,3 +461,7 @@ func buildPunchProbe(virtualIP string) []byte {
 	}
 	return buf
 }
+
+// 注意：
+// - lastIndexByte / hasTrafficFromTarget / hasTrafficFromAny
+//   在 Android 端定义在 edge.go，本文件不重复定义。
