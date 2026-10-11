@@ -15,8 +15,6 @@ import (
 	"time"
 )
 
-// ============ STUN 常量 ============
-
 const stunMagicCookie = 0x2112A442
 
 const (
@@ -54,8 +52,6 @@ const (
 	turnRefreshInterval = 60 * time.Second
 	turnRequestTimeout  = 5 * time.Second
 )
-
-// ============ 内部结构 ============
 
 type stunAttr struct {
 	typ   uint16
@@ -113,8 +109,6 @@ func NewTURNLiteWithTCP(serverAddr, username, password string, useTCP bool) *TUR
 	}
 }
 
-// ============ 辅助 ============
-
 func isNetworkUnreachable(err error) bool {
 	if err == nil {
 		return false
@@ -130,8 +124,6 @@ func (t *TURNLite) IsAlive() bool {
 	defer t.mu.Unlock()
 	return !t.stopped
 }
-
-// ============ STUN 编解码 ============
 
 func buildSTUNMsg(msgType uint16, txid [12]byte, attrs []stunAttr) []byte {
 	total := 20
@@ -184,8 +176,6 @@ func parseSTUNMsg(data []byte) (*stunMessage, error) {
 		attrs:   attrs,
 	}, nil
 }
-
-// ============ XOR 地址 ============
 
 var magicBytes = [4]byte{0x21, 0x12, 0xA4, 0x42}
 
@@ -240,8 +230,6 @@ func xorDecodePeer(data []byte) (net.IP, int, error) {
 	return nil, 0, fmt.Errorf("未知地址族 0x%02x", family)
 }
 
-// ============ HMAC-SHA1 签名 ============
-
 func (t *TURNLite) sign(msg []byte) []byte {
 	if t.key == nil {
 		return msg
@@ -271,8 +259,6 @@ func randTxID() [12]byte {
 	_, _ = rand.Read(t[:])
 	return t
 }
-
-// ============ 发送 + 等待（按 txid 分发） ============
 
 func (t *TURNLite) sendRequest(msgType uint16, attrs []stunAttr, withAuth bool) (*stunMessage, error) {
 	txid := randTxID()
@@ -334,8 +320,6 @@ func (t *TURNLite) dispatch(msg *stunMessage) {
 	}
 }
 
-// ============ Allocate ============
-
 func (t *TURNLite) Allocate() error {
 	protectedDialer := newProtectedDialer()
 
@@ -345,7 +329,6 @@ func (t *TURNLite) Allocate() error {
 		if err != nil {
 			return fmt.Errorf("TCP 连接失败: %w", err)
 		}
-		// TCP keepalive：尽早检测对端断开
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			_ = tcpConn.SetKeepAlive(true)
 			_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
@@ -433,15 +416,10 @@ func (t *TURNLite) extractAllocateResult(resp *stunMessage) error {
 	return nil
 }
 
-// ============ CreatePermission ============
-
 // ensurePermission 确保向 remoteAddr 的发送已被 TURN 服务器授权。
 //
-// TURN 协议（RFC 5766）要求客户端向某个对端地址发送数据前，必须先
-// 用 CreatePermission 在服务器上建立对该 IP 的权限。
-//
-// ★ 438 Stale Nonce 是 TURN 服务器的正常行为（每 60 秒轮换 nonce），
-//   需要换新 nonce 重试一次。
+// ★ 修复：438 Stale Nonce 换 nonce 重试；如果重试也失败，主动 Close，
+//   让上层 turn-reconnect 检测到 IsReady()==false 并重建。
 func (t *TURNLite) ensurePermission(ip net.IP) error {
 	key := ip.String()
 	t.permMu.Lock()
@@ -454,7 +432,6 @@ func (t *TURNLite) ensurePermission(ip net.IP) error {
 
 	peerData := xorEncodePeer(ip, 0)
 
-	// 第一次尝试
 	resp, err := t.sendRequest(msgCreatePermissionReq, []stunAttr{
 		{typ: attrXorPeerAddress, value: peerData},
 	}, true)
@@ -462,7 +439,6 @@ func (t *TURNLite) ensurePermission(ip net.IP) error {
 		return fmt.Errorf("CreatePermission: %w", err)
 	}
 
-	// ★ 438 Stale Nonce：换 nonce 重试一次
 	if resp.msgType != msgCreatePermissionSuc {
 		code := parseErrorCode(resp.attrs[attrErrorCode])
 		if code == 438 {
@@ -477,6 +453,9 @@ func (t *TURNLite) ensurePermission(ip net.IP) error {
 					{typ: attrXorPeerAddress, value: peerData},
 				}, true)
 				if err != nil {
+					// ★ 438 重试也失败 → 标记失效
+					log.Printf("[TURN-Lite] 438 重试失败: %v，关闭等待重建", err)
+					go t.Close()
 					return fmt.Errorf("CreatePermission 438 重试失败: %w", err)
 				}
 			} else {
@@ -495,8 +474,6 @@ func (t *TURNLite) ensurePermission(ip net.IP) error {
 	t.permMu.Unlock()
 	return nil
 }
-
-// ============ 发送 ============
 
 func (t *TURNLite) SendTo(data []byte, peerAddr *net.UDPAddr) error {
 	if t.conn == nil {
@@ -521,8 +498,6 @@ func (t *TURNLite) SendTo(data []byte, peerAddr *net.UDPAddr) error {
 	_, err := t.conn.Write(msg)
 	return err
 }
-
-// ============ 读循环 ============
 
 func (t *TURNLite) readLoop() {
 	defer func() {
@@ -636,17 +611,6 @@ func (t *TURNLite) handleIncoming(data []byte) {
 	}
 }
 
-// ============ 定时刷新 ============
-
-// refreshLoop 每 60 秒刷新 TURN allocation。
-//
-// 连续失败 3 次主动关闭自己，让上层 turn-reconnect（30 秒周期）
-// 检测到 IsReady()==false 并触发重建。
-//
-// 触发场景：
-//   - TCP transport 下 TURN 服务器 idle 5 分钟断连 → Write 成功但
-//     Read 超时 → 连续失败 → Close → 重建
-//   - UDP transport 下临时网络抖动 → 大概率单次失败自愈，不会到 3 次
 func (t *TURNLite) refreshLoop() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -684,7 +648,6 @@ func (t *TURNLite) refreshLoop() {
 				continue
 			}
 
-			// 成功清零计数
 			consecutiveFails = 0
 
 			if resp.msgType == msgRefreshSuccess {
@@ -713,8 +676,6 @@ func (t *TURNLite) refreshLoop() {
 		}
 	}
 }
-
-// ============ 查询 / 关闭 ============
 
 func (t *TURNLite) GetRelayAddr() string {
 	if t.relayAddr == nil {
