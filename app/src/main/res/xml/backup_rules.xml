@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- CONNECT_TOKEN 等凭证不进云备份 -->
+    <exclude domain="sharedpref" path="n2n_prefs.xml" />
+    <exclude domain="sharedpref" path="n2n_prefs_fallback.xml" />
+    <!-- 日志文件也排除（可能含 Client ID / 内网地址） -->
+    <exclude domain="file" path="n2n.log" />
+</full-backup-content>
