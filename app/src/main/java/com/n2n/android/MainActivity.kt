@@ -69,7 +69,6 @@ class MainActivity : AppCompatActivity() {
         applyThemeMode(Prefs.loadThemeMode(this))
         super.onCreate(savedInstanceState)
 
-        // ★ 设置时区（Go 日志和 Kotlin 日志时间一致）
         N2nController.applySystemTimezone()
 
         binding = ActivityMainBinding.inflate(layoutInflater)
@@ -263,10 +262,14 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ★ 改动：只在首次启动时弹；用户点了"稍后再说"之后不再弹
     private fun checkSignalingUrl() {
         if (!::binding.isInitialized) return
         val currentUrl = binding.etSignalingUrl.text.toString().trim()
         if (currentUrl.isNotEmpty()) return
+        if (Prefs.hasSeenFirstUseDialog(this)) return   // ← 新增
+
+        Prefs.markFirstUseDialogSeen(this)              // ← 新增：先标记，无论用户点啥
 
         AlertDialog.Builder(this)
             .setTitle(getString(R.string.first_use_title))
@@ -603,31 +606,25 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ★ 改动：徽章用 GradientDrawable 现场造圆角，替代 setBackgroundColor
     private fun applyBadge(badge: android.widget.TextView?, connType: String) {
         if (badge == null) return
         try {
-            when (connType.lowercase()) {
-                "p2p" -> {
-                    badge.text = "P2P"
-                    badge.setBackgroundColor(getColor(R.color.badge_p2p_bg))
-                    badge.setTextColor(getColor(R.color.badge_p2p_fg))
-                }
-                "turn" -> {
-                    badge.text = "TURN"
-                    badge.setBackgroundColor(getColor(R.color.badge_turn_bg))
-                    badge.setTextColor(getColor(R.color.badge_turn_fg))
-                }
-                "relay" -> {
-                    badge.text = "WS"
-                    badge.setBackgroundColor(getColor(R.color.badge_ws_bg))
-                    badge.setTextColor(getColor(R.color.badge_ws_fg))
-                }
-                else -> {
-                    badge.text = "?"
-                    badge.setBackgroundColor(getColor(R.color.brand_surface_2))
-                    badge.setTextColor(getColor(R.color.brand_text_dim))
-                }
+            val (bgRes, fgRes, label) = when (connType.lowercase()) {
+                "p2p" -> Triple(R.color.badge_p2p_bg, R.color.badge_p2p_fg, "P2P")
+                "turn" -> Triple(R.color.badge_turn_bg, R.color.badge_turn_fg, "TURN")
+                "relay" -> Triple(R.color.badge_ws_bg, R.color.badge_ws_fg, "WS")
+                else -> Triple(R.color.brand_surface_2, R.color.brand_text_dim, "?")
             }
+            badge.text = label
+            badge.setTextColor(getColor(fgRes))
+
+            val bg = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+                setColor(getColor(bgRes))
+                cornerRadius = 4f * resources.displayMetrics.density
+            }
+            badge.background = bg
         } catch (t: Throwable) {
             Log.e(TAG, "applyBadge failed", t)
         }
