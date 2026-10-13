@@ -39,9 +39,7 @@ class N2nVpnService : VpnService() {
 
         private const val DEFAULT_VIRTUAL_NETWORK = "10.64.0.0/24"
 
-        // ★ 改动：MTU 从 1280 提到 1400，与 PC 端对齐
-        //   TURN Send Indication 封装后 1400 - 40（TURN 头）- 28（IP+UDP）= 1332
-        //   足够容纳 N2NS 最大帧 1221
+        // ★ 与 PC 端对齐：MTU 1280 → 1400
         private const val TUN_MTU = 1400
 
         const val ACTION_START = "com.n2n.android.START"
@@ -114,10 +112,12 @@ class N2nVpnService : VpnService() {
             val ts = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
             val line = "[$ts] [K] $msg"
 
+            // 优先用 filesDir（进程内可达）
             val candidates = mutableListOf<File>()
             try { candidates.add(File(filesDir, "n2n.log")) } catch (_: Throwable) {}
-            candidates.add(File("/data/user/0/com.n2n.android/files/n2n.log"))
-            candidates.add(File("/data/data/com.n2n.android/files/n2n.log"))
+            // 兜底：硬编码路径（改包名后失效，但 Go 侧已改用 SetLogFilePath）
+            candidates.add(File("/data/user/0/$packageName/files/n2n.log"))
+            candidates.add(File("/data/data/$packageName/files/n2n.log"))
 
             var written = false
             for (f in candidates) {
@@ -160,6 +160,10 @@ class N2nVpnService : VpnService() {
 
     override fun onCreate() {
         super.onCreate()
+
+        // ★ 本轮新增：先设置日志路径，再 applySystemTimezone
+        //   确保 Go 侧所有日志都写到 filesDir 下的 n2n.log
+        N2nController.applyLogFilePath(this)
 
         N2nController.applySystemTimezone()
         installCrashHandler()
@@ -237,10 +241,7 @@ class N2nVpnService : VpnService() {
             return
         }
 
-        // ★ 改动：异步等待替代 Thread.sleep(300)
-        //
-        // 旧版在主线程 sleep 300ms，StrictMode 会记录，也可能擦边 ANR。
-        // 新版把重试逻辑放到 handler.postDelayed，主线程立即返回。
+        // ★ 异步等待替代 Thread.sleep(300)，避免主线程阻塞
         if (N2nController.isRunning()) {
             ktLog("handleStart: Controller 仍在 running，异步等待 500ms 后重试")
             try { N2nController.stop() } catch (t: Throwable) {
@@ -396,7 +397,7 @@ class N2nVpnService : VpnService() {
                                     started = true
                                     starting.set(false)
                                     notificationActive = true
-                                    // ★ 新增：记录曾成功启动过
+                                    // ★ 记录曾成功启动过 VPN
                                     try { Prefs.markVpnStartedOnce(this@N2nVpnService) } catch (_: Throwable) {}
                                     handler.post(updateIpRunnable)
                                 }
@@ -553,7 +554,7 @@ class N2nVpnService : VpnService() {
                 try { tunInterface?.close() } catch (_: Throwable) {}
                 tunInterface = null
 
-                // ★ 显式 close protected socket，避免 GC finalizer 误关
+                // ★ 显式 close protected socket
                 try {
                     protectedUdpSocket?.let {
                         if (!it.isClosed) it.close()
@@ -637,7 +638,6 @@ class N2nVpnService : VpnService() {
 
             val builder = Builder()
                 .setSession("n2n-client")
-                // ★ 改动：MTU 1280 → 1400
                 .setMtu(TUN_MTU)
                 .addAddress(vip, prefixLen)
                 .addRoute(networkAddr, prefixLen)
