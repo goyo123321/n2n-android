@@ -1,361 +1,726 @@
 package internal
 
+// TURN-Lite：自研的 TURN 客户端。
+//
+// ⚠️ 本文件只包含 TURNLite 协议实现。
+//    TURNClient / TURNServerInfo / TURNResponse / NewTURNClient / redactToken
+//    等定义在 turn_client.go，不要复制到这里。
+//
+// 依赖：
+//   - stunMessage / stunAttr / buildSTUNMsg / parseSTUNMsg / xorEncodePeer
+//     全部在本文件内定义，供 turn_lite_tcp.go 复用。
+
 import (
-	"context"
-	"crypto/tls"
-	"encoding/json"
+	"crypto/hmac"
+	"crypto/md5"
+	"crypto/rand"
+	"crypto/sha1"
+	"encoding/binary"
 	"fmt"
-	"io"
 	"log"
 	"net"
-	"net/http"
-	"net/url"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-type TURNServerInfo struct {
-	URL      string `json:"url"`
-	Username string `json:"username"`
-	Password string `json:"password"`
-	TTL      uint32 `json:"ttl"`
+const stunMagicCookie = 0x2112A442
+
+const (
+	msgAllocateRequest     = 0x0003
+	msgAllocateSuccess     = 0x0103
+	msgAllocateError       = 0x0113
+	msgRefreshRequest      = 0x0004
+	msgRefreshSuccess      = 0x0104
+	msgCreatePermissionReq = 0x0008
+	msgCreatePermissionSuc = 0x0108
+	msgSendIndication      = 0x0016
+	msgDataIndication      = 0x0017
+)
+
+const (
+	attrMappedAddress    = 0x0001
+	attrUsername         = 0x0006
+	attrMessageIntegrity = 0x0008
+	attrErrorCode        = 0x0009
+	attrLifetime         = 0x000D
+	attrXorPeerAddress   = 0x0012
+	attrData             = 0x0013
+	attrRealm            = 0x0014
+	attrNonce            = 0x0015
+	attrXorRelayedAddr   = 0x0016
+	attrRequestedTransID = 0x0019
+	attrXorMappedAddress = 0x0020
+)
+
+const transportUDP = 17
+
+const (
+	turnPermissionTTL   = 4 * time.Minute
+	turnDefaultLifetime = 600
+	turnRefreshInterval = 60 * time.Second
+	turnRequestTimeout  = 5 * time.Second
+)
+
+type stunAttr struct {
+	typ   uint16
+	value []byte
 }
 
-type TURNResponse struct {
-	Success bool             `json:"success"`
-	Source  string           `json:"source,omitempty"`
-	Servers []TURNServerInfo `json:"servers"`
-	Error   string           `json:"error,omitempty"`
+type stunMessage struct {
+	msgType uint16
+	txid    [12]byte
+	attrs   map[uint16][]byte
 }
 
-type TURNClient struct {
-	mu           sync.RWMutex
-	lite         *TURNLite
-	tcpAlloc     *TURNTCPAllocation
-	relayAddr    net.Addr
-	server       *TURNServerInfo
-	signalingURL string
+type TURNLite struct {
+	serverAddr string
+	username   string
+	password   string
+	useTCP     bool
 
-	// ★ 重命名：uuid → connectToken（历史遗留命名，实际一直是 CONNECT_TOKEN）
-	connectToken string
+	realm string
+	nonce []byte
+	key   []byte
 
-	edge      *Edge
+	conn net.Conn
+
+	relayAddr  *net.UDPAddr
+	mappedAddr *net.UDPAddr
+
+	permissions map[string]time.Time
+	permMu      sync.Mutex
+
 	onMessage func([]byte, net.Addr)
-	stopCh    chan struct{}
-	stopOnce  sync.Once
 
-	httpClient *http.Client
+	pendingMu sync.Mutex
+	pending   map[[12]byte]chan *stunMessage
+
+	mu       sync.Mutex
+	stopped  bool
+	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
-// NewTURNClient 构造 TURN 客户端。
-//
-// 参数名从 uuid 改为 connectToken。
-func NewTURNClient(signalingURL string, connectToken string, edge *Edge) *TURNClient {
-	protectedDialer := newProtectedDialer()
+func NewTURNLite(serverAddr, username, password string) *TURNLite {
+	return NewTURNLiteWithTCP(serverAddr, username, password, false)
+}
 
-	var sniHost string
-	if u, err := url.Parse(signalingURL); err == nil {
-		sniHost = u.Hostname()
-	}
-
-	// 优选 IP：TURN 的 /api/turn-credentials 请求也走优选 IP
-	var preferredAddr string
-	if edge != nil && edge.cfg != nil && edge.cfg.PreferredIP != "" {
-		host := edge.cfg.PreferredIP
-		port := edge.cfg.PreferredPort
-		if h, pStr, err := net.SplitHostPort(edge.cfg.PreferredIP); err == nil {
-			host = h
-			if p, err := strconv.Atoi(pStr); err == nil && p > 0 && p <= 65535 {
-				port = p
-			}
-		}
-		if port <= 0 {
-			port = 443
-		}
-		preferredAddr = net.JoinHostPort(host, strconv.Itoa(port))
-	}
-
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			if preferredAddr != "" {
-				return protectedDialer.DialContext(ctx, network, preferredAddr)
-			}
-			return protectedDialer.DialContext(ctx, network, addr)
-		},
-		TLSClientConfig:   &tls.Config{ServerName: sniHost},
-		ForceAttemptHTTP2: false,
-	}
-
-	return &TURNClient{
-		signalingURL: signalingURL,
-		connectToken: connectToken,
-		edge:         edge,
-		stopCh:       make(chan struct{}),
-		httpClient: &http.Client{
-			Timeout:   30 * time.Second,
-			Transport: transport,
-		},
+func NewTURNLiteWithTCP(serverAddr, username, password string, useTCP bool) *TURNLite {
+	return &TURNLite{
+		serverAddr:  serverAddr,
+		username:    username,
+		password:    password,
+		useTCP:      useTCP,
+		permissions: make(map[string]time.Time),
+		pending:     make(map[[12]byte]chan *stunMessage),
+		stopCh:      make(chan struct{}),
 	}
 }
 
-func (tc *TURNClient) IsReady() bool {
-	tc.mu.RLock()
-	lite := tc.lite
-	tcpAlloc := tc.tcpAlloc
-	tc.mu.RUnlock()
-
-	if lite != nil && lite.IsAlive() {
-		return true
+func isNetworkUnreachable(err error) bool {
+	if err == nil {
+		return false
 	}
-	if tcpAlloc != nil && tcpAlloc.IsAlive() {
-		return true
-	}
-	return false
+	s := err.Error()
+	return strings.Contains(s, "network is unreachable") ||
+		strings.Contains(s, "no route to host") ||
+		strings.Contains(s, "network is down")
 }
 
-// FetchAndSetup 请求凭证并建立 TURN allocation。
-func (tc *TURNClient) FetchAndSetup(ctx context.Context) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("[TURN] FetchAndSetup panic: %v\n%s", r, debug.Stack())
-			err = fmt.Errorf("panic: %v", r)
-		}
-	}()
-
-	if tc.IsReady() {
-		return nil
-	}
-
-	// wss:// → https://
-	httpBase := tc.signalingURL
-	if strings.HasPrefix(httpBase, "wss://") {
-		httpBase = "https://" + httpBase[len("wss://"):]
-	} else if strings.HasPrefix(httpBase, "ws://") {
-		httpBase = "http://" + httpBase[len("ws://"):]
-	}
-	httpBase = strings.TrimRight(httpBase, "/")
-
-	credURL := fmt.Sprintf("%s/api/turn-credentials?ttl=86400", httpBase)
-	if tc.connectToken != "" {
-		credURL += "&token=" + url.QueryEscape(tc.connectToken)
-	}
-
-	log.Printf("[TURN] 请求凭证: %s", redactToken(credURL))
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, credURL, nil)
-	if err != nil {
-		return fmt.Errorf("create request: %w", err)
-	}
-
-	resp, err := tc.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("fetch credentials: %w", err)
-	}
-	defer func() { _, _ = io.Copy(io.Discard, resp.Body); _ = resp.Body.Close() }()
-
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return fmt.Errorf("turn-credentials 未授权 (http=%d)", resp.StatusCode)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("credentials endpoint returned %d", resp.StatusCode)
-	}
-
-	var creds TURNResponse
-	if err := json.NewDecoder(resp.Body).Decode(&creds); err != nil {
-		return fmt.Errorf("decode credentials: %w", err)
-	}
-	if !creds.Success || len(creds.Servers) == 0 {
-		return fmt.Errorf("no TURN servers: %s", creds.Error)
-	}
-
-	tc.mu.Lock()
-	tc.server = &creds.Servers[0]
-	tc.mu.Unlock()
-
-	log.Printf("[TURN] 获取到 %s TURN: %s", creds.Source, creds.Servers[0].URL)
-	return tc.setupAllocation(ctx)
+func (t *TURNLite) IsAlive() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return !t.stopped
 }
 
-// setupAllocation 按 transport 优先级尝试建立 allocation。
-//
-// 顺序：
-//   - UDP transport（默认）
-//   - TURN over TCP（UDP 不通时）
-//   - RFC 6062 TCP allocation（前两者都不通时）
-func (tc *TURNClient) setupAllocation(ctx context.Context) error {
-	tc.mu.RLock()
-	srv := tc.server
-	tc.mu.RUnlock()
-	if srv == nil {
-		return fmt.Errorf("TURN server not set")
+func buildSTUNMsg(msgType uint16, txid [12]byte, attrs []stunAttr) []byte {
+	total := 20
+	for _, a := range attrs {
+		total += 4 + ((len(a.value) + 3) &^ 3)
 	}
-
-	// 剥 URL 里的 query（?transport=xxx）
-	turnAddr := srv.URL
-	if i := strings.Index(turnAddr, "?"); i >= 0 {
-		turnAddr = turnAddr[:i]
+	buf := make([]byte, total)
+	binary.BigEndian.PutUint16(buf[0:2], msgType)
+	binary.BigEndian.PutUint16(buf[2:4], uint16(total-20))
+	binary.BigEndian.PutUint32(buf[4:8], stunMagicCookie)
+	copy(buf[8:20], txid[:])
+	offset := 20
+	for _, a := range attrs {
+		binary.BigEndian.PutUint16(buf[offset:offset+2], a.typ)
+		binary.BigEndian.PutUint16(buf[offset+2:offset+4], uint16(len(a.value)))
+		copy(buf[offset+4:], a.value)
+		offset += 4 + ((len(a.value) + 3) &^ 3)
 	}
-	turnAddr = strings.TrimPrefix(turnAddr, "turn://")
-	turnAddr = strings.TrimPrefix(turnAddr, "turns://")
-	turnAddr = strings.TrimPrefix(turnAddr, "turn:")
-	turnAddr = strings.TrimPrefix(turnAddr, "turns:")
-	turnAddr = strings.TrimPrefix(turnAddr, "//")
+	return buf
+}
 
-	log.Printf("[TURN] 尝试 UDP transport: %s", turnAddr)
-	lite := NewTURNLiteWithTCP(turnAddr, srv.Username, srv.Password, false)
-	lite.onMessage = tc.wrapOnMessage()
-	if err := lite.Allocate(); err != nil {
-		log.Printf("[TURN] UDP transport 失败: %v，尝试 TCP transport", err)
-		lite2 := NewTURNLiteWithTCP(turnAddr, srv.Username, srv.Password, true)
-		lite2.onMessage = tc.wrapOnMessage()
-		if err2 := lite2.Allocate(); err2 != nil {
-			log.Printf("[TURN] TURN over TCP 失败: %v，尝试 RFC 6062 TCP allocation", err2)
-
-			tcpAlloc := NewTURNTCPAllocation(turnAddr, srv.Username, srv.Password)
-			tcpAlloc.onMessage = tc.wrapOnMessage()
-			if err3 := tcpAlloc.Allocate(); err3 != nil {
-				log.Printf("[TURN] RFC 6062 TCP allocation 也失败: %v", err3)
-				return fmt.Errorf("TURN 完全不可用: %v", err3)
-			}
-
-			tc.mu.Lock()
-			tc.tcpAlloc = tcpAlloc
-			tc.relayAddr = tcpAlloc.relayAddr
-			tc.mu.Unlock()
-
-			log.Printf("[TURN] ✅ RFC 6062 TCP allocation 就绪: %s", tcpAlloc.GetRelayAddr())
-			return nil
+func parseSTUNMsg(data []byte) (*stunMessage, error) {
+	if len(data) < 20 {
+		return nil, fmt.Errorf("STUN 消息太短")
+	}
+	if binary.BigEndian.Uint32(data[4:8]) != stunMagicCookie {
+		return nil, fmt.Errorf("magic cookie 不匹配")
+	}
+	msgLen := int(binary.BigEndian.Uint16(data[2:4]))
+	end := 20 + msgLen
+	if end > len(data) {
+		end = len(data)
+	}
+	attrs := make(map[uint16][]byte)
+	offset := 20
+	for offset+4 <= end {
+		typ := binary.BigEndian.Uint16(data[offset : offset+2])
+		l := int(binary.BigEndian.Uint16(data[offset+2 : offset+4]))
+		if offset+4+l > end {
+			break
 		}
-		lite = lite2
+		attrs[typ] = data[offset+4 : offset+4+l]
+		offset += 4 + ((l + 3) &^ 3)
 	}
+	var txid [12]byte
+	copy(txid[:], data[8:20])
+	return &stunMessage{
+		msgType: binary.BigEndian.Uint16(data[0:2]),
+		txid:    txid,
+		attrs:   attrs,
+	}, nil
+}
 
-	tc.mu.Lock()
-	tc.lite = lite
-	tc.relayAddr = lite.relayAddr
-	tc.mu.Unlock()
+var magicBytes = [4]byte{0x21, 0x12, 0xA4, 0x42}
 
-	if lite.useTCP {
-		log.Printf("[TURN] ✅ TURN over TCP 就绪: %s", tc.relayAddr)
-	} else {
-		log.Printf("[TURN] ✅ UDP transport 就绪: %s", tc.relayAddr)
+func xorEncodePeer(ip net.IP, port int) []byte {
+	if v4 := ip.To4(); v4 != nil {
+		buf := make([]byte, 8)
+		buf[1] = 0x01
+		binary.BigEndian.PutUint16(buf[2:4], uint16(port)^0x2112)
+		for i := 0; i < 4; i++ {
+			buf[4+i] = v4[i] ^ magicBytes[i]
+		}
+		return buf
+	}
+	if v6 := ip.To16(); v6 != nil {
+		buf := make([]byte, 20)
+		buf[1] = 0x02
+		binary.BigEndian.PutUint16(buf[2:4], uint16(port)^0x2112)
+		for i := 0; i < 16; i++ {
+			buf[4+i] = v6[i] ^ magicBytes[i%4]
+		}
+		return buf
 	}
 	return nil
 }
 
-func (tc *TURNClient) wrapOnMessage() func([]byte, net.Addr) {
-	return func(data []byte, addr net.Addr) {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("[TURN] onMessage panic: %v\n%s", r, debug.Stack())
-			}
-		}()
-		if tc.onMessage != nil {
-			tc.onMessage(data, addr)
+func xorDecodePeer(data []byte) (net.IP, int, error) {
+	if len(data) < 4 {
+		return nil, 0, fmt.Errorf("XOR 地址太短")
+	}
+	family := data[1]
+	port := int(binary.BigEndian.Uint16(data[2:4]) ^ 0x2112)
+	switch family {
+	case 0x01:
+		if len(data) < 8 {
+			return nil, 0, fmt.Errorf("IPv4 数据不足")
+		}
+		ip := make(net.IP, 4)
+		for i := 0; i < 4; i++ {
+			ip[i] = data[4+i] ^ magicBytes[i]
+		}
+		return ip, port, nil
+	case 0x02:
+		if len(data) < 20 {
+			return nil, 0, fmt.Errorf("IPv6 数据不足")
+		}
+		ip := make(net.IP, 16)
+		for i := 0; i < 16; i++ {
+			ip[i] = data[4+i] ^ magicBytes[i%4]
+		}
+		return ip, port, nil
+	}
+	return nil, 0, fmt.Errorf("未知地址族 0x%02x", family)
+}
+
+func (t *TURNLite) sign(msg []byte) []byte {
+	if t.key == nil {
+		return msg
+	}
+
+	newBodyLen := len(msg) - 20 + 24
+
+	tmp := make([]byte, len(msg))
+	copy(tmp, msg)
+	binary.BigEndian.PutUint16(tmp[2:4], uint16(newBodyLen))
+
+	mac := hmac.New(sha1.New, t.key)
+	mac.Write(tmp)
+	sig := mac.Sum(nil)
+
+	out := make([]byte, len(msg)+24)
+	copy(out, msg)
+	binary.BigEndian.PutUint16(out[len(msg):len(msg)+2], attrMessageIntegrity)
+	binary.BigEndian.PutUint16(out[len(msg)+2:len(msg)+4], 20)
+	copy(out[len(msg)+4:], sig)
+	binary.BigEndian.PutUint16(out[2:4], uint16(newBodyLen))
+	return out
+}
+
+func randTxID() [12]byte {
+	var t [12]byte
+	_, _ = rand.Read(t[:])
+	return t
+}
+
+func (t *TURNLite) sendRequest(msgType uint16, attrs []stunAttr, withAuth bool) (*stunMessage, error) {
+	txid := randTxID()
+
+	if withAuth && t.key != nil {
+		attrs = append(attrs,
+			stunAttr{typ: attrUsername, value: []byte(t.username)},
+			stunAttr{typ: attrRealm, value: []byte(t.realm)},
+			stunAttr{typ: attrNonce, value: t.nonce},
+		)
+	}
+
+	msg := buildSTUNMsg(msgType, txid, attrs)
+	if withAuth && t.key != nil {
+		msg = t.sign(msg)
+	}
+
+	ch := make(chan *stunMessage, 1)
+	t.pendingMu.Lock()
+	t.pending[txid] = ch
+	t.pendingMu.Unlock()
+	defer func() {
+		t.pendingMu.Lock()
+		delete(t.pending, txid)
+		t.pendingMu.Unlock()
+	}()
+
+	if _, err := t.conn.Write(msg); err != nil {
+		if isNetworkUnreachable(err) {
+			log.Printf("[TURN-Lite] socket 失效（网络变化），关闭等待重建")
+			go t.Close()
+		}
+		return nil, fmt.Errorf("发送失败: %w", err)
+	}
+
+	timeout := time.After(turnRequestTimeout)
+	select {
+	case resp := <-ch:
+		if resp == nil {
+			return nil, fmt.Errorf("空响应")
+		}
+		return resp, nil
+	case <-timeout:
+		return nil, fmt.Errorf("请求超时 (type=0x%04x)", msgType)
+	case <-t.stopCh:
+		return nil, fmt.Errorf("已关闭")
+	}
+}
+
+func (t *TURNLite) dispatch(msg *stunMessage) {
+	t.pendingMu.Lock()
+	ch := t.pending[msg.txid]
+	t.pendingMu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- msg:
+		default:
 		}
 	}
 }
 
-// StartReconnectLoop 后台每 30 秒检测 allocation 是否失效，失效则重建。
-func (tc *TURNClient) StartReconnectLoop() {
-	safeGo("turn-reconnect", func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-tc.stopCh:
-				return
-			case <-ticker.C:
-				if tc.IsReady() {
-					continue
-				}
+func (t *TURNLite) Allocate() error {
+	protectedDialer := newProtectedDialer()
 
-				log.Printf("[TURN] 检测到分配失效，尝试重建")
-				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				err := tc.FetchAndSetup(ctx)
-				cancel()
+	if t.useTCP {
+		log.Printf("[TURN-Lite] TCP transport → %s", t.serverAddr)
+		conn, err := protectedDialer.Dial("tcp", t.serverAddr)
+		if err != nil {
+			return fmt.Errorf("TCP 连接失败: %w", err)
+		}
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			_ = tcpConn.SetKeepAlive(true)
+			_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		}
+		t.conn = conn
+	} else {
+		log.Printf("[TURN-Lite] UDP transport → %s", t.serverAddr)
+		conn, err := protectedDialer.Dial("udp4", t.serverAddr)
+		if err != nil {
+			return fmt.Errorf("UDP 连接失败: %w", err)
+		}
+		t.conn = conn
+	}
+
+	safeGo("turn-lite-readLoop", t.readLoop)
+
+	reqTransport := []byte{transportUDP, 0, 0, 0}
+
+	log.Printf("[TURN-Lite] 发送初始 Allocate（无认证）")
+	resp, err := t.sendRequest(msgAllocateRequest, []stunAttr{
+		{typ: attrRequestedTransID, value: reqTransport},
+	}, false)
+	if err != nil {
+		t.Close()
+		return fmt.Errorf("初始 Allocate 失败: %w", err)
+	}
+
+	if resp.msgType == msgAllocateError {
+		realm := string(resp.attrs[attrRealm])
+		nonce := resp.attrs[attrNonce]
+		if realm == "" || len(nonce) == 0 {
+			t.Close()
+			return fmt.Errorf("401 缺 realm/nonce")
+		}
+		t.realm = realm
+		t.nonce = nonce
+
+		h := md5.Sum([]byte(fmt.Sprintf("%s:%s:%s", t.username, t.realm, t.password)))
+		t.key = h[:]
+
+		log.Printf("[TURN-Lite] 401 realm=%q nonce=%d 字节 (username=%s)", realm, len(nonce), t.username)
+	} else if resp.msgType == msgAllocateSuccess {
+		return t.extractAllocateResult(resp)
+	} else {
+		t.Close()
+		return fmt.Errorf("初始 Allocate 返回意外类型 0x%04x", resp.msgType)
+	}
+
+	log.Printf("[TURN-Lite] 发送 Allocate（带认证）")
+	resp, err = t.sendRequest(msgAllocateRequest, []stunAttr{
+		{typ: attrRequestedTransID, value: reqTransport},
+		{typ: attrLifetime, value: uint32ToBytes(turnDefaultLifetime)},
+	}, true)
+	if err != nil {
+		t.Close()
+		return fmt.Errorf("认证 Allocate 失败: %w", err)
+	}
+
+	if resp.msgType != msgAllocateSuccess {
+		t.Close()
+		code := parseErrorCode(resp.attrs[attrErrorCode])
+		return fmt.Errorf("Allocate 失败: code=%d", code)
+	}
+
+	return t.extractAllocateResult(resp)
+}
+
+func (t *TURNLite) extractAllocateResult(resp *stunMessage) error {
+	relayData := resp.attrs[attrXorRelayedAddr]
+	ip, port, err := xorDecodePeer(relayData)
+	if err != nil {
+		return fmt.Errorf("解析 relay 失败: %w", err)
+	}
+	t.relayAddr = &net.UDPAddr{IP: ip, Port: port}
+
+	if m := resp.attrs[attrXorMappedAddress]; m != nil {
+		if ip2, port2, err2 := xorDecodePeer(m); err2 == nil {
+			t.mappedAddr = &net.UDPAddr{IP: ip2, Port: port2}
+		}
+	}
+
+	log.Printf("[TURN-Lite] ✅ Allocation 成功: relay=%s", t.relayAddr)
+
+	safeGo("turn-lite-refresh", t.refreshLoop)
+	return nil
+}
+
+// ensurePermission 确保本端可以向 peer 发送数据。
+//
+// ★ 加 port 参数（旧版传 0 会被 coturn 静默丢弃）。
+func (t *TURNLite) ensurePermission(ip net.IP, port int) error {
+	key := ip.String()
+	t.permMu.Lock()
+	last, exists := t.permissions[key]
+	t.permMu.Unlock()
+
+	if exists && time.Since(last) < turnPermissionTTL {
+		return nil
+	}
+
+	peerData := xorEncodePeer(ip, port)
+
+	resp, err := t.sendRequest(msgCreatePermissionReq, []stunAttr{
+		{typ: attrXorPeerAddress, value: peerData},
+	}, true)
+	if err != nil {
+		return fmt.Errorf("CreatePermission: %w", err)
+	}
+
+	if resp.msgType != msgCreatePermissionSuc {
+		code := parseErrorCode(resp.attrs[attrErrorCode])
+		if code == 438 {
+			newNonce := resp.attrs[attrNonce]
+			if len(newNonce) > 0 {
+				t.mu.Lock()
+				t.nonce = newNonce
+				t.mu.Unlock()
+				log.Printf("[TURN-Lite] CreatePermission 收到 438，换 nonce 重试")
+
+				resp, err = t.sendRequest(msgCreatePermissionReq, []stunAttr{
+					{typ: attrXorPeerAddress, value: peerData},
+				}, true)
 				if err != nil {
-					log.Printf("[TURN] 重建失败: %v（30 秒后重试）", err)
-					continue
+					log.Printf("[TURN-Lite] 438 重试失败: %v，关闭等待重建", err)
+					go t.Close()
+					return fmt.Errorf("CreatePermission 438 重试失败: %w", err)
 				}
-
-				log.Printf("[TURN] ✅ 重建成功: %s", tc.GetRelayAddr())
-
-				if tc.edge != nil && tc.edge.ws != nil {
-					_ = tc.edge.ws.Send(map[string]interface{}{
-						"type":      "turn_relay_info",
-						"relayAddr": tc.GetRelayAddr(),
-					})
-				}
-
-				if tc.edge != nil && tc.edge.relayMgr != nil {
-					tc.edge.relayMgr.UpgradeRelaysToTURN()
-				}
+			} else {
+				log.Printf("[TURN-Lite] CreatePermission 438 但响应无 nonce")
 			}
 		}
+	}
+
+	if resp.msgType != msgCreatePermissionSuc {
+		code := parseErrorCode(resp.attrs[attrErrorCode])
+		return fmt.Errorf("CreatePermission 被拒 code=%d", code)
+	}
+
+	t.permMu.Lock()
+	t.permissions[key] = time.Now()
+	t.permMu.Unlock()
+	return nil
+}
+
+func (t *TURNLite) SendTo(data []byte, peerAddr *net.UDPAddr) error {
+	if t.conn == nil {
+		return fmt.Errorf("TURN 未就绪")
+	}
+	if len(data) == 0 {
+		return nil
+	}
+	// ★ 传真实端口
+	if err := t.ensurePermission(peerAddr.IP, peerAddr.Port); err != nil {
+		return err
+	}
+	peerData := xorEncodePeer(peerAddr.IP, peerAddr.Port)
+	msg := buildSTUNMsg(msgSendIndication, randTxID(), []stunAttr{
+		{typ: attrXorPeerAddress, value: peerData},
+		{typ: attrData, value: data},
 	})
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.stopped {
+		return fmt.Errorf("已关闭")
+	}
+	_, err := t.conn.Write(msg)
+	return err
 }
 
-// Send 通过 TURN 中继发送数据。
-func (tc *TURNClient) Send(data []byte, remoteAddr net.Addr) error {
-	tc.mu.RLock()
-	lite := tc.lite
-	tcpAlloc := tc.tcpAlloc
-	tc.mu.RUnlock()
-
-	udp, ok := remoteAddr.(*net.UDPAddr)
-	if !ok {
-		return fmt.Errorf("TURN 只支持 UDP 地址")
+func (t *TURNLite) readLoop() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[TURN-Lite] readLoop panic: %v\n%s", r, debug.Stack())
+			go t.Close()
+		}
+	}()
+	if t.useTCP {
+		t.readLoopTCP()
+	} else {
+		t.readLoopUDP()
 	}
-
-	if lite != nil && lite.IsAlive() {
-		return lite.SendTo(data, udp)
-	}
-	if tcpAlloc != nil && tcpAlloc.IsAlive() {
-		return tcpAlloc.SendTo(udp, data)
-	}
-	return fmt.Errorf("TURN 未就绪")
 }
 
-func (tc *TURNClient) GetRelayAddr() string {
-	tc.mu.RLock()
-	defer tc.mu.RUnlock()
-	if tc.relayAddr == nil {
+func (t *TURNLite) readLoopUDP() {
+	buf := make([]byte, 65535)
+	for {
+		select {
+		case <-t.stopCh:
+			return
+		default:
+		}
+		_ = t.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		n, err := t.conn.Read(buf)
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
+			if isNetworkUnreachable(err) {
+				log.Printf("[TURN-Lite] 读 socket 失效（网络变化），关闭")
+				go t.Close()
+				return
+			}
+			select {
+			case <-t.stopCh:
+				return
+			default:
+			}
+			log.Printf("[TURN-Lite] UDP 读错误: %v", err)
+			return
+		}
+		t.handleIncoming(buf[:n])
+	}
+}
+
+func (t *TURNLite) readLoopTCP() {
+	for {
+		select {
+		case <-t.stopCh:
+			return
+		default:
+		}
+		_ = t.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		pkt, err := readTCPPacket(t.conn)
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
+			if isNetworkUnreachable(err) {
+				log.Printf("[TURN-Lite] TCP 读 socket 失效（网络变化），关闭")
+				go t.Close()
+				return
+			}
+			select {
+			case <-t.stopCh:
+				return
+			default:
+			}
+			log.Printf("[TURN-Lite] TCP 读错误: %v", err)
+			return
+		}
+		t.handleIncoming(pkt)
+	}
+}
+
+func (t *TURNLite) handleIncoming(data []byte) {
+	if len(data) < 4 {
+		return
+	}
+	if data[0]&0xC0 == 0x40 {
+		return
+	}
+	msg, err := parseSTUNMsg(data)
+	if err != nil {
+		return
+	}
+	switch msg.msgType {
+	case msgDataIndication:
+		peerData := msg.attrs[attrXorPeerAddress]
+		dataPayload := msg.attrs[attrData]
+		if peerData == nil || dataPayload == nil {
+			return
+		}
+		ip, port, err := xorDecodePeer(peerData)
+		if err != nil {
+			return
+		}
+		if t.onMessage != nil {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[TURN-Lite] onMessage panic: %v\n%s", r, debug.Stack())
+					}
+				}()
+				t.onMessage(dataPayload, &net.UDPAddr{IP: ip, Port: port})
+			}()
+		}
+	default:
+		t.dispatch(msg)
+	}
+}
+
+func (t *TURNLite) refreshLoop() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[TURN-Lite] refreshLoop panic: %v\n%s", r, debug.Stack())
+		}
+	}()
+
+	consecutiveFails := 0
+
+	ticker := time.NewTicker(turnRefreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-t.stopCh:
+			return
+		case <-ticker.C:
+			if !t.IsAlive() {
+				return
+			}
+
+			resp, err := t.sendRequest(msgRefreshRequest, []stunAttr{
+				{typ: attrLifetime, value: uint32ToBytes(turnDefaultLifetime)},
+			}, true)
+			if err != nil {
+				if isNetworkUnreachable(err) {
+					return
+				}
+				consecutiveFails++
+				log.Printf("[TURN-Lite] Refresh 失败 (%d/3): %v", consecutiveFails, err)
+				if consecutiveFails >= 3 {
+					log.Printf("[TURN-Lite] Refresh 连续失败 %d 次，关闭等待重建", consecutiveFails)
+					go t.Close()
+					return
+				}
+				continue
+			}
+
+			consecutiveFails = 0
+
+			if resp.msgType == msgRefreshSuccess {
+				continue
+			}
+
+			code := parseErrorCode(resp.attrs[attrErrorCode])
+			switch code {
+			case 438:
+				newNonce := resp.attrs[attrNonce]
+				if len(newNonce) > 0 {
+					t.mu.Lock()
+					t.nonce = newNonce
+					t.mu.Unlock()
+					_, err2 := t.sendRequest(msgRefreshRequest, []stunAttr{
+						{typ: attrLifetime, value: uint32ToBytes(turnDefaultLifetime)},
+					}, true)
+					if err2 != nil && !isNetworkUnreachable(err2) {
+						log.Printf("[TURN-Lite] 438 重试失败: %v", err2)
+					}
+				} else {
+					log.Printf("[TURN-Lite] 438 但响应无 nonce")
+				}
+
+			case 437:
+				log.Printf("[TURN-Lite] Refresh 被拒 437 (Allocation Mismatch)，关闭等待重建")
+				go t.Close()
+				return
+
+			default:
+				log.Printf("[TURN-Lite] Refresh 被拒: code=%d", code)
+			}
+		}
+	}
+}
+
+func (t *TURNLite) GetRelayAddr() string {
+	if t.relayAddr == nil {
 		return ""
 	}
-	return tc.relayAddr.String()
+	return t.relayAddr.String()
 }
 
-func (tc *TURNClient) Close() {
-	tc.stopOnce.Do(func() {
-		close(tc.stopCh)
+func (t *TURNLite) Close() {
+	t.stopOnce.Do(func() {
+		t.mu.Lock()
+		t.stopped = true
+		t.mu.Unlock()
+		close(t.stopCh)
 	})
-
-	tc.mu.Lock()
-	defer tc.mu.Unlock()
-	if tc.lite != nil {
-		tc.lite.Close()
-		tc.lite = nil
-	}
-	if tc.tcpAlloc != nil {
-		tc.tcpAlloc.Close()
-		tc.tcpAlloc = nil
+	if t.conn != nil {
+		_ = t.conn.Close()
 	}
 }
 
-// ============ 辅助 ============
+func uint32ToBytes(v int) []byte {
+	b := make([]byte, 4)
+	binary.BigEndian.PutUint32(b, uint32(v))
+	return b
+}
 
-func redactToken(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return raw
+func parseErrorCode(data []byte) int {
+	if len(data) < 4 {
+		return 0
 	}
-	q := u.Query()
-	if q.Get("token") != "" {
-		q.Set("token", "***")
-		u.RawQuery = q.Encode()
-	}
-	return u.String()
+	return int(data[2]&0x07)*100 + int(data[3])
 }
