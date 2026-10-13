@@ -1,23 +1,187 @@
 # n2n-android
 
-基于 Cloudflare Workers 信令服务的 Android 客户端，**配合 edge-signal 实现跨 NAT 的 P2P 虚拟组网**。
+基于 Cloudflare Workers 信令服务的 Android 客户端，配合 [edge-signal](https://github.com/goyo123321/edge-signal) 实现跨 NAT 的 P2P 虚拟组网。
 
-通过 `VpnService` 建立 TUN 虚拟网卡，只接管组网网段（`10.64.0.0/24`），其他流量走系统默认。支持 **P2P 打洞 / TURN 中继 / WebSocket 中继** 三级降级，无需 root。
+通过 `VpnService` 建立 TUN 虚拟网卡，只接管组网网段（如 `10.64.0.0/24`），其他流量走系统默认。支持 **P2P 打洞 / TURN 中继 / WebSocket 中继** 三级降级，无需 root。
+
+---
+
+## 🌐 三端协同全景
+
+`edge-signal` 服务端 + 三个客户端构成完整的异地组网系统：
+
+```
+              ┌───────────────────────────────────────────┐
+              │      edge-signal (Cloudflare Worker)      │
+              │  ├─ 信令路由                              │
+              │  ├─ NAT 打洞协调                          │
+              │  ├─ TURN 凭证下发                         │
+              │  └─ WS 中继（最后兜底）                   │
+              └──────────────┬────────────────────────────┘
+                             │
+         ┌───────────────────┼───────────────────┐
+         │                   │                   │
+         ▼                   ▼                   ▼
+   n2n-go-client       n2n-termux          n2n-android
+   ┌──────────┐       ┌──────────┐        ┌──────────┐
+   │ TUN 模式  │       │ SOCKS5   │        │ VpnService│
+   │ 系统级路由│       │ 代理模式 │        │ 无 root  │
+   │ 需 root  │       │ 无 root  │        │          │
+   └──────────┘       └──────────┘        └──────────┘
+     Linux/macOS         Android              Android
+     Windows             Termux                APK
+     路由器
+
+       LAN / P2P / TURN / WS  --  完全互通
+```
+
+### 三种客户端定位对比
+
+| 维度 | n2n-go-client | n2n-termux | n2n-android |
+|:---|:---|:---|:---|
+| **运行环境** | Linux / macOS / Windows / 路由器 | Android Termux | Android APK |
+| **数据面** | TUN 虚拟网卡 | SOCKS5 代理 | VpnService（TUN） |
+| **权限要求** | root / 管理员 | 无 root | 无 root |
+| **应用透明** | ✅ 系统级 | ⚠️ 需 App 显式配 SOCKS5 | ✅ 系统级 |
+| **协议支持** | TCP / UDP / ICMP | 仅 TCP | TCP / UDP / ICMP |
+| **使用方式** | `curl http://10.64.0.X` | `curl --socks5 127.0.0.1:1080 ...` | 同 TUN |
+| **适用场景** | 服务器 / 桌面 / 路由器 | 临时测试 / 无 root 设备 | 日常使用（手机） |
+
+---
+
+## 🔧 Termux 与 root 的运用
+
+### 场景 1：Termux 无 root（默认）
+
+使用 **[n2n-termux](https://github.com/goyo123321/n2n-termux)** —— SOCKS5 模式：
+
+- ✅ 不需要 root
+- ⚠️ 仅支持 TCP（ICMP 和 UDP 需绕行）
+- ⚠️ 每个 App 需显式配置 SOCKS5（`curl --socks5`、`ALL_PROXY` 等）
+
+```bash
+# 启动
+~/.n2n-termux/start.sh
+
+# 使用（需要显式走 SOCKS5）
+curl --socks5 127.0.0.1:1080 http://10.64.0.3:8080/
+export ALL_PROXY=socks5://127.0.0.1:1080
+```
+
+### 场景 2：Termux + root
+
+**关键认识**：**Termux 无 root 时，Android 内核拒绝创建 TUN。但有了 root，就可以绕过这个限制。**
+
+具体两种用法：
+
+#### 用法 A：用 root 直接运行 n2n-go-client
+
+```bash
+# 在 Termux 里（需要 root）
+su -c "SIGNALING_URL=... ROOM_ID=myroom CLIENT_ID=termux-root \
+  ./n2n-go-client-linux-arm64"
+```
+
+**优势**：
+- ✅ 完整的 TUN 数据面（TCP / UDP / ICMP 全支持）
+- ✅ 应用透明（无需改每个 App 的代理配置）
+- ✅ 与 PC / Android 客户端**完全对等**
+
+**限制**：
+- 需要设备已 root（Magisk / KernelSU 等）
+- Termux 里要以 root 运行：`su -c` 或 `tsu`（Termux 的 `tsu` 包）
+
+#### 用法 B：用 proot-distro 在非 root 下跑
+
+```bash
+pkg install proot-distro
+proot-distro install debian
+proot-distro login debian
+# 装 n2n-go-client，但 TUN 依然需要 root——proot 不能绕过
+```
+
+**proot 解决不了 TUN 权限**。`/dev/net/tun` 是内核级的，proot 用户态拦截不生效。
+
+**结论**：要 TUN 必须真的 root。
+
+### 场景 3：三种 Android 客户端的协作
+
+**同一台 Android 设备可以同时运行多个客户端吗？**
+
+**不建议** —— VPN 冲突。原因：
+
+- `VpnService` 是**独占**的，一台设备同时只能有一个活跃 VPN
+- SOCKS5 模式的 Termux 与 VpnService 模式的 Android APK 可以**共存**（因为 SOCKS5 不抢 VPN 权限）
+- 具体组合：
+
+| 组合 | 是否推荐 | 说明 |
+|:---|:---|:---|
+| n2n-android（VpnService） | ✅ 推荐 | 主用方式 |
+| n2n-termux（SOCKS5） | ✅ 可共存 | 与 VpnService 一起运行时，**只有 VpnService 走 TUN**，Termux 走 SOCKS5，两者**互不冲突** |
+| n2n-android + n2n-termux | ⚠️ 可共存 | VpnService 只接管组网网段，Termux 的 SOCKS5 走 `127.0.0.1`，无冲突 |
+| **n2n-android × 2** | ❌ 不行 | 两个 VpnService 会抢 VPN 权限 |
+| Clash / 其他 VPN | ⚠️ 需协调 | 与 Clash 冲突，只能同时启用一个 |
+
+**推荐配置**：
+
+- 手机日常使用 → **n2n-android**
+- 需要临时调试 / 跑脚本 → **额外**用 n2n-termux 的 SOCKS5（与 VpnService 共存）
+- 设备已 root 且想要最优性能 → **Termux + root 跑 n2n-go-client**
+
+### 场景 4：数据面差异与互通
+
+**三端数据面协议完全独立**，但**服务端与 P2P 通道层用同一套协议**（N2NS 帧 + 打洞 + TURN 中继），所以完全互通：
+
+| 主动方 | 被动方 | 数据面路径 |
+|:---|:---|:---|
+| PC（TUN） | Termux（SOCKS5） | PC 发 N2NS → Termux 收到后转发到本地 TCP |
+| Termux（SOCKS5） | PC（TUN） | Termux 发 N2NS → PC 收到后写入 TUN |
+| PC（TUN） | Android（VpnService） | 直接写 N2NS 帧（两端都是 TUN） |
+| Android（VpnService） | Termux（SOCKS5） | Android 发 N2NS → Termux 侧转发到本地 TCP |
+| Termux（SOCKS5） | Android（VpnService） | Termux 发 N2NS → Android 收到后写入 TUN |
+
+**关键**：**N2NS 帧格式在所有客户端完全一致**，所以任意两端可以直接互通。
+
+### 场景 5：LAN 直连（同 WiFi）
+
+三端**都会收集 LAN 地址**：
+
+- PC：`net.Interfaces()` + UDP connect 骗内核
+- Termux：`net.Interfaces()`（Android 有限制，主要靠 UDP connect）
+- Android：`net.Interfaces()`（过滤 tun 接口）+ UDP connect
+
+**同 WiFi 场景**：两端在打洞指令里会带上 LAN 候选，**优先扫 LAN 端口**，命中后直接走内网，延迟 <5ms。
+
+### 场景 6：CGNAT hairpin（同运营商）
+
+两端在同一运营商 CGNAT 后面时（STUN 出口 IP 相同）：
+
+1. **首次**：服务端允许一次 hairpin 尝试
+2. **失败后**：服务端下发 `force_fallback` → 三端立即降级到 TURN
+3. **已成功**：跳过
+
+**三端行为完全一致**。
+
+---
 
 ## ✨ 特性
 
 - **原生 VPN** — `VpnService` + TUN 内核栈，无需 root
 - **三级降级** — `P2P → TURN → WS`，连接永远可用
 - **P2P 直连** — STUN 探测 + NAT 打洞，延迟低至 5ms
-- **CGNAT hairpin** — 同 STUN 出口 IP 时尝试端口扫描 + probe 回发
-- **UDP 保活** — 每 5 秒刷新 STUN 映射，防止 CGNAT 端口漂移
-- **TURN 中继** — UDP transport 双栈中继，支持 Cloudflare TURN 和自建 coturn
+- **LAN 直连** — 同 WiFi 自动内网直连
+- **CGNAT hairpin** — 同 STUN 出口 IP 时尝试端口扫描 + probe 回发，失败后服务端强制降级
+- **P2P 通道保活** — 每 15 秒往对端发 N2NS PING 多目标探针，防止空闲时通道被回收
+- **TURN 中继** — 支持 Cloudflare TURN 和自建 coturn（UDP / TCP / RFC6062）
 - **WS 中继兜底** — TURN 不可用时自动降级到 Worker 转发
+- **WS 应用层隧道** — 支持 PC / Termux 通过 WS 中继访问 Android 上的服务
 - **优选 IP** — 支持 Cloudflare 优选 IP，绕过 DNS 解析加速信令
-- **断线重连** — WebSocket 指数退避重连
+- **断线重连** — WebSocket 指数退避重连 + 90 秒读超时检测下行僵死
 - **深链支持** — `n2n://connect?url=...&token=...` 一键组网
 - **主题切换** — 浅色 / 深色 / 跟随系统
 - **连接可视化** — 节点列表带 P2P / TURN / WS 徽章
+
+---
 
 ## 🏗️ 架构
 
@@ -34,6 +198,8 @@
    │   ├─ Edge                 主控制器     │
    │   ├─ WSTransport          信令         │
    │   ├─ TURNClient           TURN 主控    │
+   │   ├─ P2PStreamManager     N2NS 流     │
+   │   ├─ AppStreamManager     WS 隧道     │
    │   ├─ TUNDevice            TUN fd 包装  │
    │   └─ NetInfo              NetInfo      │
    └──────────────────────────────────────┘
@@ -41,53 +207,32 @@
             ▼
    ┌────────────────────────────────────────┐
    │   Cloudflare Worker (edge-signal)       │
-   │   ├─ 信令路由                           │
-   │   ├─ NAT 打洞协调                       │
-   │   ├─ 下发 TURN 凭证                     │
-   │   └─ WS 中继转发（最后兜底）            │
    └────────────────────────────────────────┘
             │
-            ├─ 优先级 1: P2P 打洞（含 CGNAT hairpin）
-            │  A ←──────────────→ B
-            │
-            ├─ 优先级 2: TURN 中继（少量服务器带宽）
-            │  A ──→ TURN ──→ B
-            │
-            └─ 优先级 3: WebSocket 中继（最后兜底）
-               A ──→ Worker ──→ B
+            ├─ 优先级 1: LAN 直连（同 WiFi）
+            ├─ 优先级 2: P2P 打洞（含 CGNAT hairpin）
+            ├─ 优先级 3: TURN 中继
+            └─ 优先级 4: WebSocket 中继
 ```
 
+---
+
 ## 🔥 保活机制
-
-### 为什么需要保活
-
-CGNAT（运营商级 NAT）的 UDP 映射**不是永久的**。手机上的 socket 空闲一段时间后，CGNAT 会**回收映射**。之后从同一 socket 出去的包会被分给**新端口**——这就是"上报的 `pubSocket` 端口和实际打洞端口差 840"的原因。
-
-打洞成功后，P2P 通道也依赖这个映射。如果映射被回收：
-- P2P 通道断裂
-- 之后发往对端的数据落入黑洞
-
-### 两层保活
 
 | 层 | 间隔 | 目标 | 作用 |
 |:---|:---|:---|:---|
 | **UDP 保活** | 5 秒 | 3 个 STUN 服务器 | 保 socket 的 CGNAT 映射 |
 | **P2P 通道保活** | 15 秒 | 每个 P2P 对端 | 保 A→B 会话 |
-
-**两者互补**：
-
-- **UDP 保活**：让 CGNAT 认为"这个 socket 活跃"，不回收端口
-- **P2P 通道保活**：覆盖"CGNAT 维护独立会话超时"的场景（手机息屏后 CGNAT 通常 TTL 更短）
+| **WS 心跳** | 20 秒 | 服务端 | 保 WS 连接 |
 
 **流量代价**：
-- UDP 保活：每设备每 5 秒 3 个 20 字节包 → 一天 ~50 MB
-- P2P 保活：每 P2P 对端每 15 秒 1 个 32 字节包 → 一天 ~180 KB × 对端数
-
-**电量代价**：几乎可忽略。
-
-### 数据流优先
+- UDP 保活：~50 MB/天
+- P2P 保活：~180 KB/天 × 对端数
+- 电量代价：几乎可忽略
 
 **真实数据帧天然刷新 CGNAT 映射**（最强保活）。保活机制只在**空闲时**起兜底作用。
+
+---
 
 ## 🚀 快速开始
 
@@ -105,13 +250,7 @@ export ANDROID_NDK_HOME=$HOME/Android/Sdk/ndk/26.1.10909125
 ./build-aar.sh
 ```
 
-首次构建约 1-2 分钟。输出：`app/libs/n2nclient.aar`
-
-**如果没有 NDK**，可通过 Android Studio 安装：
-
-```
-SDK Manager → SDK Tools → NDK (Side by side) → 勾选 26.1.10909125
-```
+输出：`app/libs/n2nclient.aar`
 
 ### 二、编译 APK
 
@@ -139,29 +278,58 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 **虚拟 IP 分配**：`10.64.0.2` ~ `10.64.0.254`，由服务端自动分配。
 
-## 📱 App 界面
+---
 
-### 主界面
+## 🌐 典型使用场景
 
-| 卡片 | 内容 |
-|:---|:---|
-| **状态卡片** | 运行状态、虚拟 IP、Client ID |
-| **服务器卡片** | WSS 地址、优选 IP、连接密码 |
-| **组网卡片** | 房间名、显示名、Client ID |
-| **节点列表** | 已连接节点 + 连接类型徽章（P2P / TURN / WS） |
+### 场景 A：PC ↔ Android 手机
 
-### 菜单
+**PC 访问手机上的服务**（如 ADB / HTTP 服务）：
 
-| 菜单项 | 说明 |
-|:---|:---|
-| **日志** | 实时日志 + 复制 / 清空 / 自动滚动 |
-| **主题** | 浅色 / 深色 / 跟随系统 |
+```bash
+# Android 上跑服务
+# （例如 Termux 里 python3 -m http.server 8080 --bind 0.0.0.0）
 
-### 日志页
+# PC 端直接访问
+curl http://10.64.0.x:8080/
+```
 
-- 每秒刷新一次
-- 自动滚动开关
-- 支持复制全部 / 清空日志
+### 场景 B：三端混合组网
+
+```
+PC-A (10.64.0.2)  ←→  Android-B (10.64.0.3)  ←→  Termux-C (10.64.0.4)
+```
+
+- **PC 访问 Android**：直接 `curl http://10.64.0.3:8080/`
+- **Android 访问 PC**：直接 `curl http://10.64.0.2:8080/`
+- **Termux 访问 PC**：`curl --socks5 127.0.0.1:1080 http://10.64.0.2:8080/`
+- **PC 访问 Termux**：`curl http://10.64.0.4:8080/`（Termux 端服务监听 `0.0.0.0`）
+
+### 场景 C：Android 设备做网关
+
+Android 手机作为访问其他节点的"边缘客户端"：
+
+```
+[Android-A]──组网──[PC-B]──局域网络──[数据库服务器]
+```
+
+Android 通过组网访问 PC，PC 转发到真正的内网资源。
+
+### 场景 D：Termux + Root 做全功能节点
+
+在已 root 的 Android 设备上，用 Termux 跑 n2n-go-client，**与 PC 完全对等**：
+
+```bash
+# Termux + root
+su -c "SIGNALING_URL=wss://xxx ROOM_ID=myroom CLIENT_ID=my-phone \
+  ./n2n-go-client-linux-arm64"
+```
+
+- ✅ 完整 TUN 数据面（TCP / UDP / ICMP）
+- ✅ 应用透明（系统级路由）
+- ✅ 与 PC 完全对等的使用体验
+
+---
 
 ## ⚙️ 配置项
 
@@ -176,8 +344,6 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 ### 深链
 
-支持通过 URL 一键配置并启动：
-
 ```
 n2n://connect?url=wss://xxx.workers.dev&room=myroom&token=abc&ip=104.17.128.1&auto=1
 ```
@@ -185,213 +351,27 @@ n2n://connect?url=wss://xxx.workers.dev&room=myroom&token=abc&ip=104.17.128.1&au
 | 参数 | 说明 |
 |:---|:---|
 | `url` | WSS 地址 |
-| `token` | 连接密码（对应服务端 `CONNECT_TOKEN`） |
+| `token` | 连接密码 |
 | `room` | 房间名 |
 | `cid` | Client ID |
 | `name` | 显示名 |
 | `ip` | 优选 IP |
 | `auto` | `1` 表示自动启动 VPN |
 
-也支持通过 Intent 传参：
+---
 
-```kotlin
-val intent = Intent(context, MainActivity::class.java).apply {
-    putExtra("signaling_url", "wss://xxx.workers.dev")
-    putExtra("room_id", "myroom")
-    putExtra("auto_start", true)
-}
-```
+## 📊 连接类型徽章说明
 
-## 🌐 网络路径
+App 节点列表和 Web 面板使用同一套徽章：
 
-### 三级降级
-
-```
-1. P2P 打洞 —— STUN + NAT 打洞，延迟 10~50ms
-   ↓ 失败（对称 NAT / CGNAT 池化 hairpin 不支持）
-2. TURN 中继 —— UDP transport 中继，延迟 30~100ms
-   ↓ 失败（TURN 未配置或不可达）
-3. WS 中继 —— 走 Cloudflare Worker，延迟 100~300ms
-```
-
-### CGNAT hairpin
-
-**两端 STUN 出口 IP 相同时**（同 CGNAT 后面的两个映射），部分运营商支持 hairpin NAT，部分不支持。客户端会**首次尝试一次**，成功后走 P2P；失败后 5 次连续失败即放弃，走 TURN。
-
-**端口扫描分级**：
-
-| 层 | 范围 | 累计端口数 |
+| 徽章 | 颜色 | 含义 |
 |:---|:---|:---|
-| 1 | ±3 | 7 |
-| 2 | ±10 | 21 |
-| 3 | ±20 | 41 |
-| 4 | ±30 | 61 |
-| 5 | ±60 | 121 |
-| 6 | ±100 | 201 |
+| `P2P` | 🟢 绿底 | P2P 直连，数据面已验证 |
+| `P2P~` | 🟡 黄底虚线 | P2PAvailable 中间态（打洞握手成功，数据面未验证） |
+| `TURN` | 🔵 蓝底 | TURN 中继 |
+| `WS` | 🟡 黄底 | WS 中继（最后兜底） |
 
-**每层连发 3 次**（覆盖丢包），**层间 100ms**。
-
-- 端口差小（±3）：第 1 层命中，**~300ms**
-- 端口差中等（±20）：第 3 层命中，**~900ms**
-- 完全失败：跑满 6 层，**~1.8s** 后放弃
-
-### TUN 只接管组网网段
-
-```
-VpnService.Builder
-  .addAddress("10.64.0.2", 24)
-  .addRoute("10.64.0.0", 24)   ← 只接管虚拟网段
-  .addDisallowedApplication(packageName)  ← 自己绕过 VPN
-```
-
-**效果**：微信、Chrome、系统更新等流量**完全不受影响**，只有发往 `10.64.0.x` 的包进入 VPN。
-
-### protected socket
-
-Android 一旦 VPN 启动，**所有 socket 默认走 VPN**——包括 P2P 打洞的 UDP socket 和 STUN socket。这会形成死循环（自己的 UDP 包被自己的 TUN 捕获）。
-
-**解决**：所有 P2P 相关的 socket 创建后立即 `protect(fd)`，让它们走物理网络。fd 通过 `ParcelFileDescriptor.fromDatagramSocket(socket).detachFd()` 提取。
-
-**关键**：必须用 `detachFd()`，而不是反射读 `mFd.descriptor`。反射读只是"看一眼"fd 号，PFD 仍持有它，GC 时 finalizer 会 `close(fd)` → fd 号被系统回收 → 分配给新 socket → 误关无关 socket。
-
-## 📋 启动日志
-
-启动成功后：
-
-```
-n2n-go-client 启动
-[P2P] 使用 protected UDP fd=93（绕过 VPN）
-[P2P] UDP 监听端口 42529
-[NAT] 使用 protected STUN socket fd=107
-[WS] 优选 IP: 23.227.38.65:443 (SNI=url.jyce.kdns.fr)
-[WS] 连接 wss://url.jyce.kdns.fr/ws/default-room?cid=android-xxx
-[WS] 重放 1 条早期文本消息
-[信令] 分配虚拟 IP: 10.64.0.3
-[信令] 服务端看到的本机出口 IP: 120.229.199.61（WS/TCP 出口，仅参考）
-[信令] 上报 p2p_metadata: natType=unknown publicEndpoint="" multiExit=false
-[信令] ready: 返回 1 个已有节点
-[信令] 已有节点: android-yyy vip=10.64.0.2 pub=120.239.134.13:18883 nat=HardNAT
-[TURN] 获取到 custom TURN: turn:111.171.194.230:3478
-[TURN] 尝试 UDP transport: 111.171.194.230:3478
-[TURN-Lite] ✅ Allocation 成功: relay=111.171.194.230:58277
-[TURN] ✅ UDP transport 就绪: 111.171.194.230:58277
-[Keepalive] 启动，每 5s 刷新 3 个 STUN 服务器
-[NAT] STUN 74.125.250.129:19302 → 120.239.134.13:19190
-[NAT] ⚠️ WS/STUN 出口不一致：WS=120.229.199.61 STUN=120.239.134.13 —— CGNAT 池化，打洞大概率失败
-[NAT] 探测完成: HardNAT pub=120.239.134.13:19190 multiExit=true
-[信令] 上报 p2p_metadata: natType=HardNAT publicEndpoint="120.239.134.13:19190" multiExit=true
-[Edge] 已启动 clientId=android-xxx room=default-room
-```
-
-其他节点上线时：
-
-```
-[信令] joined: from=android-yyy vip=10.64.0.2 pub=120.239.134.13:18883 nat=HardNAT
-[NAT-HOLE] 开始打洞 role=1 target=120.239.134.13:18883 rung=0 mode=3 ttl=7
-[NAT-HOLE] 模式：同 STUN IP，端口差=6，精准扫描 targetPort±106，分级 [3 10 20 30 60 100 106]
-[NAT-HOLE] tier=±3 未命中（本轮 6 个），扩大范围（累计 attempts=18）
-[P2P] 从 android-yyy (120.239.134.13) 收到打洞探测，UDP 通道可用，升级为 P2P
-[连接] android-yyy → P2P 直连（prev=）
-[NAT-HOLE] ✅ 成功 role=1 target=120.239.134.13 attempts=46 tier=±10
-```
-
-**走 TURN 时**：
-
-```
-[NAT-HOLE] ❌ 失败 role=1 target=... attempts=308
-[连接] android-yyy → TURN 中继
-```
-
-## 🔧 从源码构建
-
-### 前置要求
-
-- Go 1.21+
-- Android NDK 26.1.10909125
-- Gradle（通过 `./gradlew` 自动下载）
-
-### 构建 AAR
-
-```bash
-export ANDROID_NDK_HOME=$HOME/Android/Sdk/ndk/26.1.10909125
-./build-aar.sh
-```
-
-`build-aar.sh` 会自动：
-
-1. 检查 Go 版本
-2. 安装 gomobile（首次）
-3. 执行 `go mod tidy`
-4. 执行 `gomobile init`
-5. 用 `-javapkg com.n2n` 生成 AAR（确保包名是 `com.n2n.mobile`）
-6. 验证生成的 AAR 含 `com/n2n/mobile/Client.class`
-
-### 构建 APK
-
-```bash
-./gradlew assembleDebug    # Debug
-./gradlew assembleRelease  # Release（需签名配置）
-```
-
-### GitHub Actions 自动构建
-
-见仓库 `.github/workflows/`。
-
-## 📁 项目结构
-
-```
-n2n-android/
-├── mobile/                      # Go 客户端（gomobile 目标）
-│   ├── mobile.go               # gomobile 桥接层
-│   ├── internal/
-│   │   ├── edge.go             # 客户端主控制器（含 UDP 保活）
-│   │   ├── config.go           # 配置结构
-│   │   ├── ws_transport.go     # 信令 WebSocket（含断线重连 + 早期消息缓冲）
-│   │   ├── turn_client.go      # TURN 客户端主控
-│   │   ├── turn_lite.go        # TURN 协议实现（UDP/TCP transport）
-│   │   ├── turn_lite_tcp.go    # TURN over TCP 分帧读取
-│   │   ├── nat_probe.go        # STUN NAT 探测
-│   │   ├── nathole_executor.go # 打洞指令执行（分阶段扫描）
-│   │   ├── relay_fallback.go   # 三级降级管理器
-│   │   ├── tun.go              # TUN fd 包装
-│   │   ├── protector.go        # VpnService.protect 桥
-│   │   ├── logger.go           # 日志环形缓冲
-│   │   └── helpers.go          # 工具函数
-│   ├── go.mod
-│   ├── go.sum
-│   └── build-aar.sh
-├── app/                         # Android App
-│   ├── src/main/
-│   │   ├── java/com/n2n/android/
-│   │   │   ├── MainActivity.kt
-│   │   │   ├── N2nVpnService.kt
-│   │   │   ├── N2nController.kt
-│   │   │   ├── LogActivity.kt
-│   │   │   └── Prefs.kt
-│   │   ├── res/
-│   │   │   ├── layout/         # 布局
-│   │   │   ├── drawable/       # 图标
-│   │   │   ├── values/         # 颜色 / 字符串 / 主题（浅色）
-│   │   │   ├── values-night/   # 深色主题
-│   │   │   ├── mipmap-*/       # 应用图标
-│   │   │   └── xml/            # 配置
-│   │   └── AndroidManifest.xml
-│   ├── libs/
-│   │   └── n2nclient.aar       # 由 build-aar.sh 生成
-│   ├── build.gradle.kts
-│   └── proguard-rules.pro
-└── README.md
-```
-
-## 🔄 数据生命周期
-
-| 事件 | 行为 |
-|:---|:---|
-| App 启动 | 读取 Prefs，恢复上次配置 |
-| 点击启动 | FetchVirtualIP → 建立 TUN → 起 Go Edge |
-| 客户端断开 | 服务端标记 `online: false`，虚拟 IP 保留 30 分钟 |
-| App 停止 VPN | 关闭 TUN / UDP / STUN socket，停 Go Edge，停 Keepalive |
-| App 卸载 | 清理所有本地文件（含日志） |
+---
 
 ## 🔐 权限说明
 
@@ -403,9 +383,9 @@ n2n-android/
 | `FOREGROUND_SERVICE_SPECIAL_USE` | VPN 前台服务 |
 | `POST_NOTIFICATIONS` | 通知栏状态显示 |
 | `WAKE_LOCK` | 保持运行 |
-| `ACCESS_WIFI_STATE` | WiFi 检测 |
-| `CHANGE_WIFI_STATE` | WiFi Lock |
 | `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` | 电池优化白名单 |
+
+---
 
 ## 🚨 限制
 
@@ -426,162 +406,115 @@ n2n-android/
 | ABI | arm64-v8a / armeabi-v7a / x86_64 |
 | IPv6 | 部分支持（P2P 打洞暂只支持 IPv4） |
 
+### 与其他 VPN 冲突
+
+同一台 Android 设备**同时只能启用一个 VpnService**。与 Clash / 其他 VPN 类 App 需二选一。
+
+**SOCKS5 模式的 n2n-termux 可以与 n2n-android 共存**——两者走不同数据面（Termux 走 `127.0.0.1`，不抢 VPN 权限）。
+
+---
+
 ## ❓ 常见问题
+
+### Q: 三端可以互相访问吗？
+
+**可以，全部支持**。见上文"三端协同全景"和"典型使用场景"。
+
+- **PC ↔ Android**：都是 TUN 数据面，直接访问虚拟 IP
+- **PC ↔ Termux**：PC 走 TUN，Termux 走 SOCKS5，透明互通
+- **Android ↔ Termux**：同 PC ↔ Termux
+
+### Q: Termux 无 root 能用 TUN 吗？
+
+**不能**。Android 内核拒绝非特权 App 创建 TUN 网卡。
+
+- **Termux 无 root** → 用 [n2n-termux](https://github.com/goyo123321/n2n-termux)（SOCKS5 模式）
+- **Termux + root** → 可直接跑 n2n-go-client（TUN 模式），与 PC 完全对等
+- **不 root 且要 TUN** → 装 n2n-android APK（用 VpnService）
+
+### Q: 同一台设备能同时跑 n2n-android 和 n2n-termux 吗？
+
+**可以**，两者不冲突：
+
+- n2n-android 用 VpnService（走 TUN）
+- n2n-termux 用 SOCKS5（走 `127.0.0.1`）
+- TUN 只接管组网网段，SOCKS5 端口不受影响
+
+但**同一类型只能开一个**：两个 VpnService 会抢权限。
+
+### Q: `ping 10.64.0.3` 不通？
+
+Android 的 TUN 对 ICMP 支持不完整，部分 ROM 直接丢弃 TUN 上写回的 ICMP reply。
+
+**用 TCP 测**：
+
+```bash
+curl -v --max-time 5 http://10.64.0.3:8080/
+```
 
 ### Q: 打洞一直失败？
 
-**先看日志里有没有这几行关键信息**：
+看日志：
 
 ```
 [信令] 上报 p2p_metadata: natType=? publicEndpoint=?
-[NAT-HOLE] 公网候选 ? 个（阶段 2）
+[NAT-HOLE] 公网候选 ? 个
 ```
 
-1. **`publicEndpoint` 为空** → NAT 探测失败，STUN 服务器被封。换国内 STUN。
-2. **`natType=EasyNAT`（单样本）** → `nat_probe.go` 太旧，会误判。应显示 `HardNAT` 或 `unknown`。
-3. **`公网候选 7 个`** → 服务端 `coordinator.js` 太旧，`halfWidth` 还在用旧的窄范围。
-4. **`公网候选 13/21/41/61 个`** → 分阶段扫描，正常。
-5. **端口差 > 100** → CGNAT 映射漂移严重，保活没生效。
-
-### Q: 面板显示 `EasyNAT` 一端、`HardNAT` 另一端？
-
-**两端判定不一致**，说明一端 AAR 太旧（单样本判 EasyNAT）。
-
-**修复**：重新 `./build-aar.sh`，装**同一版本** APK 到两端。
-
-### Q: 面板 `连接状态` 显示 `--`？
-
-**客户端 `relayMgr.states` 为空**。可能：
-
-1. 服务端 `coordinator.js` 没部署最新（缺 `force_fallback` 下发）
-2. 客户端 AAR 太旧（缺 `scheduleFallbackTimer` 8 秒兜底）
-
-**修复**：两端 AAR + 服务端 `coordinator.js` 全部升级到最新。
-
-### Q: 面板显示 B 端 `p2p-A`，A 端显示 `TURN-B`（单向 P2P）？
-
-**A 的 probe 命中了 B，但 B 回发给 A 的 probe 丢包了**。
-
-**修复**：
-- 客户端改用 `hasTrafficFromTarget`（只看目标 peer 的回包）
-- 服务端 `coordinator.js` 改用 `bothSucceeded`（双方都 state=3 才认为成功）
+1. `publicEndpoint` 为空 → NAT 探测失败，STUN 服务器被封
+2. `natType=EasyNAT` 且是单样本 → 服务端探测太旧
+3. `公网候选 7 个` → 服务端 `coordinator.js` 太旧
+4. 端口差 > 100 → CGNAT 映射漂移严重
 
 ### Q: P2P 建立后过一段时间断了？
 
 **CGNAT 映射或会话被回收**。检查：
 
-1. **日志里 `[Keepalive] 启动` 有没有？**
-   - 没有 → `startKeepalive()` 没被调用（AAR 太旧）
-2. **端口是不是又漂移了？**
-   - `[信令] 上报 p2p_metadata` 的 `publicEndpoint` 变了 → 保活无效
-   - STUN 服务器被封 → 换国内 STUN
-3. **P2P 通道保活生效了吗？**
-   - 每 15 秒会往对端发 1 个 probe
-   - 太旧的版本可能没有
+1. 日志有没有 `[Keepalive] 启动` 和 `[P2P-Keepalive] 启动`
+2. `publicEndpoint` 端口是不是又漂移了
+3. P2P 通道保活是不是每 15 秒发一次 N2NS PING
 
-### Q: 连接后无法访问外网？
+### Q: 面板显示 `p2p-avail` 不是 `p2p`？
 
-**正常行为**。TUN 只接管 `10.64.0.0/24`——外网流量走系统默认。如果外网也断了，说明有**其他 VPN 正在运行**（比如 Clash、系统自带的 VPN），两者冲突。
+**`p2p-avail`** = 打洞握手成功，但 PONG 或真实数据帧还没到。
 
-### Q: `ping 10.64.0.3` 不通？
+正常 1-2 秒内会升级到 `p2p`：
 
-**Android 的 TUN 对 ICMP 支持不完整**，部分 ROM 直接丢弃 TUN 上写回的 ICMP reply。
-
-**用 TCP 测**：
-
-```bash
-# 对端开服务
-python3 -m http.server 8080
-
-# 本机测
-curl -v --max-time 5 http://10.64.0.3:8080/
+```
+[P2P] 从 xxx 收到 Punch → P2PAvailable（等待数据帧验证）
+[P2P] 收到 PONG → P2P 直连（双向通道已验证）
 ```
 
-TCP 的连接握手必须双向往返，是最干净的端到端测试。
+**一直停在 `p2p-avail`** → 30 秒后自动降级到 TURN/WS。
 
-### Q: Termux 里 ping 不通？
+### Q: 服务端 `force_fallback` 收到后没反应？
 
-同上——**Android 不允许普通 App 用 raw ICMP socket**，且 TUN 对 ICMP 支持不完整。用 `nc -zv 10.64.0.3 8080` 或 `curl` 测。
+检查日志：
+
+```
+[信令] 收到 force_fallback: 1 个 peer, reason=server-forced
+[连接] xxx → TURN 中继 (force: server-forced)
+```
+
+如果只看到第一行没有第二行 → 客户端版本太旧。
+
+### Q: PC 通过 WS 中继访问 Android 服务失败？
+
+**这是 Android 侧曾有的缺口**——`app_stream.go` 已在本版本补齐。确认：
+
+1. 两端都是最新版本
+2. Android 日志里能看到 `[STREAM] 收到 open xxx from pc-xxx`
+3. PC 端日志里有 `[STREAM] xxx → xxx:port 打开`
 
 ### Q: 耗电严重？
 
-1. 关闭其他 VPN 类 App
-2. 在系统设置里将 App 加入电池优化白名单（App 会主动引导）
+1. 关闭其他 VPN 类 App（VpnService 独占）
+2. 在系统设置里将 App 加入电池优化白名单
 3. 长时间不使用请在 App 内停止 VPN
 
-**注意**：UDP 保活（每 5 秒 3 个包）的电量开销可忽略，不是耗电原因。
+**注意**：保活（5 秒 STUN + 15 秒 P2P）的电量开销可忽略，不是耗电原因。
 
-### Q: 编译 AAR 报 "NDK 路径不存在"？
-
-```bash
-# Linux/macOS
-export ANDROID_NDK_HOME=$HOME/Android/Sdk/ndk/26.1.10909125
-
-# Windows Git Bash
-export ANDROID_NDK_HOME=/c/Users/<you>/AppData/Local/Android/Sdk/ndk/26.1.10909125
-```
-
-NDK 可通过 Android Studio 安装：`SDK Manager → SDK Tools → NDK (Side by side)`
-
-### Q: 编译报 `readTCPPacket redeclared in this block`？
-
-`turn_lite.go` 和 `turn_lite_tcp.go` 都定义了 `readTCPPacket`。**删掉 `turn_lite.go` 里的那个定义**（保留在 `turn_lite_tcp.go`）。
-
-### Q: App 启动后闪退？
-
-1. 检查是否授予了 VPN 权限
-2. 检查 `app/libs/n2nclient.aar` 是否存在（未构建 AAR 会导致 `ClassNotFoundException`）
-3. 通过 `adb logcat` 查看 `AndroidRuntime` / `N2nVpnService` 相关错误
-4. 确认 `values-night/colors.xml` 存在（缺失会导致深色模式崩溃）
-
-### Q: 服务端看到的我的 IP 和 STUN 结果不一样？
-
-**说明你在 CGNAT 池化网络里**——运营商有多个公网出口，TCP 和 UDP 从不同出口出去。日志会出现：
-
-```
-[NAT] ⚠️ WS/STUN 出口不一致：WS=120.229.199.61 STUN=120.239.134.13 —— CGNAT 池化，打洞大概率失败
-```
-
-**这种情况下 P2P 打洞成功率降低**，客户端会按以下顺序尝试：
-
-1. CGNAT hairpin（部分运营商支持，通过端口扫描 + probe 回发）
-2. TURN 中继（默认兜底）
-3. WS 中继
-
-**保活生效后**，两端 UDP 出口端口保持稳定，hairpin 成功率显著提升。**不是 bug，是网络限制**。
-
-### Q: `[WS] 重放 1 条早期文本消息` 是什么意思？
-
-**正常信息**——`ready` 消息在 handler 设置前到达，被缓冲后重放。
-
-**旧版会丢这条消息**，导致 `virtualIP` 和 `serverSeenIP` 拿不到。
-
-### Q: `[Keepalive] 已停止` 后重启 VPN 还能恢复吗？
-
-能。`[Keepalive]` 只在 `Edge.Stop()` 时退出。**VPN 停止后重启**，会重新启动 keepalive 协程。
-
-### Q: 如何验证保活是否生效？
-
-**方法 1：看端口是否稳定**
-
-反复重启 App，看 `[信令] 上报 p2p_metadata` 的 `publicEndpoint` 端口：
-
-- **保活生效**：重启后端口**跟上次一样**（CGNAT 还在缓存里）
-- **保活失效**：重启后端口**变了**（旧映射被回收）
-
-**方法 2：看打洞时的端口差**
-
-```
-[16:31:19] A 上报 publicEndpoint="...:18517"
-[16:31:30] B 上报 publicEndpoint="...:18520"    ← 端口差 3
-[16:31:30] [NAT-HOLE] ✅ 成功 (公网) tier=±3
-```
-
-**端口差 < 10 且第 1 层命中** → 保活生效。
-
-**方法 3：看 keepalive 日志**
-
-启动日志有 `[Keepalive] 启动，每 5s 刷新 3 个 STUN 服务器`。
+---
 
 ## 📄 License
 
@@ -591,6 +524,7 @@ MIT
 
 - [edge-signal](https://github.com/goyo123321/edge-signal) — 服务端（Cloudflare Workers）
 - [n2n-go-client](https://github.com/goyo123321/n2n-go-client) — 跨平台客户端（桌面 / 路由器 / 服务器）
+- [n2n-termux](https://github.com/goyo123321/n2n-termux) — Termux SOCKS5 客户端
 - [pion/stun](https://github.com/pion/stun) — STUN 协议
 - [gorilla/websocket](https://github.com/gorilla/websocket) — WebSocket
 - [gomobile](https://pkg.go.dev/golang.org/x/mobile) — Go/Kotlin 桥接
