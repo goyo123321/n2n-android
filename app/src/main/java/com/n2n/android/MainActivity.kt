@@ -262,14 +262,20 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ★ 改动：只在首次启动时弹；用户点了"稍后再说"之后不再弹
+    // ★ 改动：first-use 时机——只在"从未成功启动过 VPN"时弹
+    //
+    // 旧版无论用户点"稍后再说"还是"现在就填"，都会立刻标记 seen，
+    // 结果用户第二次打开 App 不再被提示，直接点"启动 VPN"才报错，
+    // 一脸懵。
+    //
+    // 新版：
+    //   - 未启动过 VPN + WSS 为空 → 弹提示
+    //   - 一旦启动过 VPN（N2nVpnService 里 markVpnStartedOnce）→ 永久不再弹
     private fun checkSignalingUrl() {
         if (!::binding.isInitialized) return
         val currentUrl = binding.etSignalingUrl.text.toString().trim()
         if (currentUrl.isNotEmpty()) return
-        if (Prefs.hasSeenFirstUseDialog(this)) return   // ← 新增
-
-        Prefs.markFirstUseDialogSeen(this)              // ← 新增：先标记，无论用户点啥
+        if (Prefs.hasEverStartedVpn(this)) return
 
         AlertDialog.Builder(this)
             .setTitle(getString(R.string.first_use_title))
@@ -507,11 +513,35 @@ class MainActivity : AppCompatActivity() {
             if (running) {
                 binding.tvStatus.text = getString(R.string.status_running)
                 binding.tvStatus.setTextColor(getColor(R.color.brand_success))
-                binding.tvVirtualIp.text = "虚拟 IP: ${N2nController.getVirtualIP()}"
-                binding.tvClientId.text = "Client ID: ${N2nController.getClientID()}"
-                binding.tvVirtualIp.visibility = View.VISIBLE
-                binding.tvClientId.visibility = View.VISIBLE
                 binding.cardStatus.setStrokeColor(getColor(R.color.brand_success))
+
+                // ★ 改动：VIP 空串显示"获取中..."，避免闪 "--"
+                val vip = N2nController.getVirtualIP()
+                if (vip.isEmpty()) {
+                    binding.tvVirtualIp.text = "虚拟 IP: 获取中..."
+                    binding.tvVirtualIp.setTextColor(getColor(R.color.brand_text_dim))
+                } else {
+                    binding.tvVirtualIp.text = "虚拟 IP: $vip"
+                    binding.tvVirtualIp.setTextColor(getColor(R.color.brand_text))
+                }
+                binding.tvVirtualIp.visibility = View.VISIBLE
+
+                // ★ 新增：显示虚拟网段
+                val vn = N2nController.getVirtualNetwork()
+                if (vn.isNotEmpty()) {
+                    binding.tvVirtualNetwork.text = "网段: $vn"
+                    binding.tvVirtualNetwork.visibility = View.VISIBLE
+                } else {
+                    binding.tvVirtualNetwork.visibility = View.GONE
+                }
+
+                val cid = N2nController.getClientID()
+                if (cid.isNotEmpty()) {
+                    binding.tvClientId.text = "Client ID: $cid"
+                    binding.tvClientId.visibility = View.VISIBLE
+                } else {
+                    binding.tvClientId.visibility = View.GONE
+                }
 
                 binding.btnStart.visibility = View.GONE
                 binding.btnStop.visibility = View.VISIBLE
@@ -523,6 +553,7 @@ class MainActivity : AppCompatActivity() {
                 binding.tvStatus.text = getString(R.string.status_stopped)
                 binding.tvStatus.setTextColor(getColor(R.color.brand_text_dim))
                 binding.tvVirtualIp.visibility = View.GONE
+                binding.tvVirtualNetwork.visibility = View.GONE
                 binding.tvClientId.visibility = View.GONE
                 binding.cardStatus.setStrokeColor(getColor(R.color.brand_border))
 
@@ -606,12 +637,16 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ★ 改动：徽章用 GradientDrawable 现场造圆角，替代 setBackgroundColor
+    // ★ 改动：加 p2p-avail 分支
+    //
+    // Go 侧对齐 PC 端后会上报 "p2p-avail"（打洞握手成功、数据面未验证）。
+    // 用黄色 badge 显示为 "P2P~"——与服务端面板的黄底虚线徽章视觉一致。
     private fun applyBadge(badge: android.widget.TextView?, connType: String) {
         if (badge == null) return
         try {
             val (bgRes, fgRes, label) = when (connType.lowercase()) {
                 "p2p" -> Triple(R.color.badge_p2p_bg, R.color.badge_p2p_fg, "P2P")
+                "p2p-avail" -> Triple(R.color.badge_ws_bg, R.color.badge_ws_fg, "P2P~")
                 "turn" -> Triple(R.color.badge_turn_bg, R.color.badge_turn_fg, "TURN")
                 "relay" -> Triple(R.color.badge_ws_bg, R.color.badge_ws_fg, "WS")
                 else -> Triple(R.color.brand_surface_2, R.color.brand_text_dim, "?")
