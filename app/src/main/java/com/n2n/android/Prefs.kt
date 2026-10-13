@@ -15,7 +15,10 @@ object Prefs {
     private const val KEY_CONNECT_TOKEN = "connect_token"
     private const val KEY_THEME_MODE = "theme_mode"
     private const val KEY_AUTO_CLIENT_ID = "auto_client_id"
-    private const val KEY_FIRST_USE_SEEN = "first_use_seen"   // ★ 新增
+    private const val KEY_FIRST_USE_SEEN = "first_use_seen"
+
+    // ★ 新增：是否曾成功启动过 VPN（决定首用对话框是否还弹）
+    private const val KEY_EVER_STARTED_VPN = "ever_started_vpn"
 
     private const val DEFAULT_SIGNALING_URL = ""
     private const val DEFAULT_ROOM_ID = "default-room"
@@ -126,9 +129,8 @@ object Prefs {
         return "android-" + raw.take(8)
     }
 
-    // ============ 首用提示对话框 ============
+    // ============ 首用提示 ============
 
-    // ★ 新增：只在首次启动时提示用户填 WSS 地址，避免每次冷启动都弹
     fun hasSeenFirstUseDialog(ctx: Context): Boolean =
         try {
             sp(ctx)?.getBoolean(KEY_FIRST_USE_SEEN, false) ?: false
@@ -139,6 +141,24 @@ object Prefs {
     fun markFirstUseDialogSeen(ctx: Context) {
         try {
             sp(ctx)?.edit()?.putBoolean(KEY_FIRST_USE_SEEN, true)?.apply()
+        } catch (_: Throwable) {}
+    }
+
+    // ★ 新增：是否曾成功启动过 VPN
+    //
+    // 首用提示只在"从未成功启动过"时弹——用户点"稍后再说"之后再启动
+    // App，如果 WSS 依旧为空，仍然提示一次。只要成功启动过一次，
+    // 就永远不再弹。
+    fun hasEverStartedVpn(ctx: Context): Boolean =
+        try {
+            sp(ctx)?.getBoolean(KEY_EVER_STARTED_VPN, false) ?: false
+        } catch (t: Throwable) {
+            false
+        }
+
+    fun markVpnStartedOnce(ctx: Context) {
+        try {
+            sp(ctx)?.edit()?.putBoolean(KEY_EVER_STARTED_VPN, true)?.apply()
         } catch (_: Throwable) {}
     }
 }
