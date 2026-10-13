@@ -60,6 +60,16 @@
                         android:textColor="@color/brand_text"
                         android:textSize="13sp"
                         android:visibility="gone" />
+                    <!-- ★ 新增：虚拟网段 -->
+                    <TextView
+                        android:id="@+id/tvVirtualNetwork"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="2dp"
+                        android:fontFamily="monospace"
+                        android:textColor="@color/brand_text_dim"
+                        android:textSize="11sp"
+                        android:visibility="gone" />
                     <TextView
                         android:id="@+id/tvClientId"
                         android:layout_width="match_parent"
@@ -133,7 +143,6 @@
                             android:textSize="13sp" />
                     </com.google.android.material.textfield.TextInputLayout>
 
-                    <!-- ★ CONNECT_TOKEN 带密码切换 -->
                     <com.google.android.material.textfield.TextInputLayout
                         style="@style/Widget.N2n.TextInputLayout"
                         android:layout_width="match_parent"
@@ -233,7 +242,7 @@
                 </LinearLayout>
             </com.google.android.material.card.MaterialCardView>
 
-            <!-- ========== 节点列表卡片（未运行时隐藏） ========== -->
+            <!-- ========== 节点列表卡片 ========== -->
             <com.google.android.material.card.MaterialCardView
                 android:id="@+id/cardPeers"
                 android:layout_width="match_parent"
