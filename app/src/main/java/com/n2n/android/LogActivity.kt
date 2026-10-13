@@ -1,145 +1,224 @@
-package com.n2n.android
+package internal
 
-import android.content.ClipData
-import android.content.ClipboardManager
-import android.content.Context
-import android.os.Bundle
-import android.util.Log
-import android.view.View
-import android.widget.Toast
-import androidx.appcompat.app.AppCompatActivity
-import com.n2n.android.databinding.ActivityLogBinding
+import (
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+)
 
-class LogActivity : AppCompatActivity() {
+const maxLogLines = 1000
+const rewriteEvery = 1000
 
-    companion object {
-        private const val TAG = "LogActivity"
-    }
+var (
+	logBuffer   []string
+	logBufferMu sync.RWMutex
 
-    private lateinit var binding: ActivityLogBinding
+	logFilePath string
+	logFileMu   sync.Mutex
 
-    @Volatile private var ticking = false
+	appendCounter int
+	counterMu     sync.Mutex
 
-    // ★ 新增：记录上次日志长度，未变则跳过刷新
-    @Volatile private var lastLogsLen = 0
+	// ★ 时区：由 Kotlin 侧通过 SetTimezoneOffset 设置
+	tzMu            sync.Mutex
+	tzOffsetSeconds int
+	tzSet           bool
+)
 
-    private val ticker = object : Runnable {
-        override fun run() {
-            if (!ticking) return
-            if (isFinishing || isDestroyed || !::binding.isInitialized) return
-            refresh()
-            if (ticking) binding.root.postDelayed(this, 1000)
-        }
-    }
-
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        binding = ActivityLogBinding.inflate(layoutInflater)
-        setContentView(binding.root)
-
-        binding.toolbar.setNavigationOnClickListener {
-            onBackPressedDispatcher.onBackPressed()
-        }
-
-        binding.toolbar.inflateMenu(R.menu.menu_logs)
-        binding.toolbar.setOnMenuItemClickListener { item ->
-            when (item.itemId) {
-                R.id.action_clear_logs -> {
-                    try { N2nController.clearLogs() } catch (t: Throwable) {
-                        Log.e(TAG, "clearLogs failed", t)
-                    }
-                    // ★ 清空后重置缓存长度，强制下一次刷新
-                    lastLogsLen = -1
-                    refresh()
-                    toast(getString(R.string.log_cleared))
-                    true
-                }
-                R.id.action_copy_logs -> {
-                    val logs = try { N2nController.getLogs() } catch (t: Throwable) {
-                        Log.e(TAG, "getLogs failed", t); ""
-                    }
-                    if (logs.isEmpty()) {
-                        toast(getString(R.string.log_empty_copy))
-                    } else {
-                        try {
-                            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                            cm.setPrimaryClip(ClipData.newPlainText("n2n logs", logs))
-                            toast(getString(R.string.log_copied))
-                        } catch (t: Throwable) {
-                            Log.e(TAG, "copy failed", t)
-                        }
-                    }
-                    true
-                }
-                else -> false
-            }
-        }
-
-        binding.switchAutoScroll.setOnCheckedChangeListener { _, checked ->
-            if (!::binding.isInitialized) return@setOnCheckedChangeListener
-            binding.tvAutoScroll.text = getString(
-                if (checked) R.string.log_autoscroll_on else R.string.log_autoscroll_off
-            )
-        }
-
-        // 首次刷新：重置 lastLogsLen 确保触发
-        lastLogsLen = -1
-        refresh()
-    }
-
-    override fun onStart() {
-        super.onStart()
-        if (!::binding.isInitialized) return
-        binding.root.removeCallbacks(ticker)
-        ticking = true
-        binding.root.postDelayed(ticker, 1000)
-    }
-
-    override fun onStop() {
-        super.onStop()
-        ticking = false
-        if (!::binding.isInitialized) return
-        binding.root.removeCallbacks(ticker)
-    }
-
-    override fun onDestroy() {
-        ticking = false
-        if (::binding.isInitialized) {
-            binding.root.removeCallbacks(ticker)
-        }
-        super.onDestroy()
-    }
-
-    private fun refresh() {
-        if (isFinishing || isDestroyed || !::binding.isInitialized) return
-        try {
-            val logs = N2nController.getLogs()
-
-            // ★ 日志长度没变 → 跳过（避免每秒重建 TextView）
-            if (logs.length == lastLogsLen) return
-            lastLogsLen = logs.length
-
-            val text = if (logs.isEmpty()) getString(R.string.log_empty) else logs
-            binding.tvLogs.text = text
-
-            if (binding.switchAutoScroll.isChecked) {
-                binding.scrollView.post {
-                    if (!isFinishing && !isDestroyed && ::binding.isInitialized) {
-                        try {
-                            binding.scrollView.fullScroll(View.FOCUS_DOWN)
-                        } catch (_: Throwable) {}
-                    }
-                }
-            }
-        } catch (t: Throwable) {
-            Log.e(TAG, "refresh failed", t)
-        }
-    }
-
-    private fun toast(msg: String) {
-        if (isFinishing || isDestroyed) return
-        try {
-            Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
-        } catch (_: Throwable) {}
-    }
+// SetTimezoneOffset 由 Kotlin 侧设置设备时区偏移量（秒）。
+//
+// gomobile 环境下 time.Local 默认为 UTC，且没有可靠途径读取 Android
+// 系统时区。Kotlin 侧读取 TimeZone.getDefault() 后传入。
+//
+// 允许重复调用（设备时区切换时会重新调用）。
+func SetTimezoneOffset(seconds int) {
+	tzMu.Lock()
+	defer tzMu.Unlock()
+	if tzSet && tzOffsetSeconds == seconds {
+		return
+	}
+	tzOffsetSeconds = seconds
+	tzSet = true
+	time.Local = time.FixedZone("Local", seconds)
+	fmt.Fprintf(os.Stderr, "[logger] 设置时区偏移: %+d 秒\n", seconds)
 }
+
+// ★ 新增：SetLogFilePath 由 Kotlin 侧传入 filesDir 下的日志文件绝对路径。
+//
+// 之前 init() 里硬编码 `/data/user/0/com.n2n.android/files/n2n.log`——
+// 换包名就废了，而且 init 里做文件系统探测时机不可控。
+//
+// Kotlin 侧在 App 进程启动早期（N2nVpnService.onCreate / MainActivity.onCreate）
+// 调用一次即可。重复调用会切换路径（同时保留已有 buffer）。
+func SetLogFilePath(path string) {
+	if path == "" {
+		return
+	}
+
+	logFileMu.Lock()
+	logFilePath = path
+	logFileMu.Unlock()
+
+	// 加载已有日志到内存 buffer（App 重启时保留历史）
+	if data, err := os.ReadFile(path); err == nil {
+		content := strings.TrimRight(string(data), "\n")
+		if content == "" {
+			return
+		}
+		lines := strings.Split(content, "\n")
+		if len(lines) > maxLogLines {
+			lines = lines[len(lines)-maxLogLines:]
+		}
+		logBufferMu.Lock()
+		logBuffer = lines
+		logBufferMu.Unlock()
+	}
+
+	fmt.Fprintf(os.Stderr, "[logger] 日志文件: %s\n", path)
+}
+
+// AppendLog 追加一行日志（带时间戳）。
+//
+// 时区：time.Local 已在 SetTimezoneOffset 里改为设备本地时区，
+// 因此直接 time.Now().Format 即为本地时间。
+func AppendLog(msg string) {
+	line := fmt.Sprintf("[%s] %s", time.Now().Format("15:04:05"), msg)
+
+	logBufferMu.Lock()
+	logBuffer = append(logBuffer, line)
+	if len(logBuffer) > maxLogLines {
+		logBuffer = logBuffer[len(logBuffer)-maxLogLines:]
+	}
+	logBufferMu.Unlock()
+
+	logFileMu.Lock()
+	path := logFilePath
+	logFileMu.Unlock()
+
+	if path == "" {
+		return
+	}
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err == nil {
+		_, _ = f.WriteString(line + "\n")
+		_ = f.Close()
+	}
+
+	counterMu.Lock()
+	appendCounter++
+	needRewrite := appendCounter >= rewriteEvery
+	if needRewrite {
+		appendCounter = 0
+	}
+	counterMu.Unlock()
+
+	if needRewrite {
+		rewriteLogFile(path)
+	}
+}
+
+func rewriteLogFile(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	content := strings.TrimRight(string(data), "\n")
+	if content == "" {
+		return
+	}
+	lines := strings.Split(content, "\n")
+	if len(lines) > maxLogLines {
+		lines = lines[len(lines)-maxLogLines:]
+	}
+
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, []byte(strings.Join(lines, "\n")+"\n"), 0644); err != nil {
+		return
+	}
+	_ = os.Rename(tmpPath, path)
+}
+
+func GetLogs() string {
+	logFileMu.Lock()
+	path := logFilePath
+	logFileMu.Unlock()
+
+	if path != "" {
+		if data, err := os.ReadFile(path); err == nil {
+			content := strings.TrimRight(string(data), "\n")
+			if content != "" {
+				lines := strings.Split(content, "\n")
+				if len(lines) > maxLogLines {
+					lines = lines[len(lines)-maxLogLines:]
+				}
+				logBufferMu.Lock()
+				logBuffer = lines
+				logBufferMu.Unlock()
+			}
+		}
+	}
+
+	logBufferMu.RLock()
+	defer logBufferMu.RUnlock()
+	if len(logBuffer) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.Grow(len(logBuffer) * 60)
+	for i, line := range logBuffer {
+		if i > 0 {
+			sb.WriteByte('\n')
+		}
+		sb.WriteString(line)
+	}
+	return sb.String()
+}
+
+func ClearLogs() {
+	logBufferMu.Lock()
+	logBuffer = nil
+	logBufferMu.Unlock()
+
+	logFileMu.Lock()
+	path := logFilePath
+	logFileMu.Unlock()
+
+	if path != "" {
+		_ = os.Remove(path)
+		_ = os.Remove(path + ".tmp")
+	}
+}
+
+type logWriter struct{}
+
+func (w logWriter) Write(p []byte) (int, error) {
+	msg := strings.TrimRight(string(p), "\n")
+	AppendLog(msg)
+	_, _ = fmt.Fprintln(os.Stderr, msg)
+	return len(p), nil
+}
+
+// init 只做日志重定向，不再做文件系统探测。
+//
+// 文件路径由 Kotlin 侧通过 SetLogFilePath 传入。
+func init() {
+	{
+		local := time.Now()
+		_, offset := local.Zone()
+		fmt.Fprintf(os.Stderr,
+			"[logger] 初始 TZ=%q local=%v offset=%+d秒\n",
+			os.Getenv("TZ"), time.Local, offset)
+	}
+
+	log.SetOutput(io.MultiWriter(os.Stderr, logWriter{}))
+	log.SetFlags(0)
+}
+
+// 保留 filepath 引用（如果将来需要），当前未使用
+var _ = filepath.Join
