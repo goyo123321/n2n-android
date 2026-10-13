@@ -16,6 +16,17 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// ★ 新增：读超时。
+//
+// 客户端每 20 秒发一次 ping，服务端每 30 秒主动发 server_ping。
+// 90 秒内没收到任何消息 → 认为下行通道已死（TCP 表面正常但服务端
+// 消息到达不了客户端）→ 主动重连。
+//
+// 旧版缺这个超时，遇到"下行僵死"会永远阻塞在 ReadMessage()，
+// 只有等到下次 ws.Send 写失败才触发重连——重连延迟可能达到
+// 数分钟。加读超时后最多 90 秒就恢复。
+const wsReadTimeout = 90 * time.Second
+
 type WSTransport struct {
 	conn      *websocket.Conn
 	mu        sync.Mutex
@@ -188,9 +199,14 @@ func maskToken(u string) string {
 
 // readLoop 读循环。
 //
-// ★ 改动：socket 读错误时先判断 ws.stopping，主动关闭（Close 时关掉
-//   socket）不再打错误日志。旧版先打日志再判断，会在每次正常关闭时
-//   输出 "use of closed network connection"，误导为异常。
+// ★ 改动（本轮）：
+//   1. 每次 ReadMessage 前设置 wsReadTimeout 读超时
+//   2. 识别 net.Error.Timeout() → 视为"下行僵死"
+//   3. 收到 server_ping → 立即回 server_pong，不路由给上层
+//
+// 旧版：
+//   - 无读超时 → 僵死时永远阻塞
+//   - 不处理 server_ping → 服务端每 30 秒心跳没人回
 func (ws *WSTransport) readLoop(conn *websocket.Conn) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -205,9 +221,12 @@ func (ws *WSTransport) readLoop(conn *websocket.Conn) {
 	}()
 
 	for {
+		// ★ 新增：设置读超时
+		_ = conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+
 		msgType, data, err := conn.ReadMessage()
 		if err != nil {
-			// ★ 先判 stopping：主动 Close 时静默退出
+			// 先判 stopping：主动 Close 时静默退出
 			ws.reconnectMu.Lock()
 			stopping := ws.stopping
 			ws.reconnectMu.Unlock()
@@ -216,15 +235,28 @@ func (ws *WSTransport) readLoop(conn *websocket.Conn) {
 				return
 			}
 
-			log.Printf("[WS] 读取错误: %v", err)
+			// ★ 新增：区分读超时与其他错误
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				log.Printf("[WS] 读超时 %v 未收到任何消息（下行僵死），触发重连", wsReadTimeout)
+			} else {
+				log.Printf("[WS] 读取错误: %v", err)
+			}
 			safeGo("ws-reconnect", ws.tryReconnect)
 			return
 		}
+
 		if msgType == websocket.TextMessage {
 			var msg map[string]interface{}
 			if err := json.Unmarshal(data, &msg); err != nil {
 				continue
 			}
+
+			// ★ 新增：服务端主动 ping → 立即回 pong，不路由
+			if t, _ := msg["type"].(string); t == "server_ping" {
+				_ = ws.Send(map[string]interface{}{"type": "server_pong"})
+				continue
+			}
+
 			ws.routeText(msg)
 		} else if msgType == websocket.BinaryMessage {
 			ws.routeBinary(data)
