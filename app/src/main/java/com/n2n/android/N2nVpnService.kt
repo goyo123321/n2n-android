@@ -37,8 +37,12 @@ class N2nVpnService : VpnService() {
         private const val NOTIF_CHANNEL_ID = "n2n_vpn"
         private const val NOTIF_ID = 1001
 
-        // ★ 默认虚拟网段（与服务端 DEFAULT_VIRTUAL_NETWORK 保持一致）
         private const val DEFAULT_VIRTUAL_NETWORK = "10.64.0.0/24"
+
+        // ★ 改动：MTU 从 1280 提到 1400，与 PC 端对齐
+        //   TURN Send Indication 封装后 1400 - 40（TURN 头）- 28（IP+UDP）= 1332
+        //   足够容纳 N2NS 最大帧 1221
+        private const val TUN_MTU = 1400
 
         const val ACTION_START = "com.n2n.android.START"
         const val ACTION_STOP = "com.n2n.android.STOP"
@@ -222,6 +226,10 @@ class N2nVpnService : VpnService() {
         try { super.onRevoke() } catch (_: Throwable) {}
     }
 
+    // ============================================================
+    // handleStart — 用 handler.postDelayed 替代主线程 sleep
+    // ============================================================
+
     private fun handleStart(intent: Intent) {
         if (started) {
             ktLog("handleStart: 已启动，跳过")
@@ -229,12 +237,26 @@ class N2nVpnService : VpnService() {
             return
         }
 
+        // ★ 改动：异步等待替代 Thread.sleep(300)
+        //
+        // 旧版在主线程 sleep 300ms，StrictMode 会记录，也可能擦边 ANR。
+        // 新版把重试逻辑放到 handler.postDelayed，主线程立即返回。
         if (N2nController.isRunning()) {
-            ktLog("handleStart: Controller 仍在 running，先强制停止")
+            ktLog("handleStart: Controller 仍在 running，异步等待 500ms 后重试")
             try { N2nController.stop() } catch (t: Throwable) {
                 Log.e(TAG, "force stop failed", t)
             }
-            try { Thread.sleep(300) } catch (_: InterruptedException) {}
+            val retryIntent = Intent(intent)
+            handler.postDelayed({
+                if (destroyed || stopping.get()) return@postDelayed
+                if (N2nController.isRunning()) {
+                    ktLog("handleStart: 等待后仍 running，放弃启动")
+                    stopVpn()
+                    return@postDelayed
+                }
+                handleStart(retryIntent)
+            }, 500)
+            return
         }
 
         if (!starting.compareAndSet(false, true)) {
@@ -290,7 +312,6 @@ class N2nVpnService : VpnService() {
         ktLog("Config 构造完成")
 
         Thread {
-            // ★ virtualNetwork 与 vip 一起从 fetchVirtualIP 的复合返回值拆出
             var vip = ""
             var virtualNetwork = DEFAULT_VIRTUAL_NETWORK
             var fetchOk = false
@@ -375,6 +396,8 @@ class N2nVpnService : VpnService() {
                                     started = true
                                     starting.set(false)
                                     notificationActive = true
+                                    // ★ 新增：记录曾成功启动过
+                                    try { Prefs.markVpnStartedOnce(this@N2nVpnService) } catch (_: Throwable) {}
                                     handler.post(updateIpRunnable)
                                 }
                             } catch (t: Throwable) {
@@ -391,15 +414,6 @@ class N2nVpnService : VpnService() {
         }.apply { name = "n2n-fetchvip" }.start()
     }
 
-    // ============================================================
-    // 解析 fetchVirtualIP 的复合返回值 "172.16.0.2|172.16.0.0/20"
-    // ============================================================
-    //
-    // 约定：
-    //   - 空串               → ("", DEFAULT)，调用方按失败处理
-    //   - "vip"（无分隔符）  → (vip, DEFAULT)，兼容老服务端
-    //   - "vip|cidr"         → (vip, cidr)
-    //   - "vip|"（cidr 空）  → (vip, DEFAULT)
     private fun parseReadyPayload(raw: String): Pair<String, String> {
         if (raw.isEmpty()) return "" to DEFAULT_VIRTUAL_NETWORK
 
@@ -415,9 +429,6 @@ class N2nVpnService : VpnService() {
         return vip to (cidr.ifEmpty { DEFAULT_VIRTUAL_NETWORK })
     }
 
-    // ============================================================
-    // 从 DatagramSocket 提取 fd —— 必须 detachFd
-    // ============================================================
     private fun extractFdFromDatagramSocket(socket: DatagramSocket): Int {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             try {
@@ -508,6 +519,17 @@ class N2nVpnService : VpnService() {
         try { handleStop() } catch (t: Throwable) { Log.e(TAG, "stopVpn failed", t) }
     }
 
+    // ============================================================
+    // handleStop — ★ 显式 close UDP/STUN socket
+    // ============================================================
+    //
+    // 旧版只置 null，靠 GC finalizer 关闭——但 DatagramSocket 的 fd
+    // 已被 detachFd 移交给 Go 侧。如果 finalizer 在 Go 侧 close 之后
+    // 触发（同一 fd 号已被系统复用），会误关无关 socket。
+    //
+    // 显式 close 后：
+    //   - Kotlin 侧 socket 对象进入 CLOSED 状态，finalizer 不再触发
+    //   - Go 侧的 fd close 走 EBADF（safe）
     private fun handleStop() {
         if (!stopping.compareAndSet(false, true)) {
             ktLog("handleStop: 已在清理中，忽略")
@@ -531,7 +553,19 @@ class N2nVpnService : VpnService() {
                 try { tunInterface?.close() } catch (_: Throwable) {}
                 tunInterface = null
 
+                // ★ 显式 close protected socket，避免 GC finalizer 误关
+                try {
+                    protectedUdpSocket?.let {
+                        if (!it.isClosed) it.close()
+                    }
+                } catch (_: Throwable) {}
                 protectedUdpSocket = null
+
+                try {
+                    protectedStunSocket?.let {
+                        if (!it.isClosed) it.close()
+                    }
+                } catch (_: Throwable) {}
                 protectedStunSocket = null
 
                 releaseLocks()
@@ -599,11 +633,12 @@ class N2nVpnService : VpnService() {
                 return null
             }
 
-            ktLog("建立 TUN（仅组网段），绑定 IP: $vip，网段 $networkAddr/$prefixLen")
+            ktLog("建立 TUN（仅组网段），绑定 IP: $vip，网段 $networkAddr/$prefixLen，MTU=$TUN_MTU")
 
             val builder = Builder()
                 .setSession("n2n-client")
-                .setMtu(1280)
+                // ★ 改动：MTU 1280 → 1400
+                .setMtu(TUN_MTU)
                 .addAddress(vip, prefixLen)
                 .addRoute(networkAddr, prefixLen)
 
@@ -620,10 +655,6 @@ class N2nVpnService : VpnService() {
         }
     }
 
-    // "10.64.0.0/24" → ("10.64.0.0", 24)，自动对齐网络地址
-    //
-    // ★ Kotlin 里 String.split() 返回 List<String>，长度属性是 .size
-    //   （不是 Java 的 .length），这里和 ipToInt 保持一致。
     private fun parseCidr(cidr: String): Pair<String, Int>? {
         val parts = cidr.trim().split("/")
         if (parts.size != 2) return null
