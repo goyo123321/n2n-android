@@ -31,7 +31,7 @@ type PeerInfo struct {
 	loggedReady       bool
 	hasRealData       bool
 	AssistedEndpoints []string
-	LanEndpoints      []string // ★ 第 2 轮新增
+	LanEndpoints      []string
 }
 
 type PeerSnapshot struct {
@@ -77,7 +77,7 @@ type Edge struct {
 	// N2NS P2P 流协议管理器
 	p2pStreams *P2PStreamManager
 
-	// ★ 本轮新增：WS 应用层隧道管理器（app_stream.go 使用）
+	// WS 应用层隧道管理器（app_stream.go 使用）
 	streamMgr *AppStreamManager
 
 	// Punch ACK 限流器
@@ -143,10 +143,16 @@ func generateDefaultClientID() string {
 
 const keepaliveInterval = 5 * time.Second
 
+// STUN 服务器列表（5 个，多端点冗余）
+//
+// 只要有 1 个可达，CGNAT 映射就能保持稳定。日志里曾经看到
+// "STUN 74.125.204.127:19302 超时"——多端点后不再受单点影响。
 var keepaliveServers = []string{
 	"74.125.250.129:19302",
+	"74.125.204.127:19302",
 	"162.159.207.0:3478",
 	"stun.miwifi.com:3478",
+	"stun.cloudflare.com:3478",
 }
 
 func buildSTUNBindingRequest() []byte {
@@ -165,6 +171,19 @@ func buildSTUNBindingRequest() []byte {
 	return buf
 }
 
+// startKeepalive 无条件发送 STUN Binding Request（保 CGNAT 映射）。
+//
+// ★ 修复：旧版"仅在有 peer 时发送"，导致：
+//   1. 客户端启动到新 peer 加入的空窗期（可能 1-3 分钟）
+//   2. CGNAT 映射被回收，端口漂移（实测 42 秒漂移）
+//   3. 打洞时双方用过期端口，扫描范围暴涨（实测 3208 端口）
+//
+// 新逻辑无条件发送：
+//   - 流量代价：每设备每天 ~50 MB（可接受）
+//   - 收益：CGNAT 端口稳定，打洞一次命中
+//
+// ★ Android 特有：udpConn 是 net.PacketConn（不是 *net.UDPConn），
+//   用 WriteTo 而非 WriteToUDP。
 func (e *Edge) startKeepalive() {
 	if e.udpConn == nil {
 		return
@@ -181,7 +200,7 @@ func (e *Edge) startKeepalive() {
 		return
 	}
 
-	log.Printf("[Keepalive] 启动（条件触发），每 %v 刷新 %d 个 STUN 服务器（仅在有 peer 时）",
+	log.Printf("[Keepalive] 启动，每 %v 刷新 %d 个 STUN 服务器（无条件，保 CGNAT 映射）",
 		keepaliveInterval, len(addrs))
 
 	safeGo("keepalive", func() {
@@ -192,15 +211,8 @@ func (e *Edge) startKeepalive() {
 			}
 		}
 
-		hasPeers := func() bool {
-			e.peersMu.RLock()
-			defer e.peersMu.RUnlock()
-			return len(e.peers) > 0
-		}
-
-		if hasPeers() {
-			sendOnce()
-		}
+		// 立即发一次（启动后就保活，不等 peer 加入）
+		sendOnce()
 
 		ticker := time.NewTicker(keepaliveInterval)
 		defer ticker.Stop()
@@ -210,9 +222,6 @@ func (e *Edge) startKeepalive() {
 				log.Printf("[Keepalive] 已停止")
 				return
 			case <-ticker.C:
-				if !hasPeers() {
-					continue
-				}
 				sendOnce()
 			}
 		}
@@ -399,8 +408,6 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		},
 	}
 	e.punchAckLimiter = newPunchAckLimiter()
-
-	// ★ 本轮新增：初始化 WS 应用层隧道管理器
 	e.streamMgr = NewAppStreamManager()
 
 	tun, err := setupTUNFromFD(tunFd)
@@ -481,12 +488,10 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 			e.onRemotePacket(data)
 			return
 		}
-		// N2NS 数据面
 		if isP2PFrame(data) {
 			e.handleP2PFrame(ua, true, data)
 			return
 		}
-		// Punch / ACK
 		if isPunchProbe(data) {
 			e.notePeerProbeTURN(ua)
 			return
@@ -495,7 +500,6 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 			e.notePeerAckTURN(ua)
 			return
 		}
-		// IPv4 数据包（TUN）
 		if len(data) > 0 && data[0]>>4 == 4 {
 			e.notePeerTrafficTURN(ua)
 			e.onRemotePacket(data)
@@ -506,7 +510,6 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	e.relayMgr = NewRelayManager(ws, e.turnClient, e)
 	e.relayMgr.Report(10 * time.Second)
 
-	// N2NS P2P stream manager
 	e.p2pStreams = NewP2PStreamManager(e)
 
 	ws.SetHandlers(
@@ -634,7 +637,6 @@ func (e *Edge) Stop() {
 	if e.udpConn != nil {
 		_ = e.udpConn.Close()
 	}
-	// ★ 本轮新增：清理 WS 应用层隧道
 	if e.streamMgr != nil {
 		e.streamMgr.closeAll()
 	}
@@ -839,7 +841,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	t, _ := msg["type"].(string)
 	from, _ := msg["from"].(string)
 
-	// Android WS 特有：用假消息触发重连后清理
 	if t == "_reconnected" {
 		log.Printf("[信令] WebSocket 重连成功，重新上报元数据")
 
@@ -849,7 +850,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		if e.p2pStreams != nil {
 			e.p2pStreams.closeAll()
 		}
-		// ★ 本轮新增：清理 WS 应用层隧道
 		if e.streamMgr != nil {
 			e.streamMgr.closeAll()
 		}
@@ -1049,7 +1049,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			log.Printf("[TURN] 记录 %s 的中继地址: %s", edgeMac, relayAddr)
 		}
 
-	// ★ 本轮新增：WS 应用层隧道消息
 	case "app_stream_open":
 		safeGo("app-stream-open", func() { e.onRemoteStreamOpen(msg) })
 	case "app_stream_open_ack":
@@ -1178,7 +1177,6 @@ func (e *Edge) peerExists(peerID string) bool {
 	return ok
 }
 
-// reportMetadata 上报 p2p_metadata。
 func (e *Edge) reportMetadata() {
 	e.mu.Lock()
 	nm := e.natMeta
