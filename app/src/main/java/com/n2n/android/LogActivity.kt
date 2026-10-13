@@ -20,6 +20,9 @@ class LogActivity : AppCompatActivity() {
 
     @Volatile private var ticking = false
 
+    // ★ 新增：记录上次日志长度，未变则跳过刷新
+    @Volatile private var lastLogsLen = 0
+
     private val ticker = object : Runnable {
         override fun run() {
             if (!ticking) return
@@ -45,6 +48,8 @@ class LogActivity : AppCompatActivity() {
                     try { N2nController.clearLogs() } catch (t: Throwable) {
                         Log.e(TAG, "clearLogs failed", t)
                     }
+                    // ★ 清空后重置缓存长度，强制下一次刷新
+                    lastLogsLen = -1
                     refresh()
                     toast(getString(R.string.log_cleared))
                     true
@@ -77,6 +82,8 @@ class LogActivity : AppCompatActivity() {
             )
         }
 
+        // 首次刷新：重置 lastLogsLen 确保触发
+        lastLogsLen = -1
         refresh()
     }
 
@@ -107,16 +114,20 @@ class LogActivity : AppCompatActivity() {
         if (isFinishing || isDestroyed || !::binding.isInitialized) return
         try {
             val logs = N2nController.getLogs()
+
+            // ★ 日志长度没变 → 跳过（避免每秒重建 TextView）
+            if (logs.length == lastLogsLen) return
+            lastLogsLen = logs.length
+
             val text = if (logs.isEmpty()) getString(R.string.log_empty) else logs
-            if (binding.tvLogs.text.toString() != text) {
-                binding.tvLogs.text = text
-                if (binding.switchAutoScroll.isChecked) {
-                    binding.scrollView.post {
-                        if (!isFinishing && !isDestroyed && ::binding.isInitialized) {
-                            try {
-                                binding.scrollView.fullScroll(View.FOCUS_DOWN)
-                            } catch (_: Throwable) {}
-                        }
+            binding.tvLogs.text = text
+
+            if (binding.switchAutoScroll.isChecked) {
+                binding.scrollView.post {
+                    if (!isFinishing && !isDestroyed && ::binding.isInitialized) {
+                        try {
+                            binding.scrollView.fullScroll(View.FOCUS_DOWN)
+                        } catch (_: Throwable) {}
                     }
                 }
             }
