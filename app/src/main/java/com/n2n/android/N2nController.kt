@@ -1,10 +1,12 @@
 package com.n2n.android
 
+import android.content.Context
 import android.util.Log
 import com.n2n.mobile.Client
 import com.n2n.mobile.Config
 import com.n2n.mobile.Mobile
 import com.n2n.mobile.Protector
+import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 
 object N2nController {
@@ -18,6 +20,8 @@ object N2nController {
 
     @Volatile private var tzApplied = false
     @Volatile private var tzAppliedOffset = Long.MIN_VALUE
+
+    @Volatile private var logPathApplied = false
 
     fun isRunning(): Boolean = running.get()
 
@@ -33,6 +37,22 @@ object N2nController {
             Log.i(TAG, "applySystemTimezone: ${tz.id} offset=${offsetSec}s")
         } catch (t: Throwable) {
             Log.e(TAG, "applySystemTimezone failed", t)
+        }
+    }
+
+    // ★ 新增：把 filesDir 下的日志文件路径传给 Go 侧。
+    //
+    // 之前 Go 侧 logger.go 硬编码包名，改 applicationId 就废了。
+    // 现在在 App 进程启动早期调用一次。
+    fun applyLogFilePath(ctx: Context) {
+        if (logPathApplied) return
+        try {
+            val logFile = File(ctx.filesDir, "n2n.log")
+            Mobile.setLogFilePath(logFile.absolutePath)
+            logPathApplied = true
+            Log.i(TAG, "applyLogFilePath: ${logFile.absolutePath}")
+        } catch (t: Throwable) {
+            Log.e(TAG, "applyLogFilePath failed", t)
         }
     }
 
@@ -124,7 +144,6 @@ object N2nController {
         ""
     }
 
-    // ★ 新增：暴露虚拟网段（Go Client.GetVirtualNetwork → Kotlin 属性 virtualNetwork）
     fun getVirtualNetwork(): String = try {
         synchronized(clientLock) { client }?.virtualNetwork ?: ""
     } catch (t: Throwable) {
