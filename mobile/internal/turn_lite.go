@@ -416,7 +416,12 @@ func (t *TURNLite) extractAllocateResult(resp *stunMessage) error {
 	return nil
 }
 
-func (t *TURNLite) ensurePermission(ip net.IP) error {
+// ★ 修复：ensurePermission 加 port 参数。
+//
+// 旧版传 port=0，coturn 对 XOR-PEER-ADDRESS 的 port 做合法性检查，
+// port=0 会被静默丢弃（不返回 error，直接不响应）→ CreatePermission
+// 请求超时 → TURN 中继实际不可用。
+func (t *TURNLite) ensurePermission(ip net.IP, port int) error {
 	key := ip.String()
 	t.permMu.Lock()
 	last, exists := t.permissions[key]
@@ -426,7 +431,8 @@ func (t *TURNLite) ensurePermission(ip net.IP) error {
 		return nil
 	}
 
-	peerData := xorEncodePeer(ip, 0)
+	// ★ 用真实端口，coturn 拒绝 port=0
+	peerData := xorEncodePeer(ip, port)
 
 	resp, err := t.sendRequest(msgCreatePermissionReq, []stunAttr{
 		{typ: attrXorPeerAddress, value: peerData},
@@ -470,6 +476,7 @@ func (t *TURNLite) ensurePermission(ip net.IP) error {
 	return nil
 }
 
+// ★ 修复：SendTo 传真实端口给 ensurePermission。
 func (t *TURNLite) SendTo(data []byte, peerAddr *net.UDPAddr) error {
 	if t.conn == nil {
 		return fmt.Errorf("TURN 未就绪")
@@ -477,7 +484,7 @@ func (t *TURNLite) SendTo(data []byte, peerAddr *net.UDPAddr) error {
 	if len(data) == 0 {
 		return nil
 	}
-	if err := t.ensurePermission(peerAddr.IP); err != nil {
+	if err := t.ensurePermission(peerAddr.IP, peerAddr.Port); err != nil {
 		return err
 	}
 	peerData := xorEncodePeer(peerAddr.IP, peerAddr.Port)
