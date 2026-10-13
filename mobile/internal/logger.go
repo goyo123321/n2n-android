@@ -24,7 +24,7 @@ var (
 	appendCounter int
 	counterMu     sync.Mutex
 
-	// ★ 时区：由 Kotlin 侧通过 SetTimezoneOffset 设置
+	// 时区：由 Kotlin 侧通过 SetTimezoneOffset 设置
 	tzMu            sync.Mutex
 	tzOffsetSeconds int
 	tzSet           bool
@@ -34,8 +34,6 @@ var (
 //
 // gomobile 环境下 time.Local 默认为 UTC，且没有可靠途径读取 Android
 // 系统时区。Kotlin 侧读取 TimeZone.getDefault() 后传入。
-//
-// 允许重复调用（设备时区切换时会重新调用）。
 func SetTimezoneOffset(seconds int) {
 	tzMu.Lock()
 	defer tzMu.Unlock()
@@ -48,15 +46,23 @@ func SetTimezoneOffset(seconds int) {
 	fmt.Fprintf(os.Stderr, "[logger] 设置时区偏移: %+d 秒\n", seconds)
 }
 
-func setLogFilePath(path string) {
-	logFileMu.Lock()
-	logFilePath = path
-	logFileMu.Unlock()
-
+// SetLogFilePath 由 Kotlin 侧传入 filesDir 下的日志文件绝对路径。
+//
+// 之前 init() 里硬编码 `/data/user/0/com.n2n.android/files/n2n.log`——
+// 换包名就废了，而且 init 里做文件系统探测时机不可控。
+//
+// Kotlin 侧在 App 进程启动早期（N2nVpnService.onCreate / MainActivity.onCreate）
+// 调用一次即可。重复调用会切换路径（同时保留已有 buffer）。
+func SetLogFilePath(path string) {
 	if path == "" {
 		return
 	}
 
+	logFileMu.Lock()
+	logFilePath = path
+	logFileMu.Unlock()
+
+	// 加载已有日志到内存 buffer（App 重启时保留历史）
 	if data, err := os.ReadFile(path); err == nil {
 		content := strings.TrimRight(string(data), "\n")
 		if content == "" {
@@ -70,12 +76,11 @@ func setLogFilePath(path string) {
 		logBuffer = lines
 		logBufferMu.Unlock()
 	}
+
+	fmt.Fprintf(os.Stderr, "[logger] 日志文件: %s\n", path)
 }
 
 // AppendLog 追加一行日志（带时间戳）。
-//
-// 时区：time.Local 已在 SetTimezoneOffset 里改为设备本地时区，
-// 因此直接 time.Now().Format 即为本地时间。
 func AppendLog(msg string) {
 	line := fmt.Sprintf("[%s] %s", time.Now().Format("15:04:05"), msg)
 
@@ -194,11 +199,8 @@ func (w logWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func initLogRedirection() {
-	log.SetOutput(io.MultiWriter(os.Stderr, logWriter{}))
-	log.SetFlags(0)
-}
-
+// init 只做日志重定向，不再做文件系统探测。
+// 文件路径由 Kotlin 侧通过 SetLogFilePath 传入。
 func init() {
 	{
 		local := time.Now()
@@ -208,30 +210,9 @@ func init() {
 			os.Getenv("TZ"), time.Local, offset)
 	}
 
-	initLogRedirection()
-
-	candidates := []string{
-		"/data/user/0/com.n2n.android/files/n2n.log",
-		"/data/data/com.n2n.android/files/n2n.log",
-	}
-
-	for _, p := range candidates {
-		dir := filepath.Dir(p)
-		_ = os.MkdirAll(dir, 0700)
-
-		if _, err := os.Stat(dir); err != nil {
-			continue
-		}
-
-		testFile := filepath.Join(dir, ".write_test")
-		f, err := os.Create(testFile)
-		if err != nil {
-			continue
-		}
-		_ = f.Close()
-		_ = os.Remove(testFile)
-
-		setLogFilePath(p)
-		return
-	}
+	log.SetOutput(io.MultiWriter(os.Stderr, logWriter{}))
+	log.SetFlags(0)
 }
+
+// 保留 filepath 引用（防止未使用 import 报错）
+var _ = filepath.Join
