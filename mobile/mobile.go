@@ -32,7 +32,7 @@ type Client struct {
 	stunFd         int
 	running        bool
 	virtualIP      string
-	virtualNetwork string // ★ 新增：虚拟网段
+	virtualNetwork string
 	clientID       string
 	edge           *internal.Edge
 	protector      Protector
@@ -42,6 +42,17 @@ func NewClient() *Client { return &Client{} }
 
 func SetTimezoneOffset(seconds int) {
 	internal.SetTimezoneOffset(seconds)
+}
+
+// ★ 新增：让 Kotlin 侧传入 filesDir 下的日志文件绝对路径。
+//
+// 在 App 进程启动早期调用一次即可（N2nVpnService.onCreate /
+// MainActivity.onCreate 里都可以）。
+//
+// 之前 Go 侧 logger.go 的 init() 硬编码 /data/user/0/com.n2n.android/files/n2n.log，
+// 换包名就废了；且 init 里做文件系统探测时机不可控。
+func SetLogFilePath(path string) {
+	internal.SetLogFilePath(path)
 }
 
 func (c *Client) SetTunFD(fd int) {
@@ -148,7 +159,7 @@ func (c *Client) Start(cfg *Config) (errMsg string) {
 	c.mu.Lock()
 	c.edge = edge
 	c.running = true
-	c.virtualNetwork = edge.GetVirtualNetwork() // ★ 初次拿到虚拟网段
+	c.virtualNetwork = edge.GetVirtualNetwork()
 	if cfg.ClientID != "" {
 		c.clientID = cfg.ClientID
 	} else {
@@ -177,7 +188,6 @@ func (c *Client) Start(cfg *Config) (errMsg string) {
 				c.virtualIP = vip
 				c.mu.Unlock()
 			}
-			// ★ 同步虚拟网段（服务端可能中途变更，虽然少见）
 			if vn := edgeRef.GetVirtualNetwork(); vn != "" {
 				c.mu.Lock()
 				c.virtualNetwork = vn
@@ -227,7 +237,6 @@ func (c *Client) GetVirtualIP() string {
 	return c.virtualIP
 }
 
-// ★ 新增：暴露虚拟网段
 func (c *Client) GetVirtualNetwork() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
