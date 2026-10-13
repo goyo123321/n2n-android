@@ -69,6 +69,11 @@ class MainActivity : AppCompatActivity() {
         applyThemeMode(Prefs.loadThemeMode(this))
         super.onCreate(savedInstanceState)
 
+        // ★ 本轮新增：先设置日志路径，再 applySystemTimezone
+        //   与 N2nVpnService 里的调用互补，避免"先开 App 再启 VPN"时
+        //   Go 侧日志跑偏
+        N2nController.applyLogFilePath(this)
+
         N2nController.applySystemTimezone()
 
         binding = ActivityMainBinding.inflate(layoutInflater)
@@ -262,15 +267,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ★ 改动：first-use 时机——只在"从未成功启动过 VPN"时弹
-    //
-    // 旧版无论用户点"稍后再说"还是"现在就填"，都会立刻标记 seen，
-    // 结果用户第二次打开 App 不再被提示，直接点"启动 VPN"才报错，
-    // 一脸懵。
-    //
-    // 新版：
-    //   - 未启动过 VPN + WSS 为空 → 弹提示
-    //   - 一旦启动过 VPN（N2nVpnService 里 markVpnStartedOnce）→ 永久不再弹
+    // ★ first-use 时机调整：只在"从未成功启动过 VPN"时弹
     private fun checkSignalingUrl() {
         if (!::binding.isInitialized) return
         val currentUrl = binding.etSignalingUrl.text.toString().trim()
@@ -515,7 +512,7 @@ class MainActivity : AppCompatActivity() {
                 binding.tvStatus.setTextColor(getColor(R.color.brand_success))
                 binding.cardStatus.setStrokeColor(getColor(R.color.brand_success))
 
-                // ★ 改动：VIP 空串显示"获取中..."，避免闪 "--"
+                // ★ VIP 空串显示"获取中..."，避免闪 "--"
                 val vip = N2nController.getVirtualIP()
                 if (vip.isEmpty()) {
                     binding.tvVirtualIp.text = "虚拟 IP: 获取中..."
@@ -526,7 +523,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 binding.tvVirtualIp.visibility = View.VISIBLE
 
-                // ★ 新增：显示虚拟网段
+                // ★ 显示虚拟网段
                 val vn = N2nController.getVirtualNetwork()
                 if (vn.isNotEmpty()) {
                     binding.tvVirtualNetwork.text = "网段: $vn"
@@ -637,10 +634,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ★ 改动：加 p2p-avail 分支
-    //
-    // Go 侧对齐 PC 端后会上报 "p2p-avail"（打洞握手成功、数据面未验证）。
-    // 用黄色 badge 显示为 "P2P~"——与服务端面板的黄底虚线徽章视觉一致。
+    // ★ 徽章支持 p2p-avail（黄色，与服务端面板一致）
     private fun applyBadge(badge: android.widget.TextView?, connType: String) {
         if (badge == null) return
         try {
