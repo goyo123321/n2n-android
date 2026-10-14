@@ -114,7 +114,6 @@ type P2PStream struct {
 	recvNext uint32
 	recvBuf  map[uint32][]byte
 
-	// 最近 5 秒交付过的 seq，用于消除多目标发送导致的 DUP
 	recentlyDelivered map[uint32]time.Time
 
 	localConn net.Conn
@@ -224,7 +223,6 @@ func (m *P2PStreamManager) reaper() {
 	}
 }
 
-// sendP2PProbe 向 peerID 发一个裸 P2P PING 帧（无需 stream）。
 func (m *P2PStreamManager) sendP2PProbe(peerID string) {
 	if m == nil || m.edge == nil || peerID == "" {
 		return
@@ -248,14 +246,6 @@ func (m *P2PStreamManager) sendP2PProbe(peerID string) {
 	}
 }
 
-// collectN2NSTargets 收集一个 stream 的所有候选发送地址。
-//
-// 优先级（保持顺序，去重保留首次）：
-//   1. LAN 地址（同 WiFi 场景）
-//   2. AssistedEndpoints（STUN 反射的多公网映射）
-//   3. lastRecvFrom（对端最近一次发来的源地址，最可信）
-//   4. peerAddr（注册时分配的地址 / SYN 来源地址）
-//   5. peer.UDPAddr（观测 raddr）
 func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 	s.mu.Lock()
 	primary := s.peerAddr
@@ -307,20 +297,11 @@ func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 
 // sendP2PFrame 发送一帧到对端的所有候选地址。
 //
-// ★ 修复 1：LAN 优先。
+// ★ 修复 1：LAN 优先（p.lastLANRecvAt < 60s）。
+// ★ 修复 2：控制帧全发（保 CGNAT 映射）。
+// ★ 修复 3：TURN 模式下 PING 也尝试直连（探测 LAN 恢复）。
 //
-//   - 旧判据：p.UDPAddr 是私网 且 lastRecvAt < 5s
-//     → p.UDPAddr 一旦被公网覆盖，就永远不再尝试 LAN
-//
-//   - 新判据：p.lastLANRecvAt < 60s（即 60 秒内收到过 LAN 帧）
-//     → 只要 LAN 通道存活，就优先走 LAN
-//
-// 背景：两端在同一 WiFi 时，多路径发包会导致对端 peer.UDPAddr
-// 被公网地址覆盖，回程走 CGNAT 回环（100~600ms）。用 lastLANRecvAt
-// 判据后，只要 LAN 存活 60 秒内收到过帧，就走 LAN（8~15ms）。
-//
-// ★ Android 特有：e.udpConn 是 net.PacketConn（不是 *net.UDPConn），
-//   用 WriteTo(addr) 而非 WriteToUDP。
+// ★ Android 特有：e.udpConn 是 net.PacketConn，用 WriteTo。
 func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	s.mu.Lock()
 	viaTURN := s.viaTURN
@@ -329,27 +310,52 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 
 	buf := encodeP2PFrame(f)
 
-	if viaTURN {
-		if e.turnClient == nil || !e.turnClient.IsReady() {
-			return errors.New("turn down")
-		}
-		e.peersMu.RLock()
-		var relayAddr string
-		if p := e.peers[peerID]; p != nil {
-			relayAddr = p.TurnRelayAddr
-		}
-		e.peersMu.RUnlock()
+	// 控制帧（除 DATA/ACK）在所有模式下都尝试直连
+	forceDual := f.Type != p2pTypeDATA && f.Type != p2pTypeACK
 
-		if relayAddr == "" {
-			return errors.New("peer turn relay unknown")
+	if viaTURN {
+		// TURN 模式
+		//
+		// - 普通数据帧（DATA/ACK）：只走 TURN
+		// - 控制帧（PING/PONG/SYN/SYNACK/FIN/RST）：TURN + 直连都发
+		//   直连是"试探"——如果 LAN 恢复了，命中后触发 MarkP2P
+		var directOK bool
+		var turnOK bool
+
+		if forceDual && e.udpConn != nil {
+			targets := e.collectN2NSTargets(s)
+			for _, addr := range targets {
+				if _, err := e.udpConn.WriteTo(buf, addr); err == nil {
+					directOK = true
+				}
+			}
 		}
-		ra, err := net.ResolveUDPAddr("udp", relayAddr)
-		if err != nil {
-			return fmt.Errorf("bad relay addr %q: %w", relayAddr, err)
+
+		if e.turnClient != nil && e.turnClient.IsReady() {
+			e.peersMu.RLock()
+			var relayAddr string
+			if p := e.peers[peerID]; p != nil {
+				relayAddr = p.TurnRelayAddr
+			}
+			e.peersMu.RUnlock()
+
+			if relayAddr != "" {
+				ra, err := net.ResolveUDPAddr("udp", relayAddr)
+				if err == nil {
+					if err := e.turnClient.Send(buf, ra); err == nil {
+						turnOK = true
+					}
+				}
+			}
 		}
-		return e.turnClient.Send(buf, ra)
+
+		if directOK || turnOK {
+			return nil
+		}
+		return errors.New("both direct and turn failed")
 	}
 
+	// 非 TURN 模式：走直连（LAN 优先）
 	targets := e.collectN2NSTargets(s)
 	if len(targets) == 0 {
 		return errors.New("no targets for N2NS frame")
@@ -358,9 +364,6 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 		return errors.New("no udp")
 	}
 
-	// ★ 判断 peer 是否在 LAN：改用 lastLANRecvAt
-	//
-	// 只要 60 秒内收到过 LAN 帧，就只发 LAN——不再依赖 p.UDPAddr 是公网还是 LAN。
 	e.peersMu.RLock()
 	var lanPreferred bool
 	if p := e.peers[peerID]; p != nil {
@@ -371,8 +374,8 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	}
 	e.peersMu.RUnlock()
 
-	if lanPreferred {
-		// 只发 LAN 地址
+	if lanPreferred && !forceDual {
+		// LAN-only（仅 DATA/ACK 且 peer 在 LAN）
 		sent := 0
 		for _, addr := range targets {
 			if !isPrivateIPv4(addr.IP) {
@@ -385,9 +388,9 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 		if sent > 0 {
 			return nil
 		}
-		// LAN 全失败，落到下面全发
 	}
 
+	// 全发（LAN + 公网 + assisted + ...）
 	var lastErr error
 	sent := 0
 	for _, addr := range targets {
@@ -486,7 +489,6 @@ func (s *P2PStream) abortNoConn() {
 	close(s.closeCh)
 }
 
-// acceptSYN 处理收到的 SYN 帧。幂等：多目标发送会导致同一 SYN 到达多次。
 func (m *P2PStreamManager) acceptSYN(peerID string, peerAddr *net.UDPAddr, viaTURN bool, f *p2pFrame) {
 	if len(f.Payload) < 4 {
 		return
@@ -632,11 +634,6 @@ func (m *P2PStreamManager) handleFrame(peerID string, peerAddr *net.UDPAddr, via
 	}
 }
 
-// handleData 处理 DATA 帧。
-//
-// 两级去重：
-//   1. f.Seq < recvNext → 已交付过的老帧，直接回 ACK
-//   2. recentlyDelivered 里 5 秒内交付过的 seq → 丢弃（防多路径重复）
 func (s *P2PStream) handleData(e *Edge, f *p2pFrame) {
 	var toWrite [][]byte
 
