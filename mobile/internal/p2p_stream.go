@@ -307,6 +307,10 @@ func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 
 // sendP2PFrame 发送一帧到对端的所有候选地址。
 //
+// ★ 修复：如果 peer 最近从私网地址发过包（5 秒内），只发 LAN 地址，
+// 避免多路径发包导致对端 peer.UDPAddr 被公网地址覆盖，
+// 造成"去程走 LAN、回程走公网"的不对称延迟。
+//
 // ★ Android 特有：e.udpConn 是 net.PacketConn（不是 *net.UDPConn），
 //   用 WriteTo(addr) 而非 WriteToUDP。
 func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
@@ -344,6 +348,38 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	}
 	if e.udpConn == nil {
 		return errors.New("no udp")
+	}
+
+	// ★ 判断 peer 是否在 LAN：最近 5 秒从私网地址收到过包
+	e.peersMu.RLock()
+	var lanPreferred bool
+	if p := e.peers[peerID]; p != nil {
+		if p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP) {
+			if time.Now().UnixMilli()-p.lastRecvAt < 5000 {
+				lanPreferred = true
+			}
+		}
+	}
+	e.peersMu.RUnlock()
+
+	if lanPreferred {
+		// 只发 LAN 地址
+		var lastErr error
+		sent := 0
+		for _, addr := range targets {
+			if !isPrivateIPv4(addr.IP) {
+				continue
+			}
+			if _, err := e.udpConn.WriteTo(buf, addr); err != nil {
+				lastErr = err
+			} else {
+				sent++
+			}
+		}
+		if sent > 0 {
+			return nil
+		}
+		// LAN 全失败，落到下面全发
 	}
 
 	var lastErr error
@@ -595,17 +631,11 @@ func (m *P2PStreamManager) handleFrame(peerID string, peerAddr *net.UDPAddr, via
 // 两级去重：
 //   1. f.Seq < recvNext → 已交付过的老帧，直接回 ACK
 //   2. recentlyDelivered 里 5 秒内交付过的 seq → 丢弃（防多路径重复）
-//
-// DUP 根源：sendP2PFrame 多目标发送时，对端可能从 LAN + 公网两条路径
-// 都收到同一个 DATA 帧。如果两份到达间隔极短（< 1ms），第一份交付
-// 后 recvNext++ 还没生效，第二份也会被判定为 f.Seq == recvNext →
-// 重复交付 → 上游 TCP 栈看到重复数据 → ping 显示 DUP。
 func (s *P2PStream) handleData(e *Edge, f *p2pFrame) {
 	var toWrite [][]byte
 
 	s.mu.Lock()
 
-	// ---- 去重 1：老帧 ----
 	if f.Seq < s.recvNext {
 		ackToSend := s.recvNext
 		s.mu.Unlock()
@@ -617,7 +647,6 @@ func (s *P2PStream) handleData(e *Edge, f *p2pFrame) {
 		return
 	}
 
-	// ---- 去重 2：多路径重复 ----
 	if s.recentlyDelivered == nil {
 		s.recentlyDelivered = make(map[uint32]time.Time)
 	}
