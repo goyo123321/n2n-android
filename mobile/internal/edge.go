@@ -80,6 +80,9 @@ type Edge struct {
 	// WS 应用层隧道管理器（app_stream.go 使用）
 	streamMgr *AppStreamManager
 
+	// ★ 新增：SOCKS5 入口
+	socks5Srv *Socks5Server
+
 	// Punch ACK 限流器
 	punchAckLimiter *punchAckLimiter
 
@@ -144,9 +147,6 @@ func generateDefaultClientID() string {
 const keepaliveInterval = 5 * time.Second
 
 // STUN 服务器列表（5 个，多端点冗余）
-//
-// 只要有 1 个可达，CGNAT 映射就能保持稳定。日志里曾经看到
-// "STUN 74.125.204.127:19302 超时"——多端点后不再受单点影响。
 var keepaliveServers = []string{
 	"74.125.250.129:19302",
 	"74.125.204.127:19302",
@@ -172,18 +172,6 @@ func buildSTUNBindingRequest() []byte {
 }
 
 // startKeepalive 无条件发送 STUN Binding Request（保 CGNAT 映射）。
-//
-// ★ 修复：旧版"仅在有 peer 时发送"，导致：
-//   1. 客户端启动到新 peer 加入的空窗期（可能 1-3 分钟）
-//   2. CGNAT 映射被回收，端口漂移（实测 42 秒漂移）
-//   3. 打洞时双方用过期端口，扫描范围暴涨（实测 3208 端口）
-//
-// 新逻辑无条件发送：
-//   - 流量代价：每设备每天 ~50 MB（可接受）
-//   - 收益：CGNAT 端口稳定，打洞一次命中
-//
-// ★ Android 特有：udpConn 是 net.PacketConn（不是 *net.UDPConn），
-//   用 WriteTo 而非 WriteToUDP。
 func (e *Edge) startKeepalive() {
 	if e.udpConn == nil {
 		return
@@ -211,7 +199,6 @@ func (e *Edge) startKeepalive() {
 			}
 		}
 
-		// 立即发一次（启动后就保活，不等 peer 加入）
 		sendOnce()
 
 		ticker := time.NewTicker(keepaliveInterval)
@@ -526,6 +513,13 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	e.startKeepalive()
 	e.startP2PKeepalive()
 
+	// ★ 新增：启动 SOCKS5 入口（如果配置了）
+	if cfg.Socks5Listen != "" {
+		e.socks5Srv = NewSocks5Server(e, cfg.Socks5Listen)
+		safeGo("socks5-server", func() { e.socks5Srv.Serve() })
+		log.Printf("[SOCKS5] 已启用，监听 %s", cfg.Socks5Listen)
+	}
+
 	safeGo("nat-probe", func() {
 		log.Printf("[NAT] 开始异步 STUN 探测...")
 		var meta *NATMetadata
@@ -636,6 +630,10 @@ func (e *Edge) Stop() {
 	}
 	if e.udpConn != nil {
 		_ = e.udpConn.Close()
+	}
+	// ★ 新增：清理 SOCKS5
+	if e.socks5Srv != nil {
+		e.socks5Srv.Close()
 	}
 	if e.streamMgr != nil {
 		e.streamMgr.closeAll()
@@ -1385,7 +1383,6 @@ func (e *Edge) udpReadLoop() {
 			continue
 		}
 
-		// 1. STUN Binding Response
 		if buf[0] == 0x01 && buf[1] == 0x01 {
 			if ip, port, ok := parseSTUNResponse(buf[:n]); ok {
 				e.addAssistedEndpoint(ip, port)
@@ -1393,7 +1390,6 @@ func (e *Edge) udpReadLoop() {
 			continue
 		}
 
-		// 2. N2NS 数据面
 		if isP2PFrame(buf[:n]) {
 			if ua, ok := addr.(*net.UDPAddr); ok {
 				e.handleP2PFrame(ua, false, buf[:n])
@@ -1401,7 +1397,6 @@ func (e *Edge) udpReadLoop() {
 			continue
 		}
 
-		// 3. Punch / ACK
 		if isPunchProbe(buf[:n]) {
 			if ua, ok := addr.(*net.UDPAddr); ok {
 				e.notePeerProbe(ua)
@@ -1415,7 +1410,6 @@ func (e *Edge) udpReadLoop() {
 			continue
 		}
 
-		// 4. IPv4 数据包（TUN）
 		if buf[0]>>4 == 4 {
 			if ua, ok := addr.(*net.UDPAddr); ok {
 				e.notePeerTraffic(ua)
@@ -1555,12 +1549,6 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 	e.notePeerCommon(addr, true, true, false)
 }
 
-// notePeerCommon 是打洞握手路径的统一入口。
-//
-// score 制匹配：
-//   - p.UDPAddr         分数 3~4
-//   - p.LanEndpoints    分数 2~5
-//   - p.AssistedEndpoints 分数 1~4
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
 	now := time.Now().UnixMilli()
 
