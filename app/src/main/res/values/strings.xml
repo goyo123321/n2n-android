@@ -10,6 +10,7 @@
     <!-- 卡片标题 -->
     <string name="card_server">🌐 服务器</string>
     <string name="card_network">👥 组网</string>
+    <string name="card_socks5">🔌 SOCKS5 入口</string>
     <string name="card_peers">🌐 已连接节点</string>
 
     <!-- 输入提示 -->
@@ -19,6 +20,12 @@
     <string name="hint_room">房间名</string>
     <string name="hint_node_name">显示名</string>
     <string name="hint_client_id">Client ID（可选，留空自动生成）</string>
+    <string name="hint_socks5_listen">监听地址（如 127.0.0.1:1080 或 0.0.0.0:1080）</string>
+
+    <!-- SOCKS5 说明 -->
+    <string name="socks5_desc">与 VPN 并行运行。开启后，App 内可通过 127.0.0.1:1080 访问组网服务（走 SOCKS5 代理，不经过 TUN）。\n\n若要同手机的 Termux 访问，改成 0.0.0.0:1080。</string>
+    <string name="socks5_default_listen">127.0.0.1:1080</string>
+    <string name="socks5_invalid">SOCKS5 监听地址格式不对（应为 host:port）</string>
 
     <!-- 按钮 -->
     <string name="btn_save">保存</string>
