@@ -16,9 +16,8 @@ object Prefs {
     private const val KEY_THEME_MODE = "theme_mode"
     private const val KEY_AUTO_CLIENT_ID = "auto_client_id"
     private const val KEY_FIRST_USE_SEEN = "first_use_seen"
-
-    // ★ 新增：是否曾成功启动过 VPN（决定首用对话框是否还弹）
     private const val KEY_EVER_STARTED_VPN = "ever_started_vpn"
+    private const val KEY_SOCKS5_LISTEN = "socks5_listen"   // ★ 新增
 
     private const val DEFAULT_SIGNALING_URL = ""
     private const val DEFAULT_ROOM_ID = "default-room"
@@ -94,6 +93,21 @@ object Prefs {
         } catch (_: Throwable) {}
     }
 
+    // ============ ★ 新增：SOCKS5 监听地址 ============
+
+    fun loadSocks5Listen(ctx: Context): String =
+        try {
+            sp(ctx)?.getString(KEY_SOCKS5_LISTEN, "") ?: ""
+        } catch (t: Throwable) {
+            ""
+        }
+
+    fun saveSocks5Listen(ctx: Context, value: String) {
+        try {
+            sp(ctx)?.edit()?.putString(KEY_SOCKS5_LISTEN, value)?.apply()
+        } catch (_: Throwable) {}
+    }
+
     // ============ 主题 ============
 
     fun loadThemeMode(ctx: Context): Int =
@@ -144,11 +158,8 @@ object Prefs {
         } catch (_: Throwable) {}
     }
 
-    // ★ 新增：是否曾成功启动过 VPN
-    //
-    // 首用提示只在"从未成功启动过"时弹——用户点"稍后再说"之后再启动
-    // App，如果 WSS 依旧为空，仍然提示一次。只要成功启动过一次，
-    // 就永远不再弹。
+    // ============ 曾成功启动过 VPN ============
+
     fun hasEverStartedVpn(ctx: Context): Boolean =
         try {
             sp(ctx)?.getBoolean(KEY_EVER_STARTED_VPN, false) ?: false
