@@ -230,7 +230,6 @@ func (e *Edge) startP2PKeepalive() {
 	})
 }
 
-// sendP2PKeepalive 用 N2NS PING 多目标发送 + 活性检测。
 func (e *Edge) sendP2PKeepalive() {
 	if e.relayMgr == nil || e.p2pStreams == nil {
 		return
@@ -247,7 +246,6 @@ func (e *Edge) sendP2PKeepalive() {
 		}
 		st := e.relayMgr.GetState(id)
 
-		// 只有 P2P/P2PAvailable 才做活性检测
 		if st == ConnP2P || st == ConnP2PAvailable {
 			idleMs := now - p.lastRecvAt
 			if p.lastRecvAt > 0 && idleMs > p2pIdleDeadMs {
@@ -256,7 +254,6 @@ func (e *Edge) sendP2PKeepalive() {
 			}
 		}
 
-		// 所有有过 P2P 尝试的 peer 都发 PING（含 TURN/Relay）
 		alivePeers = append(alivePeers, id)
 	}
 	e.peersMu.RUnlock()
@@ -1243,9 +1240,6 @@ func jsonInt(v interface{}) int {
 // udpAddr 来自 joined 消息的 pubIP:pubPort（永远是公网地址）。
 // 如果 peer 当前 UDPAddr 是 LAN，不要被公网覆盖——
 // 否则 SendToPeer 会走公网 CGNAT 回环（100~500ms）。
-//
-// 真正的 UDPAddr 切换由 notePeerCommon / handleP2PFrame
-// 根据实际流量决定（LAN 优先，300s 窗口）。
 func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	var udpAddr *net.UDPAddr
 	if pubIP != "" && pubPort > 0 {
@@ -1270,14 +1264,12 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string,
 			p.PubPort = pubPort
 		}
 
-		// ★ 修复：LAN 优先保护
+		// ★ LAN 优先保护
 		if udpAddr != nil {
 			oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
 			if !oldIsLAN {
-				// 当前不是 LAN（或为 nil），允许用新的公网地址
 				p.UDPAddr = udpAddr
 			}
-			// 当前是 LAN → 保留，由实际流量决定何时切换
 		}
 
 		if natType != "" {
@@ -1308,6 +1300,13 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string,
 	}
 }
 
+// ensureTargetPeer 记录指令里的目标 peer 信息。
+//
+// ★ 修复：LAN 优先保护 UDPAddr
+//
+// instr.TargetPubSocket 来自服务端 nat_hole_instruction，永远是公网。
+// 如果 peer 当前 UDPAddr 是 LAN，不要被服务端下发的公网覆盖——
+// 否则打洞成功后，服务端 30 秒重发指令会再次把 LAN 覆盖成公网。
 func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	if instr.TargetMac == "" {
 		return
@@ -1319,8 +1318,12 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	e.peersMu.Lock()
 	defer e.peersMu.Unlock()
 	if p, ok := e.peers[instr.TargetMac]; ok {
+		// ★ LAN 优先保护
 		if udpAddr != nil {
-			p.UDPAddr = udpAddr
+			oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
+			if !oldIsLAN {
+				p.UDPAddr = udpAddr
+			}
 		}
 		if instr.TargetVirtualIp != "" {
 			p.VirtualIP = instr.TargetVirtualIp
@@ -1643,16 +1646,13 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 	if best.UDPAddr == nil {
 		shouldUpdate = true
 	} else if !oldIsLAN && newIsLAN {
-		// 旧公网 → 新 LAN（LAN 优先）
 		shouldUpdate = true
 	} else if oldIsLAN && !newIsLAN {
-		// 旧 LAN → 新公网（只在 lastLANRecvAt 超过 300 秒时才切）
 		if best.lastLANRecvAt > 0 && now-best.lastLANRecvAt > 300000 {
 			shouldUpdate = true
 			log.Printf("[P2P] %s (note) LAN 超过 300s 无流量，改用公网地址", best.ClientID)
 		}
 	} else {
-		// 同类型，端口变了才更新
 		if best.UDPAddr.Port != addrPort {
 			shouldUpdate = true
 		}
