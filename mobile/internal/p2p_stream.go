@@ -32,31 +32,20 @@ const (
 	p2pMaxPayload  = 1200
 	p2pWindow      = 16
 	p2pMaxRetries  = 8
-
-	// ★ 优化：idleTimeout 120s → 300s
-	//   避免用户长时间不操作（看文档、思考等）时 stream 被误关
 	p2pIdleTimeout = 300 * time.Second
 
-	// ★ 优化：重传检查间隔独立于 RTO
-	//   RTO 动态变化，需要更频繁地检查才能及时触发重传
-	//   50ms 对应 LAN RTT 量级，能及时响应
+	// 重传检查间隔独立于 RTO
 	p2pRetxCheckInterval = 50 * time.Millisecond
 
-	// ★ 优化：RTT 采样保护
-	//   超过 10 秒的样本视为异常丢弃（防止异常阻塞污染 SRTT）
+	// RTT 采样保护：超过 10 秒的样本视为异常丢弃
 	p2pMaxRTT = 10 * time.Second
 
-	// ★ 优化：RTO 钳制范围
+	// RTO 钳制范围
 	p2pMinRTO = 100 * time.Millisecond
 	p2pMaxRTO = 2 * time.Second
 )
 
-// ★ 优化：序列号环形比较（处理 uint32 回绕）
-//
-// 用法：seqAfter(a, b) 判断 a 是否在 b 之后（考虑回绕）
-//
-// 例：a=0x00000010, b=0xFFFFFFF0 → true（a 在 b 之后）
-//     a=0xFFFFFFF0, b=0x00000010 → false（a 在 b 之前）
+// seqAfter 判断 a 是否在 b 之后（考虑 uint32 回绕）。
 func seqAfter(a, b uint32) bool {
 	return int32(a-b) > 0
 }
@@ -163,15 +152,15 @@ type P2PStream struct {
 
 	recentlyDelivered map[uint32]time.Time
 
-	// ★ RTT 测量（RFC 6298 风格）
+	// RTT 测量（RFC 6298 风格）
 	srtt   time.Duration
 	rttvar time.Duration
 
-	// ★ 快速重传（3 个重复 ACK）
+	// 快速重传（3 个重复 ACK）
 	lastAck     uint32
 	dupAckCount int
 
-	// ★ 诊断计数（用 atomic）
+	// 诊断计数
 	bytesSent   atomic.Uint64
 	bytesRecv   atomic.Uint64
 	pktsSent    atomic.Uint64
@@ -329,7 +318,6 @@ func (s *P2PStream) Stats() P2PStreamStats {
 }
 
 // updateRTTLocked 用 RFC 6298 算法更新 SRTT / RTTVAR。
-// 调用者必须持有 s.mu。
 func (s *P2PStream) updateRTTLocked(rtt time.Duration) {
 	if rtt <= 0 || rtt > p2pMaxRTT {
 		return
@@ -348,7 +336,6 @@ func (s *P2PStream) updateRTTLocked(rtt time.Duration) {
 }
 
 // rtoLocked 计算当前 RTO。
-// 调用者必须持有 s.mu。
 func (s *P2PStream) rtoLocked() time.Duration {
 	if s.srtt == 0 {
 		return 200 * time.Millisecond
@@ -364,38 +351,26 @@ func (s *P2PStream) rtoLocked() time.Duration {
 }
 
 // processAckLocked 处理 ACK 字段。
-//
-// 返回值：
-//   - fastRetx: 是否触发快速重传
-//   - fastRetxSeq: 需要重传的 seq（仅 fastRetx=true 时有效）
-//
-// 调用者必须持有 s.mu。
 func (s *P2PStream) processAckLocked(ack uint32) (bool, uint32) {
-	// 新 ACK：更新 sendBase
 	if seqAfter(ack, s.sendBase) {
-		// RTT 采样（Karn 算法：只对未重传过的最新段采样）
 		if seg, ok := s.segments[ack-1]; ok && seg.retries == 0 {
 			rtt := time.Since(seg.sentAt)
 			s.updateRTTLocked(rtt)
 		}
 
-		// 删除已确认的段（用 != 循环，考虑序列号回绕）
 		for seq := s.sendBase; seq != ack; seq++ {
 			delete(s.segments, seq)
 		}
 		s.sendBase = ack
 
-		// 重置重复 ACK 计数
 		s.lastAck = ack
 		s.dupAckCount = 0
 		return false, 0
 	}
 
-	// 重复 ACK：计数
 	if ack == s.lastAck && seqAfter(s.sendNext, ack) {
 		s.dupAckCount++
 		if s.dupAckCount == 3 {
-			// 触发快速重传：重传 sendBase 处的段
 			if _, ok := s.segments[s.sendBase]; ok {
 				log.Printf("[P2P-STREAM] %d 快速重传触发 seq=%d", s.ID, s.sendBase)
 				s.dupAckCount = 0
@@ -516,7 +491,6 @@ func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 
 // sendP2PFrame 发送一帧到对端的所有候选地址。
 //
-// ★ PC / Termux 特有：e.udpConn 是 *net.UDPConn，用 WriteToUDP。
 // ★ Android 特有：e.udpConn 是 net.PacketConn，用 WriteTo。
 func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	s.mu.Lock()
@@ -526,7 +500,6 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 
 	buf := encodeP2PFrame(f)
 
-	// 统计
 	s.pktsSent.Add(1)
 	s.bytesSent.Add(uint64(len(buf)))
 
@@ -561,7 +534,8 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 		if e.udpConn != nil {
 			targets := e.collectN2NSTargets(s)
 			for _, addr := range targets {
-				if _, err := e.udpConn.WriteToUDP(buf, addr); err != nil {
+				// ★ Android: WriteTo
+				if _, err := e.udpConn.WriteTo(buf, addr); err != nil {
 					lastErr = err
 				}
 			}
@@ -607,7 +581,8 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 			if !isPrivateIPv4(addr.IP) {
 				continue
 			}
-			if _, err := e.udpConn.WriteToUDP(buf, addr); err == nil {
+			// ★ Android: WriteTo
+			if _, err := e.udpConn.WriteTo(buf, addr); err == nil {
 				sent++
 			}
 		}
@@ -619,7 +594,8 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	var lastErr error
 	sent := 0
 	for _, addr := range targets {
-		if _, err := e.udpConn.WriteToUDP(buf, addr); err != nil {
+		// ★ Android: WriteTo
+		if _, err := e.udpConn.WriteTo(buf, addr); err != nil {
 			lastErr = err
 		} else {
 			sent++
@@ -824,7 +800,6 @@ func (m *P2PStreamManager) handleFrame(peerID string, peerAddr *net.UDPAddr, via
 		return
 	}
 
-	// 统计
 	s.pktsRecv.Add(1)
 	s.bytesRecv.Add(uint64(p2pHeaderLen + len(f.Payload)))
 
@@ -834,7 +809,6 @@ func (m *P2PStreamManager) handleFrame(peerID string, peerAddr *net.UDPAddr, via
 	s.viaTURN = viaTURN
 	s.lastAct = time.Now()
 
-	// ★ 处理 ACK 字段（更新 sendBase + RTT 采样 + dup ACK 计数）
 	var doFastRetx bool
 	var fastRetxSeq uint32
 	if f.Ack != 0 && (f.Type == p2pTypeACK || f.Type == p2pTypeDATA || f.Type == p2pTypeSYNACK) {
@@ -842,7 +816,6 @@ func (m *P2PStreamManager) handleFrame(peerID string, peerAddr *net.UDPAddr, via
 	}
 	s.mu.Unlock()
 
-	// 快速重传在锁外执行
 	if doFastRetx {
 		s.sendFastRetx(m.edge, fastRetxSeq)
 	}
@@ -871,9 +844,8 @@ func (s *P2PStream) handleData(e *Edge, f *p2pFrame) {
 
 	s.mu.Lock()
 
-	// ★ 序列号回绕安全：用 seqAfter 判断
+	// 序列号回绕安全
 	if !seqAfter(f.Seq, s.recvNext) && f.Seq != s.recvNext {
-		// f.Seq < recvNext（老帧）→ 直接回 ACK
 		ackToSend := s.recvNext
 		s.mu.Unlock()
 		_ = e.sendP2PFrame(s, &p2pFrame{
@@ -884,7 +856,7 @@ func (s *P2PStream) handleData(e *Edge, f *p2pFrame) {
 		return
 	}
 
-	// 去重 2：多路径重复
+	// 去重：多路径重复
 	if s.recentlyDelivered == nil {
 		s.recentlyDelivered = make(map[uint32]time.Time)
 	}
@@ -927,7 +899,6 @@ func (s *P2PStream) handleData(e *Edge, f *p2pFrame) {
 			}
 		}
 	} else if seqAfter(f.Seq, s.recvNext) {
-		// 乱序帧，缓存
 		if _, exists := s.recvBuf[f.Seq]; !exists {
 			cp := make([]byte, len(f.Payload))
 			copy(cp, f.Payload)
@@ -1023,8 +994,6 @@ func (s *P2PStream) retransmitLoop(e *Edge) {
 		}
 	}()
 
-	// ★ 用独立的检查间隔（不是 RTO）
-	//   RTO 是动态的，ticker 用固定值来检查
 	t := time.NewTicker(p2pRetxCheckInterval)
 	defer t.Stop()
 
@@ -1046,7 +1015,6 @@ func (s *P2PStream) retransmitLoop(e *Edge) {
 		var toResend []*p2pSeg
 		var kill bool
 
-		// ★ 用 != 循环 + 序列号回绕安全
 		for seq := s.sendBase; seq != s.sendNext; seq++ {
 			seg, ok := s.segments[seq]
 			if !ok {
