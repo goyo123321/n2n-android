@@ -223,6 +223,7 @@ func (m *P2PStreamManager) reaper() {
 	}
 }
 
+// sendP2PProbe 向 peerID 发一个裸 P2P PING 帧（无需 stream）。
 func (m *P2PStreamManager) sendP2PProbe(peerID string) {
 	if m == nil || m.edge == nil || peerID == "" {
 		return
@@ -246,6 +247,7 @@ func (m *P2PStreamManager) sendP2PProbe(peerID string) {
 	}
 }
 
+// collectN2NSTargets 收集一个 stream 的所有候选发送地址。
 func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 	s.mu.Lock()
 	primary := s.peerAddr
@@ -297,9 +299,13 @@ func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 
 // sendP2PFrame 发送一帧到对端的所有候选地址。
 //
-// ★ 修复 1：LAN 优先（p.lastLANRecvAt < 60s）。
+// ★ 修复 1：LAN 优先。
 // ★ 修复 2：控制帧全发（保 CGNAT 映射）。
 // ★ 修复 3：TURN 模式下 PING 也尝试直连（探测 LAN 恢复）。
+//
+//   场景：P2P 曾经死过，被 ForceFallback 到 TURN。
+//   如果 LAN 恢复了，直连 PING 会命中，对端回 PONG（也走直连），
+//   触发 handleP2PFrame 里的"收到 PONG → MarkP2P"，自动切回 P2P。
 //
 // ★ Android 特有：e.udpConn 是 net.PacketConn，用 WriteTo。
 func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
@@ -310,28 +316,21 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 
 	buf := encodeP2PFrame(f)
 
-	// 控制帧（除 DATA/ACK）在所有模式下都尝试直连
+	// ★ 控制帧定义：除了 DATA/ACK 之外都是控制帧
+	//
+	// PING/PONG：15 秒一次，保 A↔B 双向 CGNAT 映射
+	// SYN/SYNACK/FIN/RST：建流/关流可靠性
+	// DATA/ACK：高频数据帧，LAN-only 省带宽
 	forceDual := f.Type != p2pTypeDATA && f.Type != p2pTypeACK
 
+	// ============ TURN 模式 ============
 	if viaTURN {
-		// TURN 模式
-		//
-		// - 普通数据帧（DATA/ACK）：只走 TURN
-		// - 控制帧（PING/PONG/SYN/SYNACK/FIN/RST）：TURN + 直连都发
-		//   直连是"试探"——如果 LAN 恢复了，命中后触发 MarkP2P
-		var directOK bool
-		var turnOK bool
-
-		if forceDual && e.udpConn != nil {
-			targets := e.collectN2NSTargets(s)
-			for _, addr := range targets {
-				if _, err := e.udpConn.WriteTo(buf, addr); err == nil {
-					directOK = true
-				}
-			}
+		if e.turnClient == nil || !e.turnClient.IsReady() {
+			return errors.New("turn down")
 		}
 
-		if e.turnClient != nil && e.turnClient.IsReady() {
+		if !forceDual {
+			// 数据帧：只走 TURN
 			e.peersMu.RLock()
 			var relayAddr string
 			if p := e.peers[peerID]; p != nil {
@@ -339,23 +338,50 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 			}
 			e.peersMu.RUnlock()
 
-			if relayAddr != "" {
-				ra, err := net.ResolveUDPAddr("udp", relayAddr)
-				if err == nil {
-					if err := e.turnClient.Send(buf, ra); err == nil {
-						turnOK = true
-					}
+			if relayAddr == "" {
+				return errors.New("peer turn relay unknown")
+			}
+			ra, err := net.ResolveUDPAddr("udp", relayAddr)
+			if err != nil {
+				return fmt.Errorf("bad relay addr %q: %w", relayAddr, err)
+			}
+			return e.turnClient.Send(buf, ra)
+		}
+
+		// ★ 控制帧在 TURN 模式：TURN + 直连试探都发
+		//
+		// TURN 保证 PING 一定到达对端（哪怕直连全断）
+		// 直连是"试探"——如果 LAN 恢复了，命中后触发 MarkP2P
+		var lastErr error
+
+		// 1. 直连路径（LAN + 公网所有候选）
+		if e.udpConn != nil {
+			targets := e.collectN2NSTargets(s)
+			for _, addr := range targets {
+				if _, err := e.udpConn.WriteTo(buf, addr); err != nil {
+					lastErr = err
 				}
 			}
 		}
 
-		if directOK || turnOK {
-			return nil
+		// 2. TURN 路径
+		e.peersMu.RLock()
+		var relayAddr string
+		if p := e.peers[peerID]; p != nil {
+			relayAddr = p.TurnRelayAddr
 		}
-		return errors.New("both direct and turn failed")
+		e.peersMu.RUnlock()
+		if relayAddr != "" {
+			ra, err := net.ResolveUDPAddr("udp", relayAddr)
+			if err == nil {
+				_ = e.turnClient.Send(buf, ra)
+			}
+		}
+
+		return lastErr
 	}
 
-	// 非 TURN 模式：走直连（LAN 优先）
+	// ============ 非 TURN 模式 ============
 	targets := e.collectN2NSTargets(s)
 	if len(targets) == 0 {
 		return errors.New("no targets for N2NS frame")
@@ -375,7 +401,7 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	e.peersMu.RUnlock()
 
 	if lanPreferred && !forceDual {
-		// LAN-only（仅 DATA/ACK 且 peer 在 LAN）
+		// 只发 LAN 地址（仅 DATA/ACK 且 peer 在 LAN）
 		sent := 0
 		for _, addr := range targets {
 			if !isPrivateIPv4(addr.IP) {
@@ -388,6 +414,7 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 		if sent > 0 {
 			return nil
 		}
+		// LAN 全失败，落到下面全发
 	}
 
 	// 全发（LAN + 公网 + assisted + ...）
