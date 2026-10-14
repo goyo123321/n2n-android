@@ -307,7 +307,7 @@ func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 
 // sendP2PFrame 发送一帧到对端的所有候选地址。
 //
-// ★ 修复：如果 peer 最近从私网地址发过包（5 秒内），只发 LAN 地址，
+// ★ 修复 1：如果 peer 最近从私网地址发过包（5 秒内），只发 LAN 地址，
 // 避免多路径发包导致对端 peer.UDPAddr 被公网地址覆盖，
 // 造成"去程走 LAN、回程走公网"的不对称延迟。
 //
@@ -364,15 +364,15 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 
 	if lanPreferred {
 		// 只发 LAN 地址
-		var lastErr error
+		//
+		// ★ 修复编译错误：这里不再声明 lastErr（sent=0 会 fall through
+		//   到全发逻辑，lastErr 从未被读取）。
 		sent := 0
 		for _, addr := range targets {
 			if !isPrivateIPv4(addr.IP) {
 				continue
 			}
-			if _, err := e.udpConn.WriteTo(buf, addr); err != nil {
-				lastErr = err
-			} else {
+			if _, err := e.udpConn.WriteTo(buf, addr); err == nil {
 				sent++
 			}
 		}
