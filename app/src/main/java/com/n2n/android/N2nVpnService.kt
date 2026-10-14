@@ -39,7 +39,7 @@ class N2nVpnService : VpnService() {
 
         private const val DEFAULT_VIRTUAL_NETWORK = "10.64.0.0/24"
 
-        // ★ 与 PC 端对齐：MTU 1280 → 1400
+        // MTU 与 PC 端对齐
         private const val TUN_MTU = 1400
 
         const val ACTION_START = "com.n2n.android.START"
@@ -51,6 +51,7 @@ class N2nVpnService : VpnService() {
         const val EXTRA_NODE_NAME = "node_name"
         const val EXTRA_CONNECT_TOKEN = "connect_token"
         const val EXTRA_PREFERRED_IP = "preferred_ip"
+        const val EXTRA_SOCKS5_LISTEN = "socks5_listen"   // ★ 新增
 
         private val crashHandlerInstalled = AtomicBoolean(false)
     }
@@ -112,10 +113,8 @@ class N2nVpnService : VpnService() {
             val ts = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
             val line = "[$ts] [K] $msg"
 
-            // 优先用 filesDir（进程内可达）
             val candidates = mutableListOf<File>()
             try { candidates.add(File(filesDir, "n2n.log")) } catch (_: Throwable) {}
-            // 兜底：硬编码路径（改包名后失效，但 Go 侧已改用 SetLogFilePath）
             candidates.add(File("/data/user/0/$packageName/files/n2n.log"))
             candidates.add(File("/data/data/$packageName/files/n2n.log"))
 
@@ -161,10 +160,7 @@ class N2nVpnService : VpnService() {
     override fun onCreate() {
         super.onCreate()
 
-        // ★ 本轮新增：先设置日志路径，再 applySystemTimezone
-        //   确保 Go 侧所有日志都写到 filesDir 下的 n2n.log
         N2nController.applyLogFilePath(this)
-
         N2nController.applySystemTimezone()
         installCrashHandler()
 
@@ -231,7 +227,7 @@ class N2nVpnService : VpnService() {
     }
 
     // ============================================================
-    // handleStart — 用 handler.postDelayed 替代主线程 sleep
+    // handleStart
     // ============================================================
 
     private fun handleStart(intent: Intent) {
@@ -241,7 +237,6 @@ class N2nVpnService : VpnService() {
             return
         }
 
-        // ★ 异步等待替代 Thread.sleep(300)，避免主线程阻塞
         if (N2nController.isRunning()) {
             ktLog("handleStart: Controller 仍在 running，异步等待 500ms 后重试")
             try { N2nController.stop() } catch (t: Throwable) {
@@ -280,8 +275,9 @@ class N2nVpnService : VpnService() {
         val clientId = intent.getStringExtra(EXTRA_CLIENT_ID) ?: ""
         val nodeName = intent.getStringExtra(EXTRA_NODE_NAME) ?: "Android"
         val connectToken = intent.getStringExtra(EXTRA_CONNECT_TOKEN) ?: ""
+        val socks5Listen = intent.getStringExtra(EXTRA_SOCKS5_LISTEN) ?: ""   // ★ 新增
 
-        ktLog("参数读取完成 room=$roomId token=${if (connectToken.isEmpty()) "<empty>" else "***"}")
+        ktLog("参数读取完成 room=$roomId token=${if (connectToken.isEmpty()) "<empty>" else "***"} socks5=${if (socks5Listen.isEmpty()) "<disabled>" else socks5Listen}")
 
         try {
             updateNotification("正在获取虚拟 IP...")
@@ -303,6 +299,7 @@ class N2nVpnService : VpnService() {
                 setConnectToken(connectToken)
                 setPreferredIP(preferredIp)
                 setPreferredPort(443)
+                setSocks5Listen(socks5Listen)   // ★ 新增
             }
         } catch (t: Throwable) {
             ktLog("Config 构造失败: ${t.message}")
@@ -397,7 +394,6 @@ class N2nVpnService : VpnService() {
                                     started = true
                                     starting.set(false)
                                     notificationActive = true
-                                    // ★ 记录曾成功启动过 VPN
                                     try { Prefs.markVpnStartedOnce(this@N2nVpnService) } catch (_: Throwable) {}
                                     handler.post(updateIpRunnable)
                                 }
@@ -520,17 +516,6 @@ class N2nVpnService : VpnService() {
         try { handleStop() } catch (t: Throwable) { Log.e(TAG, "stopVpn failed", t) }
     }
 
-    // ============================================================
-    // handleStop — ★ 显式 close UDP/STUN socket
-    // ============================================================
-    //
-    // 旧版只置 null，靠 GC finalizer 关闭——但 DatagramSocket 的 fd
-    // 已被 detachFd 移交给 Go 侧。如果 finalizer 在 Go 侧 close 之后
-    // 触发（同一 fd 号已被系统复用），会误关无关 socket。
-    //
-    // 显式 close 后：
-    //   - Kotlin 侧 socket 对象进入 CLOSED 状态，finalizer 不再触发
-    //   - Go 侧的 fd close 走 EBADF（safe）
     private fun handleStop() {
         if (!stopping.compareAndSet(false, true)) {
             ktLog("handleStop: 已在清理中，忽略")
@@ -554,7 +539,6 @@ class N2nVpnService : VpnService() {
                 try { tunInterface?.close() } catch (_: Throwable) {}
                 tunInterface = null
 
-                // ★ 显式 close protected socket
                 try {
                     protectedUdpSocket?.let {
                         if (!it.isClosed) it.close()
@@ -617,9 +601,6 @@ class N2nVpnService : VpnService() {
         wifiLock = null
     }
 
-    // ============================================================
-    // 建立 TUN —— 按服务端下发的网段动态配置
-    // ============================================================
     private fun buildTunInterface(vip: String, virtualNetwork: String): ParcelFileDescriptor? {
         return try {
             val parsed = parseCidr(virtualNetwork)
