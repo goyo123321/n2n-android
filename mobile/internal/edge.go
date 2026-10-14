@@ -28,7 +28,7 @@ type PeerInfo struct {
 	TurnRelayAddr     string
 	UDPAddr           *net.UDPAddr
 	lastRecvAt        int64
-	lastLANRecvAt     int64
+	lastLANRecvAt     int64 // ★ 最近一次收到 LAN 帧的时间
 	loggedReady       bool
 	hasRealData       bool
 	AssistedEndpoints []string
@@ -71,15 +71,20 @@ type Edge struct {
 	fallbackTimers   map[string]*time.Timer
 	fallbackTimersMu sync.Mutex
 
+	// P2PAvailable 超时降级定时器
 	p2pAvailTimers   map[string]*time.Timer
 	p2pAvailTimersMu sync.Mutex
 
+	// N2NS P2P 流协议管理器
 	p2pStreams *P2PStreamManager
-	streamMgr  *AppStreamManager
+
+	// WS 应用层隧道管理器（app_stream.go 使用）
+	streamMgr *AppStreamManager
 
 	// SOCKS5 入口
 	socks5Srv *Socks5Server
 
+	// Punch ACK 限流器
 	punchAckLimiter *punchAckLimiter
 
 	lastNoPeerLog   map[string]int64
@@ -142,6 +147,7 @@ func generateDefaultClientID() string {
 
 const keepaliveInterval = 5 * time.Second
 
+// STUN 服务器列表（5 个，多端点冗余）
 var keepaliveServers = []string{
 	"74.125.250.129:19302",
 	"74.125.204.127:19302",
@@ -166,6 +172,7 @@ func buildSTUNBindingRequest() []byte {
 	return buf
 }
 
+// startKeepalive 无条件发送 STUN Binding Request（保 CGNAT 映射）。
 func (e *Edge) startKeepalive() {
 	if e.udpConn == nil {
 		return
@@ -213,28 +220,49 @@ func (e *Edge) startKeepalive() {
 
 const p2pKeepaliveInterval = 15 * time.Second
 
-// p2pNoTrafficFallbackMs P2P 无流量判定阈值。
-//
-// 60 秒 = 4 个 PING 周期。容忍偶发丢包，但不至于卡太久。
-const p2pNoTrafficFallbackMs = 60000
+// P2P 活性检测阈值：60 秒无任何流量（PING/PONG/DATA/ACK）→ 强制降级
+const p2pIdleDeadMs = 60000
+
+func (e *Edge) startP2PKeepalive() {
+	log.Printf("[P2P-Keepalive] 启动，每 %v 刷新 P2P 通道", p2pKeepaliveInterval)
+
+	safeGo("p2p-keepalive", func() {
+		ticker := time.NewTicker(p2pKeepaliveInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-e.doneCh:
+				log.Printf("[P2P-Keepalive] 已停止")
+				return
+			case <-ticker.C:
+				e.sendP2PKeepalive()
+			}
+		}
+	})
+}
 
 // sendP2PKeepalive 用 N2NS PING 多目标发送 + 活性检测。
 //
-// ★ 修复：活性检测
+// ★ 活性检测
 //
-//   P2P 通道可能因为以下原因静默死掉：
+//   P2P 通道可能因以下原因静默死掉：
 //     - LAN 断了 + CGNAT 映射被回收
 //     - 双方路由器状态变化
 //     - 运营商 NAT 抖动
 //
-//   UDP 是无连接的，WriteToUDP 永远不会失败，所以不能靠"发送失败"检测。
-//   改为看 lastRecvAt：60 秒内没收到任何帧（PING/DATA/ACK）→ 强制降级。
+//   UDP 是无连接的，WriteToUDP 永远不会失败 → 不能靠"发送失败"检测。
+//   改为看 lastRecvAt：60 秒内没收到任何帧（PING/PONG/DATA/ACK）
+//   → 强制降级到 TURN。
 //
-// ★ 修复：TURN/Relay 状态的 peer 也发 PING
+//   60 秒 = 4 个 PING 周期（15 秒一个）。容忍偶发丢包，但不至于永远卡住。
 //
-//   旧版只对 P2P/P2PAvailable 状态发 PING，导致降级到 TURN 后
-//   永远不会探测 LAN 是否恢复。新版对所有 4 种状态都发 PING，
-//   内部通过 sendP2PFrame 的 TURN 模式 PING 直连试探来探测恢复。
+// ★ TURN 状态的 peer 也发 PING
+//
+//   降级到 TURN 后仍需持续探测直连，否则 LAN 恢复后无法自动切回。
+//   只有 P2P/P2PAvailable 状态才做活性检测，其他状态无条件发 PING。
+//
+//   PING 帧在 sendP2PFrame 里会走 TURN + 直连试探双路径，
+//   只要直连恢复（LAN 或公网），对端回 PONG 触发 MarkP2P 自动升回。
 func (e *Edge) sendP2PKeepalive() {
 	if e.relayMgr == nil || e.p2pStreams == nil {
 		return
@@ -242,44 +270,39 @@ func (e *Edge) sendP2PKeepalive() {
 
 	now := time.Now().UnixMilli()
 
+	// 第一步：收集待处理 peer
 	e.peersMu.RLock()
-	var toSend []string
 	var deadPeers []string
-
+	var alivePeers []string
 	for id, p := range e.peers {
 		if p.UDPAddr == nil {
 			continue
 		}
 		st := e.relayMgr.GetState(id)
 
-		// 覆盖 4 种状态
-		if st != ConnP2P && st != ConnP2PAvailable &&
-			st != ConnTURN && st != ConnRelay {
-			continue
+		// 只有 P2P/P2PAvailable 才做活性检测
+		if st == ConnP2P || st == ConnP2PAvailable {
+			idleMs := now - p.lastRecvAt
+			if p.lastRecvAt > 0 && idleMs > p2pIdleDeadMs {
+				deadPeers = append(deadPeers, id)
+				continue
+			}
 		}
 
-		toSend = append(toSend, id)
-
-		// P2P/P2PAvailable 状态且 60 秒无流量 → 判定失效
-		if (st == ConnP2P || st == ConnP2PAvailable) &&
-			p.lastRecvAt > 0 &&
-			now-p.lastRecvAt > p2pNoTrafficFallbackMs {
-			deadPeers = append(deadPeers, id)
-		}
+		// ★ 所有有过 P2P 尝试的 peer 都发 PING
+		//   包括 TURN/Relay 状态——这样 LAN 恢复时能自动切回
+		alivePeers = append(alivePeers, id)
 	}
 	e.peersMu.RUnlock()
 
-	// 第一步：先降级（避免继续往死路发 PING）
+	// 第二步：先降级死掉的 peer
 	for _, id := range deadPeers {
 		log.Printf("[P2P] %s 60s 无任何流量，判定 P2P 失效，强制降级", id)
 		e.relayMgr.ForceFallback(id, "no-traffic-60s")
 	}
 
-	// 第二步：给所有状态的 peer 发 PING
-	//
-	// P2P/P2PAvailable：走直连（LAN 优先）
-	// TURN/Relay：走 TURN + 直连试探（PING 双发）
-	for _, id := range toSend {
+	// 第三步：给存活的 peer 发 PING（双发 LAN + 公网；TURN 状态会走 TURN + 直连试探）
+	for _, id := range alivePeers {
 		e.p2pStreams.sendP2PProbe(id)
 	}
 }
@@ -327,6 +350,7 @@ func (e *Edge) forgetTunState(peerID string) {
 
 // ============ 主流程 ============
 
+// FetchVirtualIP 返回 "vip|cidr" 格式，例如 "172.16.0.2|172.16.0.0/20"
 func FetchVirtualIP(cfg *Config) string {
 	if cfg.SignalingURL == "" {
 		return ""
@@ -531,6 +555,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	e.startKeepalive()
 	e.startP2PKeepalive()
 
+	// 启动 SOCKS5 入口（如果配置了）
 	if cfg.Socks5Listen != "" {
 		e.socks5Srv = NewSocks5Server(e, cfg.Socks5Listen)
 		safeGo("socks5-server", func() { e.socks5Srv.Serve() })
