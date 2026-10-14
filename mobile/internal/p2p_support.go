@@ -9,6 +9,12 @@ import (
 )
 
 // findPeerIDByAddr 按对端地址查 peerID。
+//
+// 四层匹配：
+//   1. UDPAddr 精确
+//   2. LAN 精确
+//   3. Assisted 精确
+//   4. UDPAddr IP 相同（兜底）
 func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 	if addr == nil {
 		return ""
@@ -68,13 +74,13 @@ func (e *Edge) peerAddrAndMode(peerID string) (*net.UDPAddr, bool) {
 
 // handleP2PFrame 收到 N2NS 帧时的入口。
 //
-// ★ 修复：更新 peer.UDPAddr 时采用"LAN 优先 + 60 秒窗口"策略。
+// ★ 修复：更新 peer.UDPAddr 时采用"LAN 优先 + 300 秒窗口"策略。
 //
 // 更新规则（peer 已有的 UDPAddr 称为 oldAddr，新收到包的源地址称 newAddr）：
 //   1. oldAddr 为空                → 直接设置
 //   2. old=公网, new=LAN           → 更新（LAN 优先），刷新 lastLANRecvAt
 //   3. old=LAN,  new=LAN           → 端口变了才更新，刷新 lastLANRecvAt
-//   4. old=LAN,  new=公网          → 保留 LAN，除非 lastLANRecvAt 超过 60 秒
+//   4. old=LAN,  new=公网          → 保留 LAN，除非 lastLANRecvAt 超过 300 秒
 //   5. old=公网, new=公网          → 端口变了才更新
 //
 // PING/PONG 语义区分：
@@ -114,17 +120,19 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 				p.lastLANRecvAt = now
 			} else if oldIsLAN && !newIsLAN {
 				// 旧 LAN → 新公网
-				// ★ 只有 60 秒内没收到任何 LAN 帧时才切换
-				if now-p.lastLANRecvAt > 60000 {
+				// ★ 窗口从 60s 延长到 300s（5 分钟）
+				//   60 秒太短——WiFi 抖动、Doze、AP 漫游都可能超过
+				//   300 秒足够长，只有 LAN 真断才切公网
+				if now-p.lastLANRecvAt > 300000 {
 					shouldUpdate = true
-					log.Printf("[P2P] %s LAN 地址超过 60s 无流量，改用公网地址", peerID)
+					log.Printf("[P2P] %s LAN 地址超过 300s 无流量，改用公网地址", peerID)
 				}
 			} else if oldIsLAN && newIsLAN {
 				// 都是 LAN，端口变了才更新
 				if p.UDPAddr.Port != peerAddr.Port {
 					shouldUpdate = true
 				}
-				p.lastLANRecvAt = now   // ★ 每次收到 LAN 帧都刷新
+				p.lastLANRecvAt = now
 			} else {
 				// 都是公网，端口变了才更新
 				if p.UDPAddr.Port != peerAddr.Port {
