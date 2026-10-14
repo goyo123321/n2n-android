@@ -28,7 +28,7 @@ type PeerInfo struct {
 	TurnRelayAddr     string
 	UDPAddr           *net.UDPAddr
 	lastRecvAt        int64
-	lastLANRecvAt     int64    // ★ 必须加这一行
+	lastLANRecvAt     int64
 	loggedReady       bool
 	hasRealData       bool
 	AssistedEndpoints []string
@@ -71,20 +71,15 @@ type Edge struct {
 	fallbackTimers   map[string]*time.Timer
 	fallbackTimersMu sync.Mutex
 
-	// P2PAvailable 超时降级定时器
 	p2pAvailTimers   map[string]*time.Timer
 	p2pAvailTimersMu sync.Mutex
 
-	// N2NS P2P 流协议管理器
 	p2pStreams *P2PStreamManager
+	streamMgr  *AppStreamManager
 
-	// WS 应用层隧道管理器（app_stream.go 使用）
-	streamMgr *AppStreamManager
-
-	// ★ 新增：SOCKS5 入口
+	// SOCKS5 入口
 	socks5Srv *Socks5Server
 
-	// Punch ACK 限流器
 	punchAckLimiter *punchAckLimiter
 
 	lastNoPeerLog   map[string]int64
@@ -147,7 +142,6 @@ func generateDefaultClientID() string {
 
 const keepaliveInterval = 5 * time.Second
 
-// STUN 服务器列表（5 个，多端点冗余）
 var keepaliveServers = []string{
 	"74.125.250.129:19302",
 	"74.125.204.127:19302",
@@ -172,7 +166,6 @@ func buildSTUNBindingRequest() []byte {
 	return buf
 }
 
-// startKeepalive 无条件发送 STUN Binding Request（保 CGNAT 映射）。
 func (e *Edge) startKeepalive() {
 	if e.udpConn == nil {
 		return
@@ -216,52 +209,77 @@ func (e *Edge) startKeepalive() {
 	})
 }
 
-// ============ P2P 通道保活 ============
+// ============ P2P 通道保活 + 活性检测 ============
 
 const p2pKeepaliveInterval = 15 * time.Second
 
-func (e *Edge) startP2PKeepalive() {
-	log.Printf("[P2P-Keepalive] 启动，每 %v 刷新 P2P 通道", p2pKeepaliveInterval)
+// p2pNoTrafficFallbackMs P2P 无流量判定阈值。
+//
+// 60 秒 = 4 个 PING 周期。容忍偶发丢包，但不至于卡太久。
+const p2pNoTrafficFallbackMs = 60000
 
-	safeGo("p2p-keepalive", func() {
-		ticker := time.NewTicker(p2pKeepaliveInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-e.doneCh:
-				log.Printf("[P2P-Keepalive] 已停止")
-				return
-			case <-ticker.C:
-				e.sendP2PKeepalive()
-			}
-		}
-	})
-}
-
+// sendP2PKeepalive 用 N2NS PING 多目标发送 + 活性检测。
+//
+// ★ 修复：活性检测
+//
+//   P2P 通道可能因为以下原因静默死掉：
+//     - LAN 断了 + CGNAT 映射被回收
+//     - 双方路由器状态变化
+//     - 运营商 NAT 抖动
+//
+//   UDP 是无连接的，WriteToUDP 永远不会失败，所以不能靠"发送失败"检测。
+//   改为看 lastRecvAt：60 秒内没收到任何帧（PING/DATA/ACK）→ 强制降级。
+//
+// ★ 修复：TURN/Relay 状态的 peer 也发 PING
+//
+//   旧版只对 P2P/P2PAvailable 状态发 PING，导致降级到 TURN 后
+//   永远不会探测 LAN 是否恢复。新版对所有 4 种状态都发 PING，
+//   内部通过 sendP2PFrame 的 TURN 模式 PING 直连试探来探测恢复。
 func (e *Edge) sendP2PKeepalive() {
 	if e.relayMgr == nil || e.p2pStreams == nil {
 		return
 	}
 
+	now := time.Now().UnixMilli()
+
 	e.peersMu.RLock()
-	var targets []string
+	var toSend []string
+	var deadPeers []string
+
 	for id, p := range e.peers {
 		if p.UDPAddr == nil {
 			continue
 		}
 		st := e.relayMgr.GetState(id)
-		if st != ConnP2P && st != ConnP2PAvailable {
+
+		// 覆盖 4 种状态
+		if st != ConnP2P && st != ConnP2PAvailable &&
+			st != ConnTURN && st != ConnRelay {
 			continue
 		}
-		targets = append(targets, id)
+
+		toSend = append(toSend, id)
+
+		// P2P/P2PAvailable 状态且 60 秒无流量 → 判定失效
+		if (st == ConnP2P || st == ConnP2PAvailable) &&
+			p.lastRecvAt > 0 &&
+			now-p.lastRecvAt > p2pNoTrafficFallbackMs {
+			deadPeers = append(deadPeers, id)
+		}
 	}
 	e.peersMu.RUnlock()
 
-	if len(targets) == 0 {
-		return
+	// 第一步：先降级（避免继续往死路发 PING）
+	for _, id := range deadPeers {
+		log.Printf("[P2P] %s 60s 无任何流量，判定 P2P 失效，强制降级", id)
+		e.relayMgr.ForceFallback(id, "no-traffic-60s")
 	}
 
-	for _, id := range targets {
+	// 第二步：给所有状态的 peer 发 PING
+	//
+	// P2P/P2PAvailable：走直连（LAN 优先）
+	// TURN/Relay：走 TURN + 直连试探（PING 双发）
+	for _, id := range toSend {
 		e.p2pStreams.sendP2PProbe(id)
 	}
 }
@@ -309,7 +327,6 @@ func (e *Edge) forgetTunState(peerID string) {
 
 // ============ 主流程 ============
 
-// FetchVirtualIP 返回 "vip|cidr" 格式，例如 "172.16.0.2|172.16.0.0/20"
 func FetchVirtualIP(cfg *Config) string {
 	if cfg.SignalingURL == "" {
 		return ""
@@ -514,7 +531,6 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	e.startKeepalive()
 	e.startP2PKeepalive()
 
-	// ★ 新增：启动 SOCKS5 入口（如果配置了）
 	if cfg.Socks5Listen != "" {
 		e.socks5Srv = NewSocks5Server(e, cfg.Socks5Listen)
 		safeGo("socks5-server", func() { e.socks5Srv.Serve() })
@@ -632,7 +648,6 @@ func (e *Edge) Stop() {
 	if e.udpConn != nil {
 		_ = e.udpConn.Close()
 	}
-	// ★ 新增：清理 SOCKS5
 	if e.socks5Srv != nil {
 		e.socks5Srv.Close()
 	}
