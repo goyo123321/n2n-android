@@ -38,7 +38,7 @@ const (
 	p2pRetxCheckInterval = 50 * time.Millisecond
 
 	// RTT 采样保护：超过 10 秒的样本视为异常丢弃
-	p2pMaxRTT = 10 * time.Second
+	p2pMaxRTT = 3 * time.Second
 
 	// RTO 钳制范围
 	p2pMinRTO = 100 * time.Millisecond
