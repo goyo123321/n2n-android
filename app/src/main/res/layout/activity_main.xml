@@ -60,7 +60,6 @@
                         android:textColor="@color/brand_text"
                         android:textSize="13sp"
                         android:visibility="gone" />
-                    <!-- ★ 新增：虚拟网段 -->
                     <TextView
                         android:id="@+id/tvVirtualNetwork"
                         android:layout_width="match_parent"
@@ -239,6 +238,71 @@
                             android:textColor="@color/brand_text"
                             android:textSize="13sp" />
                     </com.google.android.material.textfield.TextInputLayout>
+                </LinearLayout>
+            </com.google.android.material.card.MaterialCardView>
+
+            <!-- ========== ★ 新增：SOCKS5 卡片 ========== -->
+            <com.google.android.material.card.MaterialCardView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="12dp"
+                app:cardBackgroundColor="@color/brand_surface"
+                app:cardCornerRadius="12dp"
+                app:cardElevation="0dp"
+                app:strokeColor="@color/brand_border"
+                app:strokeWidth="1dp">
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:padding="16dp">
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:gravity="center_vertical"
+                        android:orientation="horizontal">
+                        <TextView
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="@string/card_socks5"
+                            android:textColor="@color/brand_text"
+                            android:textSize="14sp"
+                            android:textStyle="bold" />
+                        <com.google.android.material.materialswitch.MaterialSwitch
+                            android:id="@+id/switchSocks5"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content" />
+                    </LinearLayout>
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp"
+                        android:layout_marginBottom="12dp"
+                        android:text="@string/socks5_desc"
+                        android:textColor="@color/brand_text_dim"
+                        android:textSize="11sp" />
+
+                    <com.google.android.material.textfield.TextInputLayout
+                        android:id="@+id/tilSocks5Listen"
+                        style="@style/Widget.N2n.TextInputLayout"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:hint="@string/hint_socks5_listen"
+                        app:boxBackgroundColor="@color/brand_bg">
+                        <com.google.android.material.textfield.TextInputEditText
+                            android:id="@+id/etSocks5Listen"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:fontFamily="monospace"
+                            android:inputType="text"
+                            android:maxLines="1"
+                            android:textColor="@color/brand_text"
+                            android:textSize="13sp" />
+                    </com.google.android.material.textfield.TextInputLayout>
+
                 </LinearLayout>
             </com.google.android.material.card.MaterialCardView>
 
