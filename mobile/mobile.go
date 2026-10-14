@@ -19,6 +19,12 @@ type Config struct {
 	ConnectToken  string
 	PreferredIP   string
 	PreferredPort int
+
+	// ★ 新增：SOCKS5 监听地址（留空 = 不启用）
+	//
+	// 与 VpnService 并行：VpnService 走 TUN，SOCKS5 走 loopback。
+	// 默认 "127.0.0.1:1080"，用户可在 UI 上改。
+	Socks5Listen string
 }
 
 type Protector interface {
@@ -44,13 +50,7 @@ func SetTimezoneOffset(seconds int) {
 	internal.SetTimezoneOffset(seconds)
 }
 
-// ★ 新增：让 Kotlin 侧传入 filesDir 下的日志文件绝对路径。
-//
-// 在 App 进程启动早期调用一次即可（N2nVpnService.onCreate /
-// MainActivity.onCreate 里都可以）。
-//
-// 之前 Go 侧 logger.go 的 init() 硬编码 /data/user/0/com.n2n.android/files/n2n.log，
-// 换包名就废了；且 init 里做文件系统探测时机不可控。
+// SetLogFilePath 由 Kotlin 侧传入 filesDir 下的日志文件绝对路径。
 func SetLogFilePath(path string) {
 	internal.SetLogFilePath(path)
 }
@@ -114,6 +114,7 @@ func (c *Client) FetchVirtualIP(cfg *Config) (result string) {
 		ClientID: cfg.ClientID, NodeName: cfg.NodeName,
 		ConnectToken: cfg.ConnectToken, PreferredIP: cfg.PreferredIP,
 		PreferredPort: cfg.PreferredPort,
+		Socks5Listen:  cfg.Socks5Listen,   // ★ 新增
 	}
 	return internal.FetchVirtualIP(icfg)
 }
@@ -149,6 +150,7 @@ func (c *Client) Start(cfg *Config) (errMsg string) {
 		ClientID: cfg.ClientID, NodeName: cfg.NodeName,
 		ConnectToken: cfg.ConnectToken, PreferredIP: cfg.PreferredIP,
 		PreferredPort: cfg.PreferredPort,
+		Socks5Listen:  cfg.Socks5Listen,   // ★ 新增
 	}
 
 	edge, err := internal.Start(icfg, tunFd, udpFd, stunFd)
@@ -201,7 +203,8 @@ func (c *Client) Start(cfg *Config) (errMsg string) {
 		}
 	}()
 
-	log.Printf("[mobile] started, room=%s, udpFd=%d, stunFd=%d", cfg.RoomID, udpFd, stunFd)
+	log.Printf("[mobile] started, room=%s, udpFd=%d, stunFd=%d, socks5=%q",
+		cfg.RoomID, udpFd, stunFd, cfg.Socks5Listen)
 	return ""
 }
 
