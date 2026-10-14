@@ -231,13 +231,6 @@ func (e *Edge) startP2PKeepalive() {
 }
 
 // sendP2PKeepalive 用 N2NS PING 多目标发送 + 活性检测。
-//
-// ★ 活性检测：
-//   P2P/P2PAvailable 状态里 lastRecvAt 超 60s → ForceFallback。
-//   UDP 无连接，WriteTo 永远不失败，只能靠 lastRecvAt 检测。
-//
-// ★ TURN 状态的 peer 也发 PING：
-//   让 sendP2PFrame 里的 PING 双路径有机会探测直连恢复。
 func (e *Edge) sendP2PKeepalive() {
 	if e.relayMgr == nil || e.p2pStreams == nil {
 		return
@@ -525,7 +518,6 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	e.startKeepalive()
 	e.startP2PKeepalive()
 
-	// 启动 SOCKS5 入口（如果配置了）
 	if cfg.Socks5Listen != "" {
 		e.socks5Srv = NewSocks5Server(e, cfg.Socks5Listen)
 		safeGo("socks5-server", func() { e.socks5Srv.Serve() })
@@ -1244,6 +1236,16 @@ func jsonInt(v interface{}) int {
 	return 0
 }
 
+// registerPeer 注册/更新一个 peer。
+//
+// ★ 修复：LAN 优先保护 UDPAddr
+//
+// udpAddr 来自 joined 消息的 pubIP:pubPort（永远是公网地址）。
+// 如果 peer 当前 UDPAddr 是 LAN，不要被公网覆盖——
+// 否则 SendToPeer 会走公网 CGNAT 回环（100~500ms）。
+//
+// 真正的 UDPAddr 切换由 notePeerCommon / handleP2PFrame
+// 根据实际流量决定（LAN 优先，300s 窗口）。
 func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	var udpAddr *net.UDPAddr
 	if pubIP != "" && pubPort > 0 {
@@ -1267,9 +1269,17 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string,
 		if pubPort > 0 {
 			p.PubPort = pubPort
 		}
+
+		// ★ 修复：LAN 优先保护
 		if udpAddr != nil {
-			p.UDPAddr = udpAddr
+			oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
+			if !oldIsLAN {
+				// 当前不是 LAN（或为 nil），允许用新的公网地址
+				p.UDPAddr = udpAddr
+			}
+			// 当前是 LAN → 保留，由实际流量决定何时切换
 		}
+
 		if natType != "" {
 			p.NATType = natType
 		}
@@ -1563,15 +1573,6 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 // notePeerCommon 是打洞握手路径的统一入口。
 //
 // ★ 修复：更新 peer.UDPAddr 时采用"LAN 优先"策略，与 handleP2PFrame 保持一致。
-//
-// 旧版直接覆盖：
-//   best.UDPAddr = &net.UDPAddr{IP: addr.IP, Port: addr.Port}
-//   → 收到公网 IPv4 包时会把 LAN 地址覆盖掉
-//   → SendToPeer 之后走公网 → ping 100~400ms
-//
-// 新版：
-//   - 收到 LAN 帧：总是更新（LAN 优先）+ 刷新 lastLANRecvAt
-//   - 收到公网帧：只在 lastLANRecvAt 超过 300 秒时才切换
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
 	now := time.Now().UnixMilli()
 
@@ -1634,7 +1635,7 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 		return
 	}
 
-	// ★ 修复：LAN 优先更新 UDPAddr
+	// ★ LAN 优先更新 UDPAddr
 	newIsLAN := isPrivateIPv4(addr.IP)
 	oldIsLAN := best.UDPAddr != nil && isPrivateIPv4(best.UDPAddr.IP)
 
