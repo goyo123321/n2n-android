@@ -9,12 +9,6 @@ import (
 )
 
 // findPeerIDByAddr 按对端地址查 peerID。
-//
-// 四层匹配：
-//   1. UDPAddr 精确
-//   2. LAN 精确
-//   3. Assisted 精确
-//   4. UDPAddr IP 相同（兜底）
 func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 	if addr == nil {
 		return ""
@@ -74,15 +68,14 @@ func (e *Edge) peerAddrAndMode(peerID string) (*net.UDPAddr, bool) {
 
 // handleP2PFrame 收到 N2NS 帧时的入口。
 //
-// ★ 修复：更新 peer.UDPAddr 时采用"LAN 优先"策略，避免公网地址
-// 覆盖 LAN 地址导致回程走 CGNAT 回环。
+// ★ 修复：更新 peer.UDPAddr 时采用"LAN 优先 + 60 秒窗口"策略。
 //
 // 更新规则（peer 已有的 UDPAddr 称为 oldAddr，新收到包的源地址称 newAddr）：
 //   1. oldAddr 为空                → 直接设置
-//   2. old=公网, new=LAN           → 更新（LAN 优先）
-//   3. old=LAN,  new=公网          → 保留 LAN（除非 LAN 超过 10 秒无流量）
-//   4. old=LAN,  new=LAN           → 端口变了就更新
-//   5. old=公网, new=公网          → 端口变了就更新
+//   2. old=公网, new=LAN           → 更新（LAN 优先），刷新 lastLANRecvAt
+//   3. old=LAN,  new=LAN           → 端口变了才更新，刷新 lastLANRecvAt
+//   4. old=LAN,  new=公网          → 保留 LAN，除非 lastLANRecvAt 超过 60 秒
+//   5. old=公网, new=公网          → 端口变了才更新
 //
 // PING/PONG 语义区分：
 //   - 收到 PING  → 只证明"对端→本端"单向可达，不升级本端状态
@@ -112,17 +105,28 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 			if p.UDPAddr == nil {
 				// 无旧地址
 				shouldUpdate = true
+				if newIsLAN {
+					p.lastLANRecvAt = now
+				}
 			} else if !oldIsLAN && newIsLAN {
 				// 旧公网 → 新 LAN（LAN 优先）
 				shouldUpdate = true
+				p.lastLANRecvAt = now
 			} else if oldIsLAN && !newIsLAN {
-				// 旧 LAN → 新公网（保留 LAN，除非 LAN 超过 10 秒无流量）
-				if now-p.lastRecvAt > 10000 {
+				// 旧 LAN → 新公网
+				// ★ 只有 60 秒内没收到任何 LAN 帧时才切换
+				if now-p.lastLANRecvAt > 60000 {
 					shouldUpdate = true
-					log.Printf("[P2P] %s LAN 地址超过 10s 无流量，改用公网地址", peerID)
+					log.Printf("[P2P] %s LAN 地址超过 60s 无流量，改用公网地址", peerID)
 				}
+			} else if oldIsLAN && newIsLAN {
+				// 都是 LAN，端口变了才更新
+				if p.UDPAddr.Port != peerAddr.Port {
+					shouldUpdate = true
+				}
+				p.lastLANRecvAt = now   // ★ 每次收到 LAN 帧都刷新
 			} else {
-				// 同类型，端口不同就更新
+				// 都是公网，端口变了才更新
 				if p.UDPAddr.Port != peerAddr.Port {
 					shouldUpdate = true
 				}
