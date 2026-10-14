@@ -28,6 +28,7 @@ type PeerInfo struct {
 	TurnRelayAddr     string
 	UDPAddr           *net.UDPAddr
 	lastRecvAt        int64
+	lastLANRecvAt     int64    // ★ 必须加这一行
 	loggedReady       bool
 	hasRealData       bool
 	AssistedEndpoints []string
