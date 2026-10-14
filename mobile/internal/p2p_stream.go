@@ -37,7 +37,7 @@ const (
 	// 重传检查间隔独立于 RTO
 	p2pRetxCheckInterval = 50 * time.Millisecond
 
-	// RTT 采样保护：超过 10 秒的样本视为异常丢弃
+	// ★ RTT 采样保护：超过 3 秒的样本视为异常丢弃（防止异常阻塞污染 SRTT）
 	p2pMaxRTT = 3 * time.Second
 
 	// RTO 钳制范围
