@@ -71,20 +71,13 @@ type Edge struct {
 	fallbackTimers   map[string]*time.Timer
 	fallbackTimersMu sync.Mutex
 
-	// P2PAvailable 超时降级定时器
 	p2pAvailTimers   map[string]*time.Timer
 	p2pAvailTimersMu sync.Mutex
 
-	// N2NS P2P 流协议管理器
 	p2pStreams *P2PStreamManager
+	streamMgr  *AppStreamManager
+	socks5Srv  *Socks5Server
 
-	// WS 应用层隧道管理器（app_stream.go 使用）
-	streamMgr *AppStreamManager
-
-	// SOCKS5 入口
-	socks5Srv *Socks5Server
-
-	// Punch ACK 限流器
 	punchAckLimiter *punchAckLimiter
 
 	lastNoPeerLog   map[string]int64
@@ -147,7 +140,6 @@ func generateDefaultClientID() string {
 
 const keepaliveInterval = 5 * time.Second
 
-// STUN 服务器列表（5 个，多端点冗余）
 var keepaliveServers = []string{
 	"74.125.250.129:19302",
 	"74.125.204.127:19302",
@@ -172,7 +164,6 @@ func buildSTUNBindingRequest() []byte {
 	return buf
 }
 
-// startKeepalive 无条件发送 STUN Binding Request（保 CGNAT 映射）。
 func (e *Edge) startKeepalive() {
 	if e.udpConn == nil {
 		return
@@ -219,8 +210,6 @@ func (e *Edge) startKeepalive() {
 // ============ P2P 通道保活 + 活性检测 ============
 
 const p2pKeepaliveInterval = 15 * time.Second
-
-// P2P 活性检测阈值：60 秒无任何流量（PING/PONG/DATA/ACK）→ 强制降级
 const p2pIdleDeadMs = 60000
 
 func (e *Edge) startP2PKeepalive() {
@@ -243,26 +232,12 @@ func (e *Edge) startP2PKeepalive() {
 
 // sendP2PKeepalive 用 N2NS PING 多目标发送 + 活性检测。
 //
-// ★ 活性检测
+// ★ 活性检测：
+//   P2P/P2PAvailable 状态里 lastRecvAt 超 60s → ForceFallback。
+//   UDP 无连接，WriteTo 永远不失败，只能靠 lastRecvAt 检测。
 //
-//   P2P 通道可能因以下原因静默死掉：
-//     - LAN 断了 + CGNAT 映射被回收
-//     - 双方路由器状态变化
-//     - 运营商 NAT 抖动
-//
-//   UDP 是无连接的，WriteToUDP 永远不会失败 → 不能靠"发送失败"检测。
-//   改为看 lastRecvAt：60 秒内没收到任何帧（PING/PONG/DATA/ACK）
-//   → 强制降级到 TURN。
-//
-//   60 秒 = 4 个 PING 周期（15 秒一个）。容忍偶发丢包，但不至于永远卡住。
-//
-// ★ TURN 状态的 peer 也发 PING
-//
-//   降级到 TURN 后仍需持续探测直连，否则 LAN 恢复后无法自动切回。
-//   只有 P2P/P2PAvailable 状态才做活性检测，其他状态无条件发 PING。
-//
-//   PING 帧在 sendP2PFrame 里会走 TURN + 直连试探双路径，
-//   只要直连恢复（LAN 或公网），对端回 PONG 触发 MarkP2P 自动升回。
+// ★ TURN 状态的 peer 也发 PING：
+//   让 sendP2PFrame 里的 PING 双路径有机会探测直连恢复。
 func (e *Edge) sendP2PKeepalive() {
 	if e.relayMgr == nil || e.p2pStreams == nil {
 		return
@@ -270,7 +245,6 @@ func (e *Edge) sendP2PKeepalive() {
 
 	now := time.Now().UnixMilli()
 
-	// 第一步：收集待处理 peer
 	e.peersMu.RLock()
 	var deadPeers []string
 	var alivePeers []string
@@ -289,19 +263,16 @@ func (e *Edge) sendP2PKeepalive() {
 			}
 		}
 
-		// ★ 所有有过 P2P 尝试的 peer 都发 PING
-		//   包括 TURN/Relay 状态——这样 LAN 恢复时能自动切回
+		// 所有有过 P2P 尝试的 peer 都发 PING（含 TURN/Relay）
 		alivePeers = append(alivePeers, id)
 	}
 	e.peersMu.RUnlock()
 
-	// 第二步：先降级死掉的 peer
 	for _, id := range deadPeers {
 		log.Printf("[P2P] %s 60s 无任何流量，判定 P2P 失效，强制降级", id)
 		e.relayMgr.ForceFallback(id, "no-traffic-60s")
 	}
 
-	// 第三步：给存活的 peer 发 PING（双发 LAN + 公网；TURN 状态会走 TURN + 直连试探）
 	for _, id := range alivePeers {
 		e.p2pStreams.sendP2PProbe(id)
 	}
@@ -350,7 +321,6 @@ func (e *Edge) forgetTunState(peerID string) {
 
 // ============ 主流程 ============
 
-// FetchVirtualIP 返回 "vip|cidr" 格式，例如 "172.16.0.2|172.16.0.0/20"
 func FetchVirtualIP(cfg *Config) string {
 	if cfg.SignalingURL == "" {
 		return ""
@@ -1590,6 +1560,18 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 	e.notePeerCommon(addr, true, true, false)
 }
 
+// notePeerCommon 是打洞握手路径的统一入口。
+//
+// ★ 修复：更新 peer.UDPAddr 时采用"LAN 优先"策略，与 handleP2PFrame 保持一致。
+//
+// 旧版直接覆盖：
+//   best.UDPAddr = &net.UDPAddr{IP: addr.IP, Port: addr.Port}
+//   → 收到公网 IPv4 包时会把 LAN 地址覆盖掉
+//   → SendToPeer 之后走公网 → ping 100~400ms
+//
+// 新版：
+//   - 收到 LAN 帧：总是更新（LAN 优先）+ 刷新 lastLANRecvAt
+//   - 收到公网帧：只在 lastLANRecvAt 超过 300 秒时才切换
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
 	now := time.Now().UnixMilli()
 
@@ -1651,11 +1633,42 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 		e.peersMu.Unlock()
 		return
 	}
+
+	// ★ 修复：LAN 优先更新 UDPAddr
+	newIsLAN := isPrivateIPv4(addr.IP)
+	oldIsLAN := best.UDPAddr != nil && isPrivateIPv4(best.UDPAddr.IP)
+
+	shouldUpdate := false
+	if best.UDPAddr == nil {
+		shouldUpdate = true
+	} else if !oldIsLAN && newIsLAN {
+		// 旧公网 → 新 LAN（LAN 优先）
+		shouldUpdate = true
+	} else if oldIsLAN && !newIsLAN {
+		// 旧 LAN → 新公网（只在 lastLANRecvAt 超过 300 秒时才切）
+		if best.lastLANRecvAt > 0 && now-best.lastLANRecvAt > 300000 {
+			shouldUpdate = true
+			log.Printf("[P2P] %s (note) LAN 超过 300s 无流量，改用公网地址", best.ClientID)
+		}
+	} else {
+		// 同类型，端口变了才更新
+		if best.UDPAddr.Port != addrPort {
+			shouldUpdate = true
+		}
+	}
+
+	if newIsLAN {
+		best.lastLANRecvAt = now
+	}
+
+	if shouldUpdate {
+		best.UDPAddr = &net.UDPAddr{IP: addr.IP, Port: addr.Port}
+	}
+
 	best.lastRecvAt = now
 	if isRealData {
 		best.hasRealData = true
 	}
-	best.UDPAddr = &net.UDPAddr{IP: addr.IP, Port: addr.Port}
 	clientID := best.ClientID
 	ip := addr.IP.String()
 	e.peersMu.Unlock()
