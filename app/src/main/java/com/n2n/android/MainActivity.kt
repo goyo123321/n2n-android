@@ -69,11 +69,7 @@ class MainActivity : AppCompatActivity() {
         applyThemeMode(Prefs.loadThemeMode(this))
         super.onCreate(savedInstanceState)
 
-        // ★ 本轮新增：先设置日志路径，再 applySystemTimezone
-        //   与 N2nVpnService 里的调用互补，避免"先开 App 再启 VPN"时
-        //   Go 侧日志跑偏
         N2nController.applyLogFilePath(this)
-
         N2nController.applySystemTimezone()
 
         binding = ActivityMainBinding.inflate(layoutInflater)
@@ -107,6 +103,23 @@ class MainActivity : AppCompatActivity() {
             saveCurrentInput()
             toast(getString(R.string.dialog_saved))
         }
+
+        // ★ 新增：SOCKS5 开关联动
+        binding.switchSocks5.setOnCheckedChangeListener { _, checked ->
+            if (!::binding.isInitialized) return@setOnCheckedChangeListener
+            if (checked) {
+                if (binding.etSocks5Listen.text.toString().trim().isEmpty()) {
+                    binding.etSocks5Listen.setText(getString(R.string.socks5_default_listen))
+                }
+                binding.tilSocks5Listen.visibility = View.VISIBLE
+            } else {
+                binding.etSocks5Listen.setText("")
+                binding.tilSocks5Listen.visibility = View.GONE
+            }
+        }
+        // 初始可见性
+        binding.tilSocks5Listen.visibility =
+            if (binding.switchSocks5.isChecked) View.VISIBLE else View.GONE
 
         refreshStatus()
     }
@@ -169,6 +182,7 @@ class MainActivity : AppCompatActivity() {
         outState.putString("clientId", binding.etClientId.text.toString())
         outState.putString("nodeName", binding.etNodeName.text.toString())
         outState.putString("connectToken", binding.etConnectToken.text.toString())
+        outState.putString("socks5Listen", binding.etSocks5Listen.text.toString())   // ★ 新增
     }
 
     // ============================================================
@@ -267,7 +281,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ★ first-use 时机调整：只在"从未成功启动过 VPN"时弹
     private fun checkSignalingUrl() {
         if (!::binding.isInitialized) return
         val currentUrl = binding.etSignalingUrl.text.toString().trim()
@@ -310,6 +323,10 @@ class MainActivity : AppCompatActivity() {
                 binding.etClientId.setText(savedInstanceState.getString("clientId", ""))
                 binding.etNodeName.setText(savedInstanceState.getString("nodeName", ""))
                 binding.etConnectToken.setText(savedInstanceState.getString("connectToken", ""))
+                // ★ 新增：恢复 SOCKS5
+                val socks5 = savedInstanceState.getString("socks5Listen", "") ?: ""
+                binding.etSocks5Listen.setText(socks5)
+                binding.switchSocks5.isChecked = socks5.isNotEmpty()
                 return
             }
             val cfg = Prefs.load(this)
@@ -319,6 +336,10 @@ class MainActivity : AppCompatActivity() {
             binding.etClientId.setText(cfg.clientId)
             binding.etNodeName.setText(cfg.nodeName)
             binding.etConnectToken.setText(cfg.connectToken)
+            // ★ 新增：加载 SOCKS5
+            val socks5 = Prefs.loadSocks5Listen(this)
+            binding.etSocks5Listen.setText(socks5)
+            binding.switchSocks5.isChecked = socks5.isNotEmpty()
         } catch (t: Throwable) {
             Log.e(TAG, "loadConfig failed", t)
         }
@@ -338,6 +359,11 @@ class MainActivity : AppCompatActivity() {
                     data.getQueryParameter("cid")?.let { binding.etClientId.setText(it) }
                     data.getQueryParameter("name")?.let { binding.etNodeName.setText(it) }
                     data.getQueryParameter("token")?.let { binding.etConnectToken.setText(it) }
+                    // ★ 新增：深链支持 socks5
+                    data.getQueryParameter("socks5")?.let {
+                        binding.etSocks5Listen.setText(it)
+                        binding.switchSocks5.isChecked = it.isNotEmpty()
+                    }
 
                     saveCurrentInput()
                     if (data.getQueryParameter("auto") == "1") {
@@ -353,6 +379,7 @@ class MainActivity : AppCompatActivity() {
             val cid = intent.getStringExtra(N2nVpnService.EXTRA_CLIENT_ID)
             val name = intent.getStringExtra(N2nVpnService.EXTRA_NODE_NAME)
             val token = intent.getStringExtra(N2nVpnService.EXTRA_CONNECT_TOKEN)
+            val socks5 = intent.getStringExtra(N2nVpnService.EXTRA_SOCKS5_LISTEN)   // ★ 新增
 
             var changed = false
             if (!url.isNullOrEmpty()) { binding.etSignalingUrl.setText(url); changed = true }
@@ -361,6 +388,11 @@ class MainActivity : AppCompatActivity() {
             if (!cid.isNullOrEmpty()) { binding.etClientId.setText(cid); changed = true }
             if (!name.isNullOrEmpty()) { binding.etNodeName.setText(name); changed = true }
             if (!token.isNullOrEmpty()) { binding.etConnectToken.setText(token); changed = true }
+            if (!socks5.isNullOrEmpty()) {
+                binding.etSocks5Listen.setText(socks5)
+                binding.switchSocks5.isChecked = true
+                changed = true
+            }
 
             if (changed) {
                 saveCurrentInput()
@@ -388,6 +420,12 @@ class MainActivity : AppCompatActivity() {
                 connectToken = binding.etConnectToken.text.toString().trim(),
             ))
             Prefs.savePreferredIp(this, binding.etPreferredIp.text.toString().trim())
+            // ★ 新增：保存 SOCKS5
+            if (binding.switchSocks5.isChecked) {
+                Prefs.saveSocks5Listen(this, binding.etSocks5Listen.text.toString().trim())
+            } else {
+                Prefs.saveSocks5Listen(this, "")
+            }
         } catch (t: Throwable) {
             Log.e(TAG, "saveCurrentInput failed", t)
         }
@@ -434,6 +472,16 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        // ★ 新增：SOCKS5 校验
+        if (binding.switchSocks5.isChecked) {
+            val socks5 = binding.etSocks5Listen.text.toString().trim()
+            if (socks5.isEmpty() || !isValidHostPort(socks5)) {
+                toast(getString(R.string.socks5_invalid))
+                binding.etSocks5Listen.requestFocus()
+                return
+            }
+        }
+
         try {
             val intent = VpnService.prepare(this)
             if (intent != null) {
@@ -458,12 +506,27 @@ class MainActivity : AppCompatActivity() {
         return s.all { it.code in 33..126 }
     }
 
+    // ★ 新增：host:port 校验
+    private fun isValidHostPort(s: String): Boolean {
+        val idx = s.lastIndexOf(':')
+        if (idx <= 0 || idx == s.length - 1) return false
+        val port = s.substring(idx + 1).toIntOrNull() ?: return false
+        if (port < 1 || port > 65535) return false
+        val host = s.substring(0, idx)
+        if (host.isEmpty()) return false
+        return true
+    }
+
     private fun startVpnService() {
         if (isFinishing || isDestroyed) return
         if (!::binding.isInitialized) return
         try {
             val preferredIp = binding.etPreferredIp.text.toString().trim()
             val token = binding.etConnectToken.text.toString().trim()
+            // ★ 新增：SOCKS5
+            val socks5 = if (binding.switchSocks5.isChecked) {
+                binding.etSocks5Listen.text.toString().trim()
+            } else ""
 
             val intent = Intent(this, N2nVpnService::class.java).apply {
                 action = N2nVpnService.ACTION_START
@@ -473,6 +536,7 @@ class MainActivity : AppCompatActivity() {
                 putExtra(N2nVpnService.EXTRA_CLIENT_ID, binding.etClientId.text.toString().trim())
                 putExtra(N2nVpnService.EXTRA_NODE_NAME, binding.etNodeName.text.toString().trim())
                 putExtra(N2nVpnService.EXTRA_CONNECT_TOKEN, token)
+                putExtra(N2nVpnService.EXTRA_SOCKS5_LISTEN, socks5)   // ★ 新增
             }
             startForegroundService(intent)
             toast(getString(R.string.dialog_starting))
@@ -512,7 +576,6 @@ class MainActivity : AppCompatActivity() {
                 binding.tvStatus.setTextColor(getColor(R.color.brand_success))
                 binding.cardStatus.setStrokeColor(getColor(R.color.brand_success))
 
-                // ★ VIP 空串显示"获取中..."，避免闪 "--"
                 val vip = N2nController.getVirtualIP()
                 if (vip.isEmpty()) {
                     binding.tvVirtualIp.text = "虚拟 IP: 获取中..."
@@ -523,7 +586,6 @@ class MainActivity : AppCompatActivity() {
                 }
                 binding.tvVirtualIp.visibility = View.VISIBLE
 
-                // ★ 显示虚拟网段
                 val vn = N2nController.getVirtualNetwork()
                 if (vn.isNotEmpty()) {
                     binding.tvVirtualNetwork.text = "网段: $vn"
@@ -546,6 +608,10 @@ class MainActivity : AppCompatActivity() {
 
                 binding.btnSave.isEnabled = false
                 binding.btnSave.alpha = 0.5f
+                // ★ 运行中禁止改 SOCKS5
+                binding.switchSocks5.isEnabled = false
+                binding.switchSocks5.alpha = 0.5f
+                binding.etSocks5Listen.isEnabled = false
             } else {
                 binding.tvStatus.text = getString(R.string.status_stopped)
                 binding.tvStatus.setTextColor(getColor(R.color.brand_text_dim))
@@ -560,6 +626,10 @@ class MainActivity : AppCompatActivity() {
 
                 binding.btnSave.isEnabled = true
                 binding.btnSave.alpha = 1.0f
+                // ★ 未运行时可改 SOCKS5
+                binding.switchSocks5.isEnabled = true
+                binding.switchSocks5.alpha = 1.0f
+                binding.etSocks5Listen.isEnabled = true
             }
         } catch (t: Throwable) {
             Log.e(TAG, "refreshStatus failed", t)
@@ -634,7 +704,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ★ 徽章支持 p2p-avail（黄色，与服务端面板一致）
     private fun applyBadge(badge: android.widget.TextView?, connType: String) {
         if (badge == null) return
         try {
