@@ -4,9 +4,11 @@
 
 通过 `VpnService` 建立 TUN 虚拟网卡，只接管组网网段（如 `10.64.0.0/24`），其他流量走系统默认。支持 **P2P 打洞 / TURN 中继 / WebSocket 中继** 三级降级，无需 root。
 
+**内置 SOCKS5 入口**——与 VPN 并行运行，无需 root，可为特定 App 提供代理通道。
+
 ---
 
-## 🌐 三端协同全景
+## 🌐 四端协同全景
 
 `edge-signal` 服务端 + 三个客户端构成完整的异地组网系统：
 
@@ -24,9 +26,9 @@
          ▼                   ▼                   ▼
    n2n-go-client       n2n-termux          n2n-android
    ┌──────────┐       ┌──────────┐        ┌──────────┐
-   │ TUN 模式  │       │ SOCKS5   │        │ VpnService│
-   │ 系统级路由│       │ 代理模式 │        │ 无 root  │
-   │ 需 root  │       │ 无 root  │        │          │
+   │ TUN 模式  │       │ SOCKS5   │        │VpnService│
+   │ 系统级路由│       │ 代理模式 │        │ + SOCKS5 │
+   │ 需 root  │       │ 无 root  │        │ 无 root  │
    └──────────┘       └──────────┘        └──────────┘
      Linux/macOS         Android              Android
      Windows             Termux                APK
@@ -37,142 +39,125 @@
 
 ### 三种客户端定位对比
 
-| 维度 | n2n-go-client | n2n-termux | n2n-android |
+| 维度 | n2n-go-client | n2n-termux | **n2n-android** |
 |:---|:---|:---|:---|
-| **运行环境** | Linux / macOS / Windows / 路由器 | Android Termux | Android APK |
-| **数据面** | TUN 虚拟网卡 | SOCKS5 代理 | VpnService（TUN） |
-| **权限要求** | root / 管理员 | 无 root | 无 root |
-| **应用透明** | ✅ 系统级 | ⚠️ 需 App 显式配 SOCKS5 | ✅ 系统级 |
-| **协议支持** | TCP / UDP / ICMP | 仅 TCP | TCP / UDP / ICMP |
-| **使用方式** | `curl http://10.64.0.X` | `curl --socks5 127.0.0.1:1080 ...` | 同 TUN |
-| **适用场景** | 服务器 / 桌面 / 路由器 | 临时测试 / 无 root 设备 | 日常使用（手机） |
+| **运行环境** | Linux / macOS / Windows / 路由器 | Android Termux | **Android APK** |
+| **数据面** | TUN 虚拟网卡 | SOCKS5 代理 | **VpnService + SOCKS5 双入口** |
+| **权限要求** | root / 管理员 | 无 root | **无 root** |
+| **应用透明** | ✅ 系统级 | ⚠️ 需 App 显式配 SOCKS5 | **✅ VpnService 系统级 + SOCKS5 可选** |
+| **协议支持** | TCP / UDP / ICMP | 仅 TCP | **TCP / UDP / ICMP（VpnService）；TCP（SOCKS5）** |
+| **使用方式** | `curl http://10.64.0.X` | `curl --socks5 127.0.0.1:1080 ...` | **同 TUN + 可选 SOCKS5** |
+| **适用场景** | 服务器 / 桌面 / 路由器 | 临时测试 / 无 root 设备 | **日常手机使用** |
 
 ---
 
-## 🔧 Termux 与 root 的运用
+## 🔌 SOCKS5 入口（Android 独有）
 
-### 场景 1：Termux 无 root（默认）
+### 为什么需要
 
-使用 **[n2n-termux](https://github.com/goyo123321/n2n-termux)** —— SOCKS5 模式：
+`VpnService` 是**全局**的——一旦启动，所有 App 流量都走 TUN。但有时你只想让**部分 App** 访问组网资源，其他 App 保持走物理网络。
 
-- ✅ 不需要 root
-- ⚠️ 仅支持 TCP（ICMP 和 UDP 需绕行）
-- ⚠️ 每个 App 需显式配置 SOCKS5（`curl --socks5`、`ALL_PROXY` 等）
+**场景举例**：
 
-```bash
-# 启动
-~/.n2n-termux/start.sh
+- 只想让 Firefox 访问内网 NAS，其他 App 不受影响
+- 只想让 Termux 里的 SSH 走组网，其他 App 直连
+- 需要同时挂 Clash 等其它代理（VpnService 独占，但 SOCKS5 可以共存）
 
-# 使用（需要显式走 SOCKS5）
-curl --socks5 127.0.0.1:1080 http://10.64.0.3:8080/
-export ALL_PROXY=socks5://127.0.0.1:1080
-```
+此时可以**用 SOCKS5 入口**——不启用 VPN，只打开 SOCKS5 开关，让特定 App 通过 `127.0.0.1:1080` 访问组网服务。
 
-### 场景 2：Termux + root
+### 与 VpnService 的关系
 
-**关键认识**：**Termux 无 root 时，Android 内核拒绝创建 TUN。但有了 root，就可以绕过这个限制。**
+**两者可以独立使用，也可以同时运行**：
 
-具体两种用法：
+| 组合 | VpnService | SOCKS5 | 效果 |
+|:---|:---|:---|:---|
+| **仅 VpnService** | ✅ 开启 | ❌ 关闭 | 所有 App 走 VPN，应用透明 |
+| **仅 SOCKS5** | ❌ 关闭 | ✅ 开启 | 只有配置了代理的 App 走组网 |
+| **两者都开** | ✅ | ✅ | 双入口并存（互不干扰） |
+| **两者都关** | ❌ | ❌ | 无组网（不可能同时关，至少开一个） |
 
-#### 用法 A：用 root 直接运行 n2n-go-client
+**注意**：无论哪种组合，都需要 VPN 权限（因为 SOCKS5 底层走的是组网通道，而组网需要 TUN）。
 
-```bash
-# 在 Termux 里（需要 root）
-su -c "SIGNALING_URL=... ROOM_ID=myroom CLIENT_ID=termux-root \
-  ./n2n-go-client-linux-arm64"
-```
+### 使用步骤
 
-**优势**：
-- ✅ 完整的 TUN 数据面（TCP / UDP / ICMP 全支持）
-- ✅ 应用透明（无需改每个 App 的代理配置）
-- ✅ 与 PC / Android 客户端**完全对等**
+#### 1. 打开开关
 
-**限制**：
-- 需要设备已 root（Magisk / KernelSU 等）
-- Termux 里要以 root 运行：`su -c` 或 `tsu`（Termux 的 `tsu` 包）
+App 主界面 → **「🔌 SOCKS5 入口」卡片** → **打开开关**
 
-#### 用法 B：用 proot-distro 在非 root 下跑
+自动填入默认监听地址 `127.0.0.1:1080`。
 
-```bash
-pkg install proot-distro
-proot-distro install debian
-proot-distro login debian
-# 装 n2n-go-client，但 TUN 依然需要 root——proot 不能绕过
-```
+#### 2. 修改监听地址（可选）
 
-**proot 解决不了 TUN 权限**。`/dev/net/tun` 是内核级的，proot 用户态拦截不生效。
-
-**结论**：要 TUN 必须真的 root。
-
-### 场景 3：三种 Android 客户端的协作
-
-**同一台 Android 设备可以同时运行多个客户端吗？**
-
-**不建议** —— VPN 冲突。原因：
-
-- `VpnService` 是**独占**的，一台设备同时只能有一个活跃 VPN
-- SOCKS5 模式的 Termux 与 VpnService 模式的 Android APK 可以**共存**（因为 SOCKS5 不抢 VPN 权限）
-- 具体组合：
-
-| 组合 | 是否推荐 | 说明 |
+| 地址 | 谁能访问 | 使用场景 |
 |:---|:---|:---|
-| n2n-android（VpnService） | ✅ 推荐 | 主用方式 |
-| n2n-termux（SOCKS5） | ✅ 可共存 | 与 VpnService 一起运行时，**只有 VpnService 走 TUN**，Termux 走 SOCKS5，两者**互不冲突** |
-| n2n-android + n2n-termux | ⚠️ 可共存 | VpnService 只接管组网网段，Termux 的 SOCKS5 走 `127.0.0.1`，无冲突 |
-| **n2n-android × 2** | ❌ 不行 | 两个 VpnService 会抢 VPN 权限 |
-| Clash / 其他 VPN | ⚠️ 需协调 | 与 Clash 冲突，只能同时启用一个 |
+| `127.0.0.1:1080` | **仅本 App** | 默认，最安全 |
+| `0.0.0.0:1080` | **局域网内所有设备** | 让其他设备借用手机的 SOCKS5 |
 
-**推荐配置**：
+**如果要让同手机的 Termux 访问**（Android 10+ 有 loopback 隔离）→ **改成 `0.0.0.0:1080`**。
 
-- 手机日常使用 → **n2n-android**
-- 需要临时调试 / 跑脚本 → **额外**用 n2n-termux 的 SOCKS5（与 VpnService 共存）
-- 设备已 root 且想要最优性能 → **Termux + root 跑 n2n-go-client**
+#### 3. 启动 VPN
 
-### 场景 4：数据面差异与互通
+点 **「启动 VPN」** → 授予 VPN 权限 → 状态变绿。
 
-**三端数据面协议完全独立**，但**服务端与 P2P 通道层用同一套协议**（N2NS 帧 + 打洞 + TURN 中继），所以完全互通：
+日志里会出现：
 
-| 主动方 | 被动方 | 数据面路径 |
-|:---|:---|:---|
-| PC（TUN） | Termux（SOCKS5） | PC 发 N2NS → Termux 收到后转发到本地 TCP |
-| Termux（SOCKS5） | PC（TUN） | Termux 发 N2NS → PC 收到后写入 TUN |
-| PC（TUN） | Android（VpnService） | 直接写 N2NS 帧（两端都是 TUN） |
-| Android（VpnService） | Termux（SOCKS5） | Android 发 N2NS → Termux 侧转发到本地 TCP |
-| Termux（SOCKS5） | Android（VpnService） | Termux 发 N2NS → Android 收到后写入 TUN |
+```
+[SOCKS5] 已启用，监听 127.0.0.1:1080
+```
 
-**关键**：**N2NS 帧格式在所有客户端完全一致**，所以任意两端可以直接互通。
+#### 4. 使用 SOCKS5
 
-### 场景 5：LAN 直连（同 WiFi）
+**Firefox**：
 
-三端**都会收集 LAN 地址**：
+```
+about:preferences → 网络设置 → 手动代理
+SOCKS 主机: 127.0.0.1
+端口:     1080
+☑ 使用 SOCKS v5 时代理 DNS
+```
 
-- PC：`net.Interfaces()` + UDP connect 骗内核
-- Termux：`net.Interfaces()`（Android 有限制，主要靠 UDP connect）
-- Android：`net.Interfaces()`（过滤 tun 接口）+ UDP connect
+**Termux（同手机）**（需用 `0.0.0.0:1080`）：
 
-**同 WiFi 场景**：两端在打洞指令里会带上 LAN 候选，**优先扫 LAN 端口**，命中后直接走内网，延迟 <5ms。
+```bash
+# 查看手机局域网 IP
+ifconfig | grep "inet "
 
-### 场景 6：CGNAT hairpin（同运营商）
+# 通过手机的局域网 IP 访问 SOCKS5
+curl --socks5 <手机IP>:1080 http://10.64.0.2:8080/
+export ALL_PROXY=socks5://<手机IP>:1080
+```
 
-两端在同一运营商 CGNAT 后面时（STUN 出口 IP 相同）：
+**其他 App**：在 App 的网络设置里找「代理」选项，填入 `127.0.0.1:1080`。
 
-1. **首次**：服务端允许一次 hairpin 尝试
-2. **失败后**：服务端下发 `force_fallback` → 三端立即降级到 TURN
-3. **已成功**：跳过
+### 使用限制
 
-**三端行为完全一致**。
+| 限制 | 说明 |
+|:---|:---|
+| **仅支持 TCP** | SOCKS5 协议只代理 TCP，UDP 不通 |
+| **目标必须是虚拟 IP** | 只能访问 `10.64.0.x` 段的对端设备，其他 IP 会被拒绝 |
+| **不支持域名** | 客户端必须用虚拟 IP，不支持域名解析 |
+| **运行中不可改** | VPN 运行期间开关会变灰，需先停止 VPN |
+
+### 与同设备其他代理共存
+
+- **与 Clash**：两者都监听不同端口即可。Clash 常用 `7890`，n2n SOCKS5 用 `1080`，无冲突
+- **与 n2n-termux**：Termux 版也用 `127.0.0.1:1080`，**会冲突**！改其中一个端口即可
+- **与 Surge/Quantumult**：类似，确保端口不冲突
 
 ---
 
 ## ✨ 特性
 
 - **原生 VPN** — `VpnService` + TUN 内核栈，无需 root
+- **SOCKS5 入口** — 与 VpnService 并行，为特定 App 提供代理
 - **三级降级** — `P2P → TURN → WS`，连接永远可用
 - **P2P 直连** — STUN 探测 + NAT 打洞，延迟低至 5ms
-- **LAN 直连** — 同 WiFi 自动内网直连
-- **CGNAT hairpin** — 同 STUN 出口 IP 时尝试端口扫描 + probe 回发，失败后服务端强制降级
-- **P2P 通道保活** — 每 15 秒往对端发 N2NS PING 多目标探针，防止空闲时通道被回收
-- **TURN 中继** — 支持 Cloudflare TURN 和自建 coturn（UDP / TCP / RFC6062）
+- **LAN 直连** — 同 WiFi 自动内网直连，延迟 <10ms
+- **多目标打洞** — LAN + STUN 反射 + 观测 raddr 同时扫描，命中率大幅提升
+- **CGNAT hairpin** — 同 STUN 出口 IP 时首次允许尝试，失败后服务端强制降级
+- **UDP 保活** — 每 5 秒无条件刷新 STUN 映射，防止 CGNAT 端口漂移
+- **P2P 通道保活** — 每 15 秒往对端发 N2NS PING 多目标探针
+- **TURN 中继** — 支持 Cloudflare TURN + 自建 coturn（UDP / TCP / RFC6062）
 - **WS 中继兜底** — TURN 不可用时自动降级到 Worker 转发
 - **WS 应用层隧道** — 支持 PC / Termux 通过 WS 中继访问 Android 上的服务
 - **优选 IP** — 支持 Cloudflare 优选 IP，绕过 DNS 解析加速信令
@@ -200,11 +185,16 @@ proot-distro login debian
    │   ├─ TURNClient           TURN 主控    │
    │   ├─ P2PStreamManager     N2NS 流     │
    │   ├─ AppStreamManager     WS 隧道     │
+   │   ├─ Socks5Server         SOCKS5 入口  │
    │   ├─ TUNDevice            TUN fd 包装  │
    │   └─ NetInfo              NetInfo      │
    └──────────────────────────────────────┘
             │
-            ▼
+            ├─ VpnService → TUN → 系统流量
+            │
+            └─ SOCKS5 (127.0.0.1:1080) → 代理流量
+                       │
+                       ▼
    ┌────────────────────────────────────────┐
    │   Cloudflare Worker (edge-signal)       │
    └────────────────────────────────────────┘
@@ -221,7 +211,7 @@ proot-distro login debian
 
 | 层 | 间隔 | 目标 | 作用 |
 |:---|:---|:---|:---|
-| **UDP 保活** | 5 秒 | 3 个 STUN 服务器 | 保 socket 的 CGNAT 映射 |
+| **UDP 保活** | 5 秒 | 5 个 STUN 服务器 | 保 socket 的 CGNAT 映射（无条件发送） |
 | **P2P 通道保活** | 15 秒 | 每个 P2P 对端 | 保 A→B 会话 |
 | **WS 心跳** | 20 秒 | 服务端 | 保 WS 连接 |
 
@@ -273,61 +263,32 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 3. 填写 **房间名**（同一房间的设备互相组网）
 4. 可选：填写 **优选 IP**（Cloudflare 优选 IP，加速连接）
 5. 可选：填写 **连接密码**（对应服务端 `CONNECT_TOKEN`）
-6. 点击 **启动 VPN** → 授予 VPN 权限
-7. 状态变绿后，其它设备可通过虚拟 IP 互访
+6. 可选：打开 **🔌 SOCKS5 入口** 开关（默认关闭）
+7. 点击 **启动 VPN** → 授予 VPN 权限
+8. 状态变绿后，其它设备可通过虚拟 IP 互访
 
 **虚拟 IP 分配**：`10.64.0.2` ~ `10.64.0.254`，由服务端自动分配。
 
 ---
 
-## 🌐 典型使用场景
+## 📱 App 界面
 
-### 场景 A：PC ↔ Android 手机
+### 主界面
 
-**PC 访问手机上的服务**（如 ADB / HTTP 服务）：
+| 卡片 | 内容 |
+|:---|:---|
+| **状态卡片** | 运行状态、虚拟 IP、网段、Client ID |
+| **服务器卡片** | WSS 地址、优选 IP、连接密码 |
+| **组网卡片** | 房间名、显示名、Client ID |
+| **🔌 SOCKS5 卡片** | 开关 + 监听地址（默认 `127.0.0.1:1080`） |
+| **节点列表** | 已连接节点 + 连接类型徽章（P2P / P2P~ / TURN / WS） |
 
-```bash
-# Android 上跑服务
-# （例如 Termux 里 python3 -m http.server 8080 --bind 0.0.0.0）
+### 菜单
 
-# PC 端直接访问
-curl http://10.64.0.x:8080/
-```
-
-### 场景 B：三端混合组网
-
-```
-PC-A (10.64.0.2)  ←→  Android-B (10.64.0.3)  ←→  Termux-C (10.64.0.4)
-```
-
-- **PC 访问 Android**：直接 `curl http://10.64.0.3:8080/`
-- **Android 访问 PC**：直接 `curl http://10.64.0.2:8080/`
-- **Termux 访问 PC**：`curl --socks5 127.0.0.1:1080 http://10.64.0.2:8080/`
-- **PC 访问 Termux**：`curl http://10.64.0.4:8080/`（Termux 端服务监听 `0.0.0.0`）
-
-### 场景 C：Android 设备做网关
-
-Android 手机作为访问其他节点的"边缘客户端"：
-
-```
-[Android-A]──组网──[PC-B]──局域网络──[数据库服务器]
-```
-
-Android 通过组网访问 PC，PC 转发到真正的内网资源。
-
-### 场景 D：Termux + Root 做全功能节点
-
-在已 root 的 Android 设备上，用 Termux 跑 n2n-go-client，**与 PC 完全对等**：
-
-```bash
-# Termux + root
-su -c "SIGNALING_URL=wss://xxx ROOM_ID=myroom CLIENT_ID=my-phone \
-  ./n2n-go-client-linux-arm64"
-```
-
-- ✅ 完整 TUN 数据面（TCP / UDP / ICMP）
-- ✅ 应用透明（系统级路由）
-- ✅ 与 PC 完全对等的使用体验
+| 菜单项 | 说明 |
+|:---|:---|
+| **日志** | 实时日志 + 复制 / 清空 / 自动滚动 |
+| **主题** | 浅色 / 深色 / 跟随系统 |
 
 ---
 
@@ -341,11 +302,13 @@ su -c "SIGNALING_URL=wss://xxx ROOM_ID=myroom CLIENT_ID=my-phone \
 | 优选 IP | ❌ | Cloudflare 优选 IP，格式 `IP` 或 `IP:端口`。留空走 DNS |
 | 显示名 | ❌ | 显示在面板上的名称，默认 "Android" |
 | Client ID | ❌ | 留空自动生成，多设备建议手填固定值 |
+| **SOCKS5 开关** | ❌ | 打开/关闭 SOCKS5 入口，默认关闭 |
+| **SOCKS5 监听地址** | ❌ | `127.0.0.1:1080`（默认）或 `0.0.0.0:1080` |
 
 ### 深链
 
 ```
-n2n://connect?url=wss://xxx.workers.dev&room=myroom&token=abc&ip=104.17.128.1&auto=1
+n2n://connect?url=wss://xxx.workers.dev&room=myroom&token=abc&ip=104.17.128.1&socks5=127.0.0.1:1080&auto=1
 ```
 
 | 参数 | 说明 |
@@ -356,6 +319,7 @@ n2n://connect?url=wss://xxx.workers.dev&room=myroom&token=abc&ip=104.17.128.1&au
 | `cid` | Client ID |
 | `name` | 显示名 |
 | `ip` | 优选 IP |
+| **`socks5`** | **SOCKS5 监听地址（填了则自动开启）** |
 | `auto` | `1` 表示自动启动 VPN |
 
 ---
@@ -367,7 +331,7 @@ App 节点列表和 Web 面板使用同一套徽章：
 | 徽章 | 颜色 | 含义 |
 |:---|:---|:---|
 | `P2P` | 🟢 绿底 | P2P 直连，数据面已验证 |
-| `P2P~` | 🟡 黄底虚线 | P2PAvailable 中间态（打洞握手成功，数据面未验证） |
+| `P2P~` | 🟡 黄底虚线 | P2PAvailable 中间态（握手成功，数据面未验证） |
 | `TURN` | 🔵 蓝底 | TURN 中继 |
 | `WS` | 🟡 黄底 | WS 中继（最后兜底） |
 
@@ -385,6 +349,8 @@ App 节点列表和 Web 面板使用同一套徽章：
 | `WAKE_LOCK` | 保持运行 |
 | `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` | 电池优化白名单 |
 
+**注意**：SOCKS5 入口**不需要额外权限**——它监听 loopback，权限沿用 VpnService。
+
 ---
 
 ## 🚨 限制
@@ -396,6 +362,15 @@ App 节点列表和 Web 面板使用同一套徽章：
 | 单房间设备数 | 253（受虚拟 IP 池限制） |
 | 推荐规模 | 10 台以内 |
 | 打洞协调复杂度 | O(N²) |
+
+### SOCKS5 特有
+
+| 项 | 说明 |
+|:---|:---|
+| **仅 TCP** | 不支持 UDP / ICMP |
+| **目标必须是虚拟 IP** | `10.64.0.x` 段，不支持域名 |
+| **Android 10+ loopback 隔离** | 同设备其他 App 无法访问 `127.0.0.1:1080`，需改 `0.0.0.0:1080` |
+| **运行中不可修改** | 需先停止 VPN |
 
 ### 兼容性
 
@@ -410,37 +385,93 @@ App 节点列表和 Web 面板使用同一套徽章：
 
 同一台 Android 设备**同时只能启用一个 VpnService**。与 Clash / 其他 VPN 类 App 需二选一。
 
-**SOCKS5 模式的 n2n-termux 可以与 n2n-android 共存**——两者走不同数据面（Termux 走 `127.0.0.1`，不抢 VPN 权限）。
+**但 SOCKS5 入口可以与 Clash 共存**——只要端口不冲突。
 
 ---
 
 ## ❓ 常见问题
 
+### Q: SOCKS5 和 VPN 有什么区别？
+
+| 项 | VpnService | SOCKS5 |
+|:---|:---|:---|
+| **覆盖范围** | 全设备（系统级） | 仅配置了代理的 App |
+| **协议** | TCP / UDP / ICMP | **仅 TCP** |
+| **应用透明** | ✅ 无需配置 | ⚠️ 需 App 显式配代理 |
+| **权限** | VPN 权限 | 无额外权限 |
+| **适用** | 全局组网 | 定向代理 |
+
+**推荐**：日常用 VpnService，特殊场景（如与其他代理共存）用 SOCKS5。
+
+### Q: SOCKS5 打开后为什么还需要 VPN 权限？
+
+因为组网底层**必须用 TUN 虚拟网卡**（SOCKS5 只是一个入口，把流量导入组网通道）。所以即使你只想要 SOCKS5，也要走 VpnService 的权限。
+
+**如果连 TUN 都不想开** → 用 [n2n-termux](https://github.com/goyo123321/n2n-termux)（SOCKS5 模式，无需 VPN 权限）。
+
+### Q: 打开 SOCKS5 后其他 App 会变慢吗？
+
+**不会**。SOCKS5 **只监听 `127.0.0.1:1080`**，不接管任何系统流量。只有**主动配置了 SOCKS5 代理**的 App 才会走组网。
+
+同时，VpnService 只接管 `10.64.0.0/24`，其他流量走系统默认。
+
+### Q: Firefox 怎么配 SOCKS5？
+
+```
+about:preferences
+  → 拉到底部 → 网络设置 → 设置...
+  → 手动代理配置
+    ○ SOCKS 主机: 127.0.0.1
+    ○ 端口:      1080
+    ○ SOCKS v5
+    ☑ 使用 SOCKS v5 时代理 DNS 查询
+  → 确定
+```
+
+**注意**：访问组网资源要用**虚拟 IP**（`10.64.0.x`），不要用域名。
+
+### Q: Termux 里怎么用手机的 SOCKS5？
+
+**Android 10+ 的 loopback 隔离**让 Termux 访问不到其他 App 的 `127.0.0.1:1080`。需要：
+
+1. **把 App 里的 SOCKS5 监听地址改成 `0.0.0.0:1080`**
+2. **在 Termux 里用手机的局域网 IP**：
+
+```bash
+# 查手机的局域网 IP
+ifconfig | grep "inet " | grep -v 127.0.0.1
+
+# 通过手机的局域网 IP 访问 SOCKS5
+curl --socks5 192.168.1.100:1080 http://10.64.0.2:8080/
+
+# 或者设置环境变量
+export ALL_PROXY=socks5://192.168.1.100:1080
+```
+
+**安全提示**：`0.0.0.0:1080` 会让同一 WiFi 下的所有设备都能访问你的 SOCKS5，**建议只在可信网络用**。
+
+### Q: SOCKS5 卡片的开关点不动？
+
+**检查 VPN 是否在运行**。运行时开关会变灰（防止配置冲突），需要先「停止 VPN」。
+
+### Q: 目标 IP 不是 10.64.0.x 会怎么样？
+
+SOCKS5 会**拒绝**并返回 `Host unreachable`。因为 `findPeerByVIP` 只识别虚拟 IP，其他 IP 没有对应的 peer。
+
+### Q: 与 Clash / Surge 冲突吗？
+
+**不冲突**（只要端口不同）。Clash 默认用 `7890`，n2n SOCKS5 用 `1080`，互不干扰。
+
+**唯一冲突点**：Clash 也可能用 `1080` 端口（部分配置）。检查一下，冲突就改 n2n 的监听端口。
+
 ### Q: 三端可以互相访问吗？
 
-**可以，全部支持**。见上文"三端协同全景"和"典型使用场景"。
+**可以，全部支持**。见上文「四端协同全景」。
 
 - **PC ↔ Android**：都是 TUN 数据面，直接访问虚拟 IP
 - **PC ↔ Termux**：PC 走 TUN，Termux 走 SOCKS5，透明互通
 - **Android ↔ Termux**：同 PC ↔ Termux
-
-### Q: Termux 无 root 能用 TUN 吗？
-
-**不能**。Android 内核拒绝非特权 App 创建 TUN 网卡。
-
-- **Termux 无 root** → 用 [n2n-termux](https://github.com/goyo123321/n2n-termux)（SOCKS5 模式）
-- **Termux + root** → 可直接跑 n2n-go-client（TUN 模式），与 PC 完全对等
-- **不 root 且要 TUN** → 装 n2n-android APK（用 VpnService）
-
-### Q: 同一台设备能同时跑 n2n-android 和 n2n-termux 吗？
-
-**可以**，两者不冲突：
-
-- n2n-android 用 VpnService（走 TUN）
-- n2n-termux 用 SOCKS5（走 `127.0.0.1`）
-- TUN 只接管组网网段，SOCKS5 端口不受影响
-
-但**同一类型只能开一个**：两个 VpnService 会抢权限。
+- **Android 的 SOCKS5 入口 ↔ 其他设备**：可以，但只能代理 TCP
 
 ### Q: `ping 10.64.0.3` 不通？
 
@@ -461,10 +492,9 @@ curl -v --max-time 5 http://10.64.0.3:8080/
 [NAT-HOLE] 公网候选 ? 个
 ```
 
-1. `publicEndpoint` 为空 → NAT 探测失败，STUN 服务器被封
+1. `publicEndpoint` 为空 → NAT 探测失败
 2. `natType=EasyNAT` 且是单样本 → 服务端探测太旧
-3. `公网候选 7 个` → 服务端 `coordinator.js` 太旧
-4. 端口差 > 100 → CGNAT 映射漂移严重
+3. 端口差 > 100 → CGNAT 映射漂移严重
 
 ### Q: P2P 建立后过一段时间断了？
 
@@ -476,35 +506,17 @@ curl -v --max-time 5 http://10.64.0.3:8080/
 
 ### Q: 面板显示 `p2p-avail` 不是 `p2p`？
 
-**`p2p-avail`** = 打洞握手成功，但 PONG 或真实数据帧还没到。
+**`p2p-avail`** = 打洞握手成功，但 PONG 或真实数据帧还没到。正常 1-2 秒内会升级到 `p2p`。**一直停在 `p2p-avail`** → 30 秒后自动降级。
 
-正常 1-2 秒内会升级到 `p2p`：
+### Q: 同 WiFi 延迟波动很大（100ms+）？
 
-```
-[P2P] 从 xxx 收到 Punch → P2PAvailable（等待数据帧验证）
-[P2P] 收到 PONG → P2P 直连（双向通道已验证）
-```
+**已修复**。原因是两端同时向 LAN + 公网发包，导致对端 `peer.UDPAddr` 被公网地址覆盖，回程走 CGNAT 回环。
 
-**一直停在 `p2p-avail`** → 30 秒后自动降级到 TURN/WS。
+**修复后**：
+- 若 peer 最近 5 秒从私网发过包 → **只发 LAN**（走内网直达，~8ms）
+- 收到包更新 `peer.UDPAddr` 时 → **LAN 优先**（不被公网覆盖）
 
-### Q: 服务端 `force_fallback` 收到后没反应？
-
-检查日志：
-
-```
-[信令] 收到 force_fallback: 1 个 peer, reason=server-forced
-[连接] xxx → TURN 中继 (force: server-forced)
-```
-
-如果只看到第一行没有第二行 → 客户端版本太旧。
-
-### Q: PC 通过 WS 中继访问 Android 服务失败？
-
-**这是 Android 侧曾有的缺口**——`app_stream.go` 已在本版本补齐。确认：
-
-1. 两端都是最新版本
-2. Android 日志里能看到 `[STREAM] 收到 open xxx from pc-xxx`
-3. PC 端日志里有 `[STREAM] xxx → xxx:port 打开`
+现在同 WiFi 场景延迟稳定在 **8~15ms**，标准差 <2ms。
 
 ### Q: 耗电严重？
 
