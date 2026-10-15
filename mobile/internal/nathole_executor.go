@@ -452,28 +452,53 @@ func (e *Edge) resetFailCount(peerID string) {
 
 // recordP2PSuccess 打洞成功时更新 peer 地址。
 //
-// ★ 简化：无条件覆盖 UDPAddr，LAN 时刷新 lastLANRecvAt。
-// 决策由 sendP2PFrame 统一处理。
+// ★ LAN 优先保护
+//
+// targetAddr 来自 resolveTarget，通常是 peer.UDPAddr（已被保护），
+// 但如果 resolveTarget 走到了 fallback 分支（peer.UDPAddr 为 nil），
+// 就会返回指令里的 TargetPubSocket（公网）。
+//
+// 无条件覆盖会把 LAN 打成公网，之后 SendToPeer 走 CGNAT 回环（100~300ms）。
 func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAddr) {
 	e.peersMu.Lock()
 	if p, ok := e.peers[instr.TargetMac]; ok {
+		// ★ LAN 优先保护
+		newIsLAN := isPrivateIPv4(targetAddr.IP)
+		oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
 		now := time.Now().UnixMilli()
-		p.UDPAddr = targetAddr
-		p.lastRecvAt = now
-		if isPrivateIPv4(targetAddr.IP) {
+
+		shouldUpdate := false
+		if p.UDPAddr == nil {
+			shouldUpdate = true
+		} else if !oldIsLAN && newIsLAN {
+			shouldUpdate = true
+		} else if oldIsLAN && !newIsLAN {
+			// 旧 LAN → 新公网：只在 lastLANRecvAt 超过 300 秒时才切
+			if p.lastLANRecvAt > 0 && now-p.lastLANRecvAt > 300000 {
+				shouldUpdate = true
+			}
+		} else {
+			// 同类型，端口变了才更新
+			if p.UDPAddr.Port != targetAddr.Port {
+				shouldUpdate = true
+			}
+		}
+
+		if newIsLAN {
 			p.lastLANRecvAt = now
 		}
+
+		if shouldUpdate {
+			p.UDPAddr = targetAddr
+		}
+		p.lastRecvAt = now
 	} else {
-		newPeer := &PeerInfo{
+		e.peers[instr.TargetMac] = &PeerInfo{
 			ClientID:   instr.TargetMac,
 			VirtualIP:  instr.TargetVirtualIp,
 			UDPAddr:    targetAddr,
 			lastRecvAt: time.Now().UnixMilli(),
 		}
-		if isPrivateIPv4(targetAddr.IP) {
-			newPeer.lastLANRecvAt = time.Now().UnixMilli()
-		}
-		e.peers[instr.TargetMac] = newPeer
 	}
 	e.peersMu.Unlock()
 }
@@ -522,7 +547,7 @@ func parseSockAddr(s string) *net.UDPAddr {
 
 // resolveTarget 决定这次打洞往哪个地址发包。
 //
-// 优先使用观测 raddr（已被证明可达）。
+// ★ 优先使用观测 raddr（已被证明可达）。
 func (e *Edge) resolveTarget(instr *NatHoleInstruction) *net.UDPAddr {
 	e.peersMu.RLock()
 	if p := e.peers[instr.TargetMac]; p != nil && p.UDPAddr != nil && p.lastRecvAt > 0 {
