@@ -130,20 +130,13 @@ type P2PStreamManager struct {
 	byID map[uint32]*P2PStream
 	next uint32
 	edge *Edge
-
-	// ★ 新增：记录哪些 peer 已经回过 PONG
-	//   首次收到 PING 回一个 PONG（兼容老版对端 + 升级 P2P）
-	//   之后不再回（节省流量 + 避免状态扰动）
-	pongSent map[string]bool
-	pongMu   sync.Mutex
 }
 
 func NewP2PStreamManager(edge *Edge) *P2PStreamManager {
 	m := &P2PStreamManager{
-		byID:     make(map[uint32]*P2PStream),
-		next:     2,
-		edge:     edge,
-		pongSent: make(map[string]bool),
+		byID: make(map[uint32]*P2PStream),
+		next: 2,
+		edge: edge,
 	}
 	safeGo("p2p-reaper", m.reaper)
 	return m
@@ -193,10 +186,6 @@ func (m *P2PStreamManager) closeAll() {
 	for _, s := range all {
 		s.close("manager-shutdown")
 	}
-	// 清空 pongSent
-	m.pongMu.Lock()
-	m.pongSent = make(map[string]bool)
-	m.pongMu.Unlock()
 }
 
 func (m *P2PStreamManager) dropPeer(peerID string) {
@@ -214,11 +203,6 @@ func (m *P2PStreamManager) dropPeer(peerID string) {
 	for _, s := range toClose {
 		s.close("peer-left")
 	}
-
-	// ★ 清空该 peer 的 pongSent 记录
-	m.pongMu.Lock()
-	delete(m.pongSent, peerID)
-	m.pongMu.Unlock()
 }
 
 func (m *P2PStreamManager) reaper() {
@@ -318,11 +302,6 @@ func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 
 // sendP2PFrame 发送一帧到对端的所有候选地址。
 //
-// ★ 修复 1：LAN 优先（300s 窗口）
-// ★ 修复 2：控制帧全发（保 CGNAT 映射）
-// ★ 修复 3：TURN 模式下控制帧也尝试直连
-// ★ 修复 4：TURN 未就绪时控制帧也走直连（防死锁）
-//
 // ★ Android 特有：e.udpConn 是 net.PacketConn，用 WriteTo。
 func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	s.mu.Lock()
@@ -337,7 +316,7 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	// ============ TURN 模式 ============
 	if viaTURN {
 		if e.turnClient == nil || !e.turnClient.IsReady() {
-			// ★ 修复 4：TURN 未就绪也走直连试探（防死锁）
+			// TURN 未就绪也走直连试探（防死锁）
 			if forceDual && e.udpConn != nil {
 				targets := e.collectN2NSTargets(s)
 				sent := 0
@@ -616,47 +595,14 @@ func (m *P2PStreamManager) acceptSYN(peerID string, peerAddr *net.UDPAddr, viaTU
 
 // handleFrame 处理收到的帧。
 //
-// ★ 修复（本版）：PING 首次回 PONG，之后不回
-//
-// 首次回 PONG 的目的：
-//   - 兼容老版对端（只认 PONG 升 P2P）
-//   - 让对端确认本端存活
-//
-// 之后不回的原因：
-//   - 双向 PING 已保活 CGNAT 映射（A 发 PING 保 A→B，B 发 PING 保 B→A）
-//   - PONG 走公网可能扰动状态（虽然前面已修，但这是釜底抽薪）
-//   - 节省 50% 保活流量
+// ★ PING/PONG 都不在这里处理——回 PONG 逻辑在 handleP2PFrame 里
+//   （需要访问 relayMgr.GetState 判断是否要回）
 func (m *P2PStreamManager) handleFrame(peerID string, peerAddr *net.UDPAddr, viaTURN bool, f *p2pFrame) {
 	s := m.get(f.StreamID)
 
 	if s == nil {
-		if f.Type == p2pTypePING {
-			// ★ 检查是否已回过 PONG
-			m.pongMu.Lock()
-			needPong := !m.pongSent[peerID]
-			if needPong {
-				m.pongSent[peerID] = true
-			}
-			m.pongMu.Unlock()
-
-			if needPong {
-				log.Printf("[P2P] %s 首次 PING，回一个 PONG（之后不再回）", peerID)
-				safeGo("p2p-pong", func() {
-					resp := &p2pFrame{Type: p2pTypePONG, StreamID: 0}
-					tmp := &P2PStream{
-						ID:       0,
-						PeerID:   peerID,
-						peerAddr: peerAddr,
-						viaTURN:  viaTURN,
-					}
-					_ = m.edge.sendP2PFrame(tmp, resp)
-				})
-			}
-			return
-		}
-		if f.Type == p2pTypePONG {
-			// 兼容老版对端（可能有对端还在回 PONG）
-			// 收到 PONG 什么都不做——对端存活由它主动发 PING 体现
+		if f.Type == p2pTypePING || f.Type == p2pTypePONG {
+			// PING/PONG 由 handleP2PFrame 处理
 			return
 		}
 		if f.Type == p2pTypeSYN {
