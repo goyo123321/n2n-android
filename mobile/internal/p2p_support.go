@@ -72,16 +72,80 @@ func (e *Edge) peerAddrAndMode(peerID string) (*net.UDPAddr, bool) {
 	return p.UDPAddr, viaTURN
 }
 
+// setPeerUDPAddr 是 peer.UDPAddr 的唯一写入点。
+//
+// 所有可能改变 UDPAddr 的入口都必须经过它，避免逻辑分叉：
+//   - registerPeer       (joined / ready 消息)
+//   - handleP2PFrame     (收到 N2NS 帧)
+//   - notePeerCommon     (收到 Punch/ACK/IPv4)
+//   - ensureTargetPeer   (nat_hole_instruction)
+//
+// ★ LAN 优先规则：
+//   1. old=nil             → 直接设置
+//   2. old=公网 new=LAN    → 更新（LAN 升级）
+//   3. old=LAN  new=LAN    → 端口变了才更新
+//   4. old=LAN  new=公网   → 保留 LAN，除非 lastLANRecvAt 超过 300 秒
+//   5. old=公网 new=公网   → 端口变了才更新
+//
+// ★ 副作用：
+//   - 新地址是 LAN 时刷新 p.lastLANRecvAt
+//   - 不更新 p.lastRecvAt（由调用者维护）
+//
+// ★ 调用约定：
+//   调用者必须持有 e.peersMu 写锁。
+func (e *Edge) setPeerUDPAddr(p *PeerInfo, newAddr *net.UDPAddr, source string) bool {
+	if p == nil || newAddr == nil {
+		return false
+	}
+
+	now := time.Now().UnixMilli()
+	newIsLAN := isPrivateIPv4(newAddr.IP)
+	oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
+
+	shouldUpdate := false
+	reason := ""
+
+	if p.UDPAddr == nil {
+		shouldUpdate = true
+		reason = "init"
+	} else if !oldIsLAN && newIsLAN {
+		shouldUpdate = true
+		reason = "lan-upgrade"
+	} else if oldIsLAN && !newIsLAN {
+		if p.lastLANRecvAt > 0 && now-p.lastLANRecvAt > 300000 {
+			shouldUpdate = true
+			reason = "lan-timeout"
+		} else {
+			reason = "keep-lan"
+		}
+	} else {
+		if p.UDPAddr.Port != newAddr.Port {
+			shouldUpdate = true
+			reason = "port-change"
+		} else {
+			reason = "same"
+		}
+	}
+
+	// 新地址是 LAN 时，无论是否更新 UDPAddr，都要刷新 lastLANRecvAt
+	if newIsLAN {
+		p.lastLANRecvAt = now
+	}
+
+	if shouldUpdate {
+		p.UDPAddr = &net.UDPAddr{IP: newAddr.IP, Port: newAddr.Port}
+		if reason == "lan-timeout" {
+			log.Printf("[P2P] %s LAN 超 300s 无流量，切公网 (source=%s)",
+				p.ClientID, source)
+		}
+		return true
+	}
+	return false
+}
+
 // handleP2PFrame 收到 N2NS 帧时的入口。
 //
-// ★ 修复：更新 peer.UDPAddr 时采用"LAN 优先 + 300 秒窗口"策略。
-//
-// 更新规则（peer 已有的 UDPAddr 称为 oldAddr，新收到包的源地址称 newAddr）：
-//   1. oldAddr 为空                → 直接设置
-//   2. old=公网, new=LAN           → 更新（LAN 优先），刷新 lastLANRecvAt
-//   3. old=LAN,  new=LAN           → 端口变了才更新，刷新 lastLANRecvAt
-//   4. old=LAN,  new=公网          → 保留 LAN，除非 lastLANRecvAt 超过 300 秒
-//   5. old=公网, new=公网          → 端口变了才更新
+// ★ 修复：更新 peer.UDPAddr 通过 setPeerUDPAddr 统一处理。
 //
 // PING/PONG 语义区分：
 //   - 收到 PING  → 只证明"对端→本端"单向可达，不升级本端状态
@@ -103,47 +167,9 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 	if !viaTURN {
 		e.peersMu.Lock()
 		if p := e.peers[peerID]; p != nil {
-			now := time.Now().UnixMilli()
-			newIsLAN := isPrivateIPv4(peerAddr.IP)
-			oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
-
-			shouldUpdate := false
-			if p.UDPAddr == nil {
-				// 无旧地址
-				shouldUpdate = true
-				if newIsLAN {
-					p.lastLANRecvAt = now
-				}
-			} else if !oldIsLAN && newIsLAN {
-				// 旧公网 → 新 LAN（LAN 优先）
-				shouldUpdate = true
-				p.lastLANRecvAt = now
-			} else if oldIsLAN && !newIsLAN {
-				// 旧 LAN → 新公网
-				// ★ 窗口从 60s 延长到 300s（5 分钟）
-				//   60 秒太短——WiFi 抖动、Doze、AP 漫游都可能超过
-				//   300 秒足够长，只有 LAN 真断才切公网
-				if now-p.lastLANRecvAt > 300000 {
-					shouldUpdate = true
-					log.Printf("[P2P] %s LAN 地址超过 300s 无流量，改用公网地址", peerID)
-				}
-			} else if oldIsLAN && newIsLAN {
-				// 都是 LAN，端口变了才更新
-				if p.UDPAddr.Port != peerAddr.Port {
-					shouldUpdate = true
-				}
-				p.lastLANRecvAt = now
-			} else {
-				// 都是公网，端口变了才更新
-				if p.UDPAddr.Port != peerAddr.Port {
-					shouldUpdate = true
-				}
-			}
-
-			if shouldUpdate {
-				p.UDPAddr = &net.UDPAddr{IP: peerAddr.IP, Port: peerAddr.Port}
-			}
-			p.lastRecvAt = now
+			// ★ 统一通过 setPeerUDPAddr 更新（LAN 优先）
+			e.setPeerUDPAddr(p, peerAddr, "n2ns")
+			p.lastRecvAt = time.Now().UnixMilli()
 		}
 		e.peersMu.Unlock()
 	}
