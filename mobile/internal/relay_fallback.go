@@ -37,6 +37,9 @@ func NewRelayManager(ws *WSTransport, turnClient *TURNClient, edge *Edge) *Relay
 }
 
 // MarkP2PAvailable 从 Unknown / Relay 升级到"打洞握手成功"。
+//
+// 收到 Punch 或 ACK 时调用。此时对端→本端通道已被证明，
+// 但还需要收到 PONG 或真实数据帧才能确认双向通道。
 func (rm *RelayManager) MarkP2PAvailable(peerID string) {
 	rm.mu.Lock()
 	cur := rm.states[peerID]
@@ -78,6 +81,7 @@ func (rm *RelayManager) MarkP2P(peerId string) {
 func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.mu.Lock()
 
+	// 保护 P2PAvailable：给它验证窗口，不因单次 UDP 发送失败就降级
 	if rm.states[peerId] == ConnP2P || rm.states[peerId] == ConnP2PAvailable {
 		rm.mu.Unlock()
 		rm.cancelFallbackTimer(peerId)
@@ -134,6 +138,14 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 }
 
 // ForceFallback 强制降级，允许从 P2PAvailable 直接降级。
+//
+// 使用场景：
+//   1. 服务端下发 force_fallback（同 STUN IP 已失败）
+//   2. P2PAvailable 超时兜底
+//   3. 60s 无流量活性检测
+//
+// 与 MarkFallback 的区别：MarkFallback 保护 P2PAvailable，
+// ForceFallback 允许从 P2PAvailable 立即切到 TURN/Relay。
 func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
@@ -159,6 +171,10 @@ func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	}
 }
 
+// ClearPeer 清空某个 peer 的连接状态。
+//
+// 对端离线时调用。避免新会话继承旧状态（如 TURN）导致
+// MarkFallback 被跳过。
 func (rm *RelayManager) ClearPeer(peerID string) {
 	if peerID == "" {
 		return
@@ -168,6 +184,9 @@ func (rm *RelayManager) ClearPeer(peerID string) {
 	delete(rm.states, peerID)
 }
 
+// ClearAll 清空所有 peer 的连接状态。
+//
+// WS 重连时调用（服务端会清所有 pair，客户端对应清）。
 func (rm *RelayManager) ClearAll() {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
@@ -217,6 +236,7 @@ func (rm *RelayManager) MarkRelay(peerId string) {
 	rm.MarkFallback(peerId)
 }
 
+// ShouldRelay 判断是否需要走中继（P2P/P2PAvailable 都返回 false）。
 func (rm *RelayManager) ShouldRelay(peerId string) bool {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
@@ -264,88 +284,39 @@ func (rm *RelayManager) SendViaRelay(data []byte) error {
 	return rm.ws.SendBinary(data)
 }
 
-// ============ 数据面发送 ============
-
-// sendToPeerMulticast 向 peer 的所有候选地址发送。
-//
-// ★ 与 p2p_stream.go 的 collectN2NSTargets 逻辑一致，但用于 ICMP/UDP 数据面。
-//
-// 为什么：ICMP 是单包的，走单路径丢一个就丢一个。
-// 双发 LAN + 公网，对端收到哪个是哪个，保证低延迟。
-// 代价：流量翻倍（但 ICMP 通常 < 100 字节，可接受）。
-//
-// ★ Android 特有：e.udpConn 是 net.PacketConn，用 WriteTo。
-func (rm *RelayManager) sendToPeerMulticast(data []byte, target *PeerInfo) bool {
-	if target == nil {
-		return false
-	}
-	e := rm.edge
-	if e == nil || e.udpConn == nil {
-		return false
-	}
-
-	var targets []*net.UDPAddr
-	seen := make(map[string]bool)
-	add := func(a *net.UDPAddr) {
-		if a == nil || a.IP == nil {
-			return
-		}
-		k := a.String()
-		if seen[k] {
-			return
-		}
-		seen[k] = true
-		targets = append(targets, a)
-	}
-
-	// 1. peer.UDPAddr（最近观测地址，可能是 LAN 或公网）
-	add(target.UDPAddr)
-
-	// 2. peer 的 LAN 端点列表
-	for _, lan := range target.LanEndpoints {
-		if a, err := net.ResolveUDPAddr("udp", lan); err == nil {
-			add(a)
-		}
-	}
-
-	// 3. peer 的 assisted 端点
-	for _, ep := range target.AssistedEndpoints {
-		if a, err := net.ResolveUDPAddr("udp", ep); err == nil {
-			add(a)
-		}
-	}
-
-	if len(targets) == 0 {
-		return false
-	}
-
-	sent := 0
-	for _, addr := range targets {
-		if _, err := e.udpConn.WriteTo(data, addr); err == nil {
-			sent++
-		}
-	}
-	return sent > 0
-}
-
 // SendToPeer 按当前状态发送数据。
 //
-// ★ 修复：P2P 状态下多目标发送（LAN + 公网 + assisted）。
+// ★ 单发（不做双发）
 //
-//   ICMP 是单包的，单目标丢包即丢包——双发保证至少一条到达。
-//   对端 p2p_stream.go 的 handleData 有去重，不会重复交付。
+// 数据面路径：
+//   - P2P/P2PAvailable → 走 UDP，目标由 peer.UDPAddr 决定
+//   - TURN             → 走 TURN 中继
+//   - WS Relay         → 走 WS 中继
+//
+// 为什么不双发：
+//   - TUN 层没有去重，双发会导致 DUP（ICMP/TCP/UDP 重复交付）
+//   - 5 入口统一（updatePeerUDPAddrLocked）已保证 UDPAddr 最优
+//   - 保活机制（5s STUN + 15s PING）让 CGNAT 映射永远新鲜
+//   - PING 在 N2NS 层已双发（用于探测 LAN 恢复），覆盖了保活需求
+//   - TCP 有自己的重传，不需要应用层双发
+//
+// ★ Android 特有：e.udpConn 是 net.PacketConn（不是 *net.UDPConn），
+//   用 WriteTo(addr) 而非 WriteToUDP。
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
 	state := rm.GetState(peerId)
 
 	switch state {
 	case ConnP2P, ConnP2PAvailable:
-		// ★ P2P 状态下，多目标发送
-		if rm.sendToPeerMulticast(data, target) {
-			return true
+		if target != nil && target.UDPAddr != nil && rm.edge != nil && rm.edge.udpConn != nil {
+			_, err := rm.edge.udpConn.WriteTo(data, target.UDPAddr)
+			if err == nil {
+				return true
+			}
+			log.Printf("[P2P] UDP 发送到 %s 失败: %v，降级到 WS", peerId, err)
+			rm.MarkFallback(peerId)
+		} else {
+			rm.MarkFallback(peerId)
 		}
-		// 所有候选都失败 → 降级
-		log.Printf("[P2P] UDP 发送到 %s 全部失败，降级到 WS", peerId)
-		rm.MarkFallback(peerId)
 		if rm.ws == nil {
 			return false
 		}
