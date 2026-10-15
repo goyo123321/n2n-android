@@ -1235,7 +1235,11 @@ func jsonInt(v interface{}) int {
 
 // registerPeer 注册/更新一个 peer。
 //
-// ★ 统一调度：UDPAddr 更新走 updatePeerUDPAddrLocked
+// ★ 修复：LAN 优先保护 UDPAddr
+//
+// udpAddr 来自 joined 消息的 pubIP:pubPort（永远是公网地址）。
+// 如果 peer 当前 UDPAddr 是 LAN，不要被公网覆盖——
+// 否则 SendToPeer 会走公网 CGNAT 回环（100~500ms）。
 func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	var udpAddr *net.UDPAddr
 	if pubIP != "" && pubPort > 0 {
@@ -1260,9 +1264,12 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string,
 			p.PubPort = pubPort
 		}
 
-		// ★ 统一走 updatePeerUDPAddrLocked
+		// ★ LAN 优先保护
 		if udpAddr != nil {
-			updatePeerUDPAddrLocked(p, udpAddr, "join")
+			oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
+			if !oldIsLAN {
+				p.UDPAddr = udpAddr
+			}
 		}
 
 		if natType != "" {
@@ -1295,7 +1302,11 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string,
 
 // ensureTargetPeer 记录指令里的目标 peer 信息。
 //
-// ★ 统一调度：UDPAddr 更新走 updatePeerUDPAddrLocked
+// ★ 修复：LAN 优先保护 UDPAddr
+//
+// instr.TargetPubSocket 来自服务端 nat_hole_instruction，永远是公网。
+// 如果 peer 当前 UDPAddr 是 LAN，不要被服务端下发的公网覆盖——
+// 否则打洞成功后，服务端 30 秒重发指令会再次把 LAN 覆盖成公网。
 func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	if instr.TargetMac == "" {
 		return
@@ -1307,9 +1318,12 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	e.peersMu.Lock()
 	defer e.peersMu.Unlock()
 	if p, ok := e.peers[instr.TargetMac]; ok {
-		// ★ 统一走 updatePeerUDPAddrLocked
+		// ★ LAN 优先保护
 		if udpAddr != nil {
-			updatePeerUDPAddrLocked(p, udpAddr, "instr")
+			oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
+			if !oldIsLAN {
+				p.UDPAddr = udpAddr
+			}
 		}
 		if instr.TargetVirtualIp != "" {
 			p.VirtualIP = instr.TargetVirtualIp
@@ -1561,7 +1575,7 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 
 // notePeerCommon 是打洞握手路径的统一入口。
 //
-// ★ 统一调度：UDPAddr 更新走 updatePeerUDPAddrLocked
+// ★ 修复：更新 peer.UDPAddr 时采用"LAN 优先"策略，与 handleP2PFrame 保持一致。
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
 	now := time.Now().UnixMilli()
 
@@ -1624,8 +1638,34 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 		return
 	}
 
-	// ★ 统一走 updatePeerUDPAddrLocked
-	updatePeerUDPAddrLocked(best, addr, "probe")
+	// ★ LAN 优先更新 UDPAddr
+	newIsLAN := isPrivateIPv4(addr.IP)
+	oldIsLAN := best.UDPAddr != nil && isPrivateIPv4(best.UDPAddr.IP)
+
+	shouldUpdate := false
+	if best.UDPAddr == nil {
+		shouldUpdate = true
+	} else if !oldIsLAN && newIsLAN {
+		shouldUpdate = true
+	} else if oldIsLAN && !newIsLAN {
+		if best.lastLANRecvAt > 0 && now-best.lastLANRecvAt > 300000 {
+			shouldUpdate = true
+			log.Printf("[P2P] %s (note) LAN 超过 300s 无流量，改用公网地址", best.ClientID)
+		}
+	} else {
+		if best.UDPAddr.Port != addrPort {
+			shouldUpdate = true
+		}
+	}
+
+	if newIsLAN {
+		best.lastLANRecvAt = now
+	}
+
+	if shouldUpdate {
+		best.UDPAddr = &net.UDPAddr{IP: addr.IP, Port: addr.Port}
+	}
+
 	best.lastRecvAt = now
 	if isRealData {
 		best.hasRealData = true
@@ -1735,30 +1775,6 @@ func (e *Edge) hasTrafficFromAny(ips []net.IP, since int64) bool {
 		}
 	}
 	return false
-}
-
-// firstLanEndpoint 返回 peer 的首选 LAN 地址（已按 affinity 排序）。
-//
-// 用于 SendToPeer 的"半双发"——主路径是公网时补发 LAN。
-//
-// 返回 nil 表示 peer 没有 LAN 候选。
-func (e *Edge) firstLanEndpoint(peerID string) *net.UDPAddr {
-	e.peersMu.RLock()
-	p := e.peers[peerID]
-	var lan string
-	if p != nil && len(p.LanEndpoints) > 0 {
-		lan = p.LanEndpoints[0]
-	}
-	e.peersMu.RUnlock()
-
-	if lan == "" {
-		return nil
-	}
-	addr, err := net.ResolveUDPAddr("udp", lan)
-	if err != nil {
-		return nil
-	}
-	return addr
 }
 
 // ============ 多 STUN 端点收集 ============
