@@ -37,9 +37,6 @@ func NewRelayManager(ws *WSTransport, turnClient *TURNClient, edge *Edge) *Relay
 }
 
 // MarkP2PAvailable 从 Unknown / Relay 升级到"打洞握手成功"。
-//
-// 收到 Punch 或 ACK 时调用。此时对端→本端通道已被证明，
-// 但还需要收到 PONG 或真实数据帧才能确认双向通道。
 func (rm *RelayManager) MarkP2PAvailable(peerID string) {
 	rm.mu.Lock()
 	cur := rm.states[peerID]
@@ -81,7 +78,6 @@ func (rm *RelayManager) MarkP2P(peerId string) {
 func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.mu.Lock()
 
-	// 保护 P2PAvailable：给它验证窗口，不因单次 UDP 发送失败就降级
 	if rm.states[peerId] == ConnP2P || rm.states[peerId] == ConnP2PAvailable {
 		rm.mu.Unlock()
 		rm.cancelFallbackTimer(peerId)
@@ -137,15 +133,11 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.cancelFallbackTimer(peerId)
 }
 
-// ForceFallback 强制降级，允许从 P2PAvailable 直接降级。
+// ForceFallback 强制降级，允许从 P2PAvailable 降级。
 //
 // 使用场景：
 //   1. 服务端下发 force_fallback（同 STUN IP 已失败）
 //   2. P2PAvailable 超时兜底
-//   3. 显式放弃 P2P 的场景
-//
-// 与 MarkFallback 的区别：MarkFallback 保护 P2PAvailable，
-// ForceFallback 允许从 P2PAvailable 立即切到 TURN/Relay。
 func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
@@ -236,7 +228,7 @@ func (rm *RelayManager) MarkRelay(peerId string) {
 	rm.MarkFallback(peerId)
 }
 
-// ShouldRelay 判断是否需要走中继（P2P/P2PAvailable 都返回 false）。
+// ShouldRelay 判断是否需要走中继。
 func (rm *RelayManager) ShouldRelay(peerId string) bool {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
@@ -339,6 +331,14 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 	return false
 }
 
+// Report 定期上报连接状态给服务端。
+//
+// ★ 修复：即使 states 为空也上报
+//
+// 空 Map 让服务端知道客户端当前没有 P2P 连接，
+// 触发服务端清空 punchState 并重新协调。
+// 否则客户端 states 空 → 不上报 → 服务端保留旧状态
+// → 不重新协调 → 死锁。
 func (rm *RelayManager) Report(interval time.Duration) {
 	if rm.edge == nil {
 		return
@@ -355,9 +355,8 @@ func (rm *RelayManager) Report(interval time.Duration) {
 					conns[peerId] = string(t)
 				}
 				rm.mu.RUnlock()
-				if len(conns) == 0 {
-					continue
-				}
+
+				// ★ 即使为空也上报
 				if rm.ws == nil {
 					continue
 				}
