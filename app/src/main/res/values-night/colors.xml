@@ -19,8 +19,4 @@
     <color name="badge_turn_fg">#93C5FD</color>
     <color name="badge_ws_bg">#78350F</color>
     <color name="badge_ws_fg">#FCD34D</color>
-
-    <color name="ic_launcher_background">#0F172A</color>
-    <color name="ic_launcher_foreground">#22D3EE</color>
-    <color name="ic_launcher_accent">#60A5FA</color>
 </resources>
