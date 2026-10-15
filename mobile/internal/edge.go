@@ -1235,11 +1235,7 @@ func jsonInt(v interface{}) int {
 
 // registerPeer 注册/更新一个 peer。
 //
-// ★ 修复：LAN 优先保护 UDPAddr
-//
-// udpAddr 来自 joined 消息的 pubIP:pubPort（永远是公网地址）。
-// 如果 peer 当前 UDPAddr 是 LAN，不要被公网覆盖——
-// 否则 SendToPeer 会走公网 CGNAT 回环（100~500ms）。
+// ★ UDPAddr 通过 setPeerUDPAddr 统一更新（LAN 优先）。
 func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	var udpAddr *net.UDPAddr
 	if pubIP != "" && pubPort > 0 {
@@ -1264,12 +1260,9 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string,
 			p.PubPort = pubPort
 		}
 
-		// ★ LAN 优先保护
+		// ★ 统一通过 setPeerUDPAddr 更新（LAN 优先）
 		if udpAddr != nil {
-			oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
-			if !oldIsLAN {
-				p.UDPAddr = udpAddr
-			}
+			e.setPeerUDPAddr(p, udpAddr, "joined")
 		}
 
 		if natType != "" {
@@ -1302,11 +1295,7 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string,
 
 // ensureTargetPeer 记录指令里的目标 peer 信息。
 //
-// ★ 修复：LAN 优先保护 UDPAddr
-//
-// instr.TargetPubSocket 来自服务端 nat_hole_instruction，永远是公网。
-// 如果 peer 当前 UDPAddr 是 LAN，不要被服务端下发的公网覆盖——
-// 否则打洞成功后，服务端 30 秒重发指令会再次把 LAN 覆盖成公网。
+// ★ UDPAddr 通过 setPeerUDPAddr 统一更新（LAN 优先）。
 func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	if instr.TargetMac == "" {
 		return
@@ -1318,12 +1307,9 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	e.peersMu.Lock()
 	defer e.peersMu.Unlock()
 	if p, ok := e.peers[instr.TargetMac]; ok {
-		// ★ LAN 优先保护
+		// ★ 统一通过 setPeerUDPAddr 更新（LAN 优先）
 		if udpAddr != nil {
-			oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
-			if !oldIsLAN {
-				p.UDPAddr = udpAddr
-			}
+			e.setPeerUDPAddr(p, udpAddr, "nat_hole")
 		}
 		if instr.TargetVirtualIp != "" {
 			p.VirtualIP = instr.TargetVirtualIp
@@ -1575,10 +1561,8 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 
 // notePeerCommon 是打洞握手路径的统一入口。
 //
-// ★ 修复：更新 peer.UDPAddr 时采用"LAN 优先"策略，与 handleP2PFrame 保持一致。
+// ★ UDPAddr 通过 setPeerUDPAddr 统一更新（LAN 优先）。
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
-	now := time.Now().UnixMilli()
-
 	e.peersMu.Lock()
 	var best *PeerInfo
 	bestScore := 0
@@ -1638,35 +1622,10 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 		return
 	}
 
-	// ★ LAN 优先更新 UDPAddr
-	newIsLAN := isPrivateIPv4(addr.IP)
-	oldIsLAN := best.UDPAddr != nil && isPrivateIPv4(best.UDPAddr.IP)
+	// ★ 统一通过 setPeerUDPAddr 更新（LAN 优先）
+	e.setPeerUDPAddr(best, addr, "punch")
 
-	shouldUpdate := false
-	if best.UDPAddr == nil {
-		shouldUpdate = true
-	} else if !oldIsLAN && newIsLAN {
-		shouldUpdate = true
-	} else if oldIsLAN && !newIsLAN {
-		if best.lastLANRecvAt > 0 && now-best.lastLANRecvAt > 300000 {
-			shouldUpdate = true
-			log.Printf("[P2P] %s (note) LAN 超过 300s 无流量，改用公网地址", best.ClientID)
-		}
-	} else {
-		if best.UDPAddr.Port != addrPort {
-			shouldUpdate = true
-		}
-	}
-
-	if newIsLAN {
-		best.lastLANRecvAt = now
-	}
-
-	if shouldUpdate {
-		best.UDPAddr = &net.UDPAddr{IP: addr.IP, Port: addr.Port}
-	}
-
-	best.lastRecvAt = now
+	best.lastRecvAt = time.Now().UnixMilli()
 	if isRealData {
 		best.hasRealData = true
 	}
