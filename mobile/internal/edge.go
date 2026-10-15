@@ -1737,6 +1737,30 @@ func (e *Edge) hasTrafficFromAny(ips []net.IP, since int64) bool {
 	return false
 }
 
+// firstLanEndpoint 返回 peer 的首选 LAN 地址（已按 affinity 排序）。
+//
+// 用于 SendToPeer 的"半双发"——主路径是公网时补发 LAN。
+//
+// 返回 nil 表示 peer 没有 LAN 候选。
+func (e *Edge) firstLanEndpoint(peerID string) *net.UDPAddr {
+	e.peersMu.RLock()
+	p := e.peers[peerID]
+	var lan string
+	if p != nil && len(p.LanEndpoints) > 0 {
+		lan = p.LanEndpoints[0]
+	}
+	e.peersMu.RUnlock()
+
+	if lan == "" {
+		return nil
+	}
+	addr, err := net.ResolveUDPAddr("udp", lan)
+	if err != nil {
+		return nil
+	}
+	return addr
+}
+
 // ============ 多 STUN 端点收集 ============
 
 func (e *Edge) addAssistedEndpoint(ip string, port int) {
