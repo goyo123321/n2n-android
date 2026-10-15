@@ -306,19 +306,10 @@ func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 
 // sendP2PFrame 发送一帧到对端的所有候选地址。
 //
-// ★ 修复 1：LAN 优先（窗口 300s）。
+// ★ 统一调度：lanPreferred 判断改用 isLANPreferredLocked
 //
-//   - 旧判据：p.UDPAddr 是私网 且 lastRecvAt < 5s
-//     → p.UDPAddr 一旦被公网覆盖，就永远不再尝试 LAN
-//
-//   - 新判据：p.lastLANRecvAt < 300s（即 5 分钟内收到过 LAN 帧）
-//     → 只要 LAN 通道存活，就优先走 LAN
-//
+// ★ 修复 1：LAN 优先。
 // ★ 修复 2：控制帧全发（保 CGNAT 映射 + 探测 LAN 恢复）。
-//
-//   PING/PONG/SYN/SYNACK/FIN/RST 都全发，同时刷新 A↔B 双向 CGNAT 映射。
-//   只有 DATA/ACK 走 LAN-only 节省带宽。
-//
 // ★ 修复 3：TURN 模式下控制帧也尝试直连（探测 LAN 恢复）。
 //
 // ★ Android 特有：e.udpConn 是 net.PacketConn（不是 *net.UDPConn），
@@ -362,7 +353,7 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 		// ★ 控制帧在 TURN 模式：TURN + 直连试探都发
 		var lastErr error
 
-		// 1. 直连路径（LAN + 公网所有候选）
+		// 1. 直连路径
 		if e.udpConn != nil {
 			targets := e.collectN2NSTargets(s)
 			for _, addr := range targets {
@@ -398,14 +389,11 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 		return errors.New("no udp")
 	}
 
+	// ★ 统一判据：改用 isLANPreferredLocked
 	e.peersMu.RLock()
 	var lanPreferred bool
 	if p := e.peers[peerID]; p != nil {
-		// ★ 窗口从 60s 延长到 300s
-		if p.lastLANRecvAt > 0 &&
-			time.Now().UnixMilli()-p.lastLANRecvAt < 300000 {
-			lanPreferred = true
-		}
+		lanPreferred = isLANPreferredLocked(p)
 	}
 	e.peersMu.RUnlock()
 
