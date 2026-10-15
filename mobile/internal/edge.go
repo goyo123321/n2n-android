@@ -28,7 +28,7 @@ type PeerInfo struct {
 	TurnRelayAddr     string
 	UDPAddr           *net.UDPAddr
 	lastRecvAt        int64
-	lastLANRecvAt     int64 // 只在 helper 里写，记录最近一次收到 LAN 帧的时间
+	lastLANRecvAt     int64 // ★ 最近一次收到 LAN 帧的时间
 	loggedReady       bool
 	hasRealData       bool
 	AssistedEndpoints []string
@@ -136,52 +136,6 @@ func generateDefaultClientID() string {
 	return fmt.Sprintf("%s-%s", hostname, hex.EncodeToString(b[:]))
 }
 
-// ============ ★ 核心 helper：所有 UDPAddr 更新的唯一入口 ============
-
-// updatePeerUDPAddr 统一更新 peer 的 UDPAddr（LAN 优先）。
-//
-// 所有需要更新 UDPAddr 的入口都调用此函数——逻辑只写一次。
-//
-// 规则：
-//   收到 LAN 帧  → 无条件更新 UDPAddr + 刷新 lastLANRecvAt
-//   收到公网帧   → 只在以下情况更新：
-//                 1. UDPAddr 为空
-//                 2. 当前 UDPAddr 不是 LAN
-//                 3. LAN 过期（lastLANRecvAt > 300 秒前）
-func (e *Edge) updatePeerUDPAddr(p *PeerInfo, newAddr *net.UDPAddr) {
-	if p == nil || newAddr == nil {
-		return
-	}
-	now := time.Now().UnixMilli()
-	newIsLAN := isPrivateIPv4(newAddr.IP)
-
-	if newIsLAN {
-		p.UDPAddr = newAddr
-		p.lastLANRecvAt = now
-		return
-	}
-
-	// 公网帧
-	if p.UDPAddr == nil {
-		p.UDPAddr = newAddr
-		return
-	}
-
-	oldIsLAN := isPrivateIPv4(p.UDPAddr.IP)
-	if !oldIsLAN {
-		// 当前不是 LAN，可以更新
-		p.UDPAddr = newAddr
-		return
-	}
-
-	// 当前是 LAN，只在 LAN 过期时才切公网
-	if p.lastLANRecvAt > 0 && now-p.lastLANRecvAt > 300000 {
-		p.UDPAddr = newAddr
-		log.Printf("[P2P] %s LAN 超过 300s 无流量，改用公网地址", p.ClientID)
-	}
-	// 否则保留 LAN
-}
-
 // ============ UDP 保活 ============
 
 const keepaliveInterval = 5 * time.Second
@@ -256,6 +210,8 @@ func (e *Edge) startKeepalive() {
 // ============ P2P 通道保活 + 活性检测 ============
 
 const p2pKeepaliveInterval = 15 * time.Second
+
+// ★ 从 60 秒延长到 120 秒——容忍更多偶发丢包，避免误判
 const p2pIdleDeadMs = 120000
 
 func (e *Edge) startP2PKeepalive() {
@@ -305,8 +261,9 @@ func (e *Edge) sendP2PKeepalive() {
 	e.peersMu.RUnlock()
 
 	for _, id := range deadPeers {
-		log.Printf("[P2P] %s 120s 无任何流量，判定 P2P 失效，强制降级", id)
-		e.relayMgr.ForceFallback(id, "no-traffic-120s")
+		log.Printf("[P2P] %s %ds 无任何流量，判定 P2P 失效，强制降级",
+			id, p2pIdleDeadMs/1000)
+		e.relayMgr.ForceFallback(id, "no-traffic")
 	}
 
 	for _, id := range alivePeers {
@@ -1139,6 +1096,14 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	}
 }
 
+// maybeResetFailCountForPeer 处理对端出口地址变化。
+//
+// ★ 区分 IP 变化 vs 端口漂移
+//
+//   - 端口漂移（同 IP 不同端口）：CGNAT 常态，P2P 通道本身还在用旧地址，
+//     不能清空状态，否则 viaTURN=true → 走 WS 中继（100~300ms）
+//
+//   - IP 变化（对端真的换了网络）：需要清空状态，重新打洞
 func (e *Edge) maybeResetFailCountForPeer(peerID, newPubIP string, newPubPort int) {
 	if peerID == "" || newPubIP == "" || newPubPort <= 0 {
 		return
@@ -1162,6 +1127,7 @@ func (e *Edge) maybeResetFailCountForPeer(peerID, newPubIP string, newPubPort in
 	delete(failCounts, peerID)
 	natHoleActiveMu.Unlock()
 
+	// ★ 只有 IP 变化才清空连接状态
 	if oldPubIP != newPubIP {
 		if e.relayMgr != nil {
 			e.relayMgr.ClearPeer(peerID)
@@ -1169,6 +1135,7 @@ func (e *Edge) maybeResetFailCountForPeer(peerID, newPubIP string, newPubPort in
 		log.Printf("[NAT-HOLE] %s 出口 IP 变化 %s → %s，清空连接状态 (was=%d)",
 			peerID, oldPubIP, newPubIP, hadCount)
 	} else {
+		// 同 IP 端口漂移：只重置失败计数，保留 P2P 状态
 		log.Printf("[NAT-HOLE] %s 端口漂移 %s:%d → %s:%d，保留 P2P 状态",
 			peerID, oldPubIP, oldPubPort, newPubIP, newPubPort)
 	}
@@ -1285,7 +1252,7 @@ func jsonInt(v interface{}) int {
 
 // registerPeer 注册/更新一个 peer。
 //
-// ★ 调用 updatePeerUDPAddr 统一处理 UDPAddr（LAN 优先）。
+// ★ LAN 优先保护 UDPAddr
 func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	var udpAddr *net.UDPAddr
 	if pubIP != "" && pubPort > 0 {
@@ -1309,9 +1276,15 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string,
 		if pubPort > 0 {
 			p.PubPort = pubPort
 		}
+
+		// ★ LAN 优先保护
 		if udpAddr != nil {
-			e.updatePeerUDPAddr(p, udpAddr)
+			oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
+			if !oldIsLAN {
+				p.UDPAddr = udpAddr
+			}
 		}
+
 		if natType != "" {
 			p.NATType = natType
 		}
@@ -1322,19 +1295,16 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string,
 			p.LanEndpoints = sortedLAN
 		}
 	} else {
-		newPeer := &PeerInfo{
+		e.peers[pid] = &PeerInfo{
 			ClientID:          pid,
 			VirtualIP:         vip,
 			PubIP:             pubIP,
 			PubPort:           pubPort,
+			UDPAddr:           udpAddr,
 			NATType:           natType,
 			AssistedEndpoints: assisted,
 			LanEndpoints:      sortedLAN,
 		}
-		if udpAddr != nil {
-			e.updatePeerUDPAddr(newPeer, udpAddr)
-		}
-		e.peers[pid] = newPeer
 	}
 	e.peersMu.Unlock()
 
@@ -1344,6 +1314,8 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string,
 }
 
 // ensureTargetPeer 记录指令里的目标 peer 信息。
+//
+// ★ LAN 优先保护 UDPAddr
 func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	if instr.TargetMac == "" {
 		return
@@ -1352,25 +1324,23 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	if instr.TargetPubSocket != "" {
 		udpAddr = parseSockAddr(instr.TargetPubSocket)
 	}
-
 	e.peersMu.Lock()
 	defer e.peersMu.Unlock()
 	if p, ok := e.peers[instr.TargetMac]; ok {
+		// ★ LAN 优先保护
 		if udpAddr != nil {
-			e.updatePeerUDPAddr(p, udpAddr)
+			oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
+			if !oldIsLAN {
+				p.UDPAddr = udpAddr
+			}
 		}
 		if instr.TargetVirtualIp != "" {
 			p.VirtualIP = instr.TargetVirtualIp
 		}
 	} else {
-		newPeer := &PeerInfo{
-			ClientID:  instr.TargetMac,
-			VirtualIP: instr.TargetVirtualIp,
+		e.peers[instr.TargetMac] = &PeerInfo{
+			ClientID: instr.TargetMac, VirtualIP: instr.TargetVirtualIp, UDPAddr: udpAddr,
 		}
-		if udpAddr != nil {
-			e.updatePeerUDPAddr(newPeer, udpAddr)
-		}
-		e.peers[instr.TargetMac] = newPeer
 	}
 }
 
@@ -1614,7 +1584,7 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 
 // notePeerCommon 是打洞握手路径的统一入口。
 //
-// ★ 调用 updatePeerUDPAddr 统一处理 UDPAddr（LAN 优先）。
+// ★ LAN 优先 + 300 秒窗口 + lastLANRecvAt > 0 检查
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
 	now := time.Now().UnixMilli()
 
@@ -1677,7 +1647,35 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 		return
 	}
 
-	e.updatePeerUDPAddr(best, &net.UDPAddr{IP: addr.IP, Port: addr.Port})
+	// ★ LAN 优先更新 UDPAddr
+	newIsLAN := isPrivateIPv4(addr.IP)
+	oldIsLAN := best.UDPAddr != nil && isPrivateIPv4(best.UDPAddr.IP)
+
+	shouldUpdate := false
+	if best.UDPAddr == nil {
+		shouldUpdate = true
+	} else if !oldIsLAN && newIsLAN {
+		shouldUpdate = true
+	} else if oldIsLAN && !newIsLAN {
+		// ★ 加 lastLANRecvAt > 0 检查
+		if best.lastLANRecvAt > 0 && now-best.lastLANRecvAt > 300000 {
+			shouldUpdate = true
+			log.Printf("[P2P] %s (note) LAN 超过 300s 无流量，改用公网地址", best.ClientID)
+		}
+	} else {
+		if best.UDPAddr.Port != addrPort {
+			shouldUpdate = true
+		}
+	}
+
+	if newIsLAN {
+		best.lastLANRecvAt = now
+	}
+
+	if shouldUpdate {
+		best.UDPAddr = &net.UDPAddr{IP: addr.IP, Port: addr.Port}
+	}
+
 	best.lastRecvAt = now
 	if isRealData {
 		best.hasRealData = true
