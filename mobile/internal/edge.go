@@ -1235,7 +1235,7 @@ func jsonInt(v interface{}) int {
 
 // registerPeer 注册/更新一个 peer。
 //
-// ★ UDPAddr 通过 setPeerUDPAddr 统一更新（LAN 优先）。
+// ★ 统一调度：UDPAddr 更新走 updatePeerUDPAddrLocked
 func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	var udpAddr *net.UDPAddr
 	if pubIP != "" && pubPort > 0 {
@@ -1260,9 +1260,9 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string,
 			p.PubPort = pubPort
 		}
 
-		// ★ 统一通过 setPeerUDPAddr 更新（LAN 优先）
+		// ★ 统一走 updatePeerUDPAddrLocked
 		if udpAddr != nil {
-			e.setPeerUDPAddr(p, udpAddr, "joined")
+			updatePeerUDPAddrLocked(p, udpAddr, "join")
 		}
 
 		if natType != "" {
@@ -1295,7 +1295,7 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string,
 
 // ensureTargetPeer 记录指令里的目标 peer 信息。
 //
-// ★ UDPAddr 通过 setPeerUDPAddr 统一更新（LAN 优先）。
+// ★ 统一调度：UDPAddr 更新走 updatePeerUDPAddrLocked
 func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	if instr.TargetMac == "" {
 		return
@@ -1307,9 +1307,9 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	e.peersMu.Lock()
 	defer e.peersMu.Unlock()
 	if p, ok := e.peers[instr.TargetMac]; ok {
-		// ★ 统一通过 setPeerUDPAddr 更新（LAN 优先）
+		// ★ 统一走 updatePeerUDPAddrLocked
 		if udpAddr != nil {
-			e.setPeerUDPAddr(p, udpAddr, "nat_hole")
+			updatePeerUDPAddrLocked(p, udpAddr, "instr")
 		}
 		if instr.TargetVirtualIp != "" {
 			p.VirtualIP = instr.TargetVirtualIp
@@ -1561,8 +1561,10 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 
 // notePeerCommon 是打洞握手路径的统一入口。
 //
-// ★ UDPAddr 通过 setPeerUDPAddr 统一更新（LAN 优先）。
+// ★ 统一调度：UDPAddr 更新走 updatePeerUDPAddrLocked
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
+	now := time.Now().UnixMilli()
+
 	e.peersMu.Lock()
 	var best *PeerInfo
 	bestScore := 0
@@ -1622,10 +1624,9 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 		return
 	}
 
-	// ★ 统一通过 setPeerUDPAddr 更新（LAN 优先）
-	e.setPeerUDPAddr(best, addr, "punch")
-
-	best.lastRecvAt = time.Now().UnixMilli()
+	// ★ 统一走 updatePeerUDPAddrLocked
+	updatePeerUDPAddrLocked(best, addr, "probe")
+	best.lastRecvAt = now
 	if isRealData {
 		best.hasRealData = true
 	}
