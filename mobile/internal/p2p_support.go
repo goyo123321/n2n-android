@@ -68,9 +68,7 @@ func (e *Edge) peerAddrAndMode(peerID string) (*net.UDPAddr, bool) {
 
 // handleP2PFrame 收到 N2NS 帧时的入口。
 //
-// ★ 修复 1：LAN 优先 + 300 秒窗口
-// ★ 修复 2（本版）：lastLANRecvAt > 0 检查——零值 0 会导致
-//   now-0 > 300000 永远为 true，首次收到公网包就覆盖 LAN。
+// ★ 简化：无条件覆盖 UDPAddr，LAN 时刷新 lastLANRecvAt。
 func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) {
 	if e.p2pStreams == nil {
 		return
@@ -88,40 +86,11 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 		e.peersMu.Lock()
 		if p := e.peers[peerID]; p != nil {
 			now := time.Now().UnixMilli()
-			newIsLAN := isPrivateIPv4(peerAddr.IP)
-			oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
-
-			shouldUpdate := false
-			if p.UDPAddr == nil {
-				shouldUpdate = true
-				if newIsLAN {
-					p.lastLANRecvAt = now
-				}
-			} else if !oldIsLAN && newIsLAN {
-				shouldUpdate = true
-				p.lastLANRecvAt = now
-			} else if oldIsLAN && !newIsLAN {
-				// ★ 修复：加 lastLANRecvAt > 0 检查
-				//   零值 0 会导致 now-0 > 300000 永远为 true
-				if p.lastLANRecvAt > 0 && now-p.lastLANRecvAt > 300000 {
-					shouldUpdate = true
-					log.Printf("[P2P] %s LAN 地址超过 300s 无流量，改用公网地址", peerID)
-				}
-			} else if oldIsLAN && newIsLAN {
-				if p.UDPAddr.Port != peerAddr.Port {
-					shouldUpdate = true
-				}
-				p.lastLANRecvAt = now
-			} else {
-				if p.UDPAddr.Port != peerAddr.Port {
-					shouldUpdate = true
-				}
-			}
-
-			if shouldUpdate {
-				p.UDPAddr = &net.UDPAddr{IP: peerAddr.IP, Port: peerAddr.Port}
-			}
+			p.UDPAddr = &net.UDPAddr{IP: peerAddr.IP, Port: peerAddr.Port}
 			p.lastRecvAt = now
+			if isPrivateIPv4(peerAddr.IP) {
+				p.lastLANRecvAt = now
+			}
 		}
 		e.peersMu.Unlock()
 	}
