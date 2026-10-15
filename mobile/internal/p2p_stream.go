@@ -130,10 +130,21 @@ type P2PStreamManager struct {
 	byID map[uint32]*P2PStream
 	next uint32
 	edge *Edge
+
+	// ★ 新增：记录哪些 peer 已经回过 PONG
+	//   首次收到 PING 回一个 PONG（兼容老版对端 + 升级 P2P）
+	//   之后不再回（节省流量 + 避免状态扰动）
+	pongSent map[string]bool
+	pongMu   sync.Mutex
 }
 
 func NewP2PStreamManager(edge *Edge) *P2PStreamManager {
-	m := &P2PStreamManager{byID: make(map[uint32]*P2PStream), next: 2, edge: edge}
+	m := &P2PStreamManager{
+		byID:     make(map[uint32]*P2PStream),
+		next:     2,
+		edge:     edge,
+		pongSent: make(map[string]bool),
+	}
 	safeGo("p2p-reaper", m.reaper)
 	return m
 }
@@ -182,6 +193,10 @@ func (m *P2PStreamManager) closeAll() {
 	for _, s := range all {
 		s.close("manager-shutdown")
 	}
+	// 清空 pongSent
+	m.pongMu.Lock()
+	m.pongSent = make(map[string]bool)
+	m.pongMu.Unlock()
 }
 
 func (m *P2PStreamManager) dropPeer(peerID string) {
@@ -199,6 +214,11 @@ func (m *P2PStreamManager) dropPeer(peerID string) {
 	for _, s := range toClose {
 		s.close("peer-left")
 	}
+
+	// ★ 清空该 peer 的 pongSent 记录
+	m.pongMu.Lock()
+	delete(m.pongSent, peerID)
+	m.pongMu.Unlock()
 }
 
 func (m *P2PStreamManager) reaper() {
@@ -223,7 +243,7 @@ func (m *P2PStreamManager) reaper() {
 	}
 }
 
-// sendP2PProbe 向 peerID 发一个裸 P2P PING 帧。
+// sendP2PProbe 向 peerID 发一个裸 P2P PING 帧（无需 stream）。
 func (m *P2PStreamManager) sendP2PProbe(peerID string) {
 	if m == nil || m.edge == nil || peerID == "" {
 		return
@@ -247,7 +267,6 @@ func (m *P2PStreamManager) sendP2PProbe(peerID string) {
 	}
 }
 
-// collectN2NSTargets 收集所有候选发送地址。
 func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 	s.mu.Lock()
 	primary := s.peerAddr
@@ -299,10 +318,12 @@ func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 
 // sendP2PFrame 发送一帧到对端的所有候选地址。
 //
-// ★ 方案 C：判断依据改成 p.UDPAddr 本身
+// ★ 修复 1：LAN 优先（300s 窗口）
+// ★ 修复 2：控制帧全发（保 CGNAT 映射）
+// ★ 修复 3：TURN 模式下控制帧也尝试直连
+// ★ 修复 4：TURN 未就绪时控制帧也走直连（防死锁）
 //
-// 因为 UDPAddr 已由 updatePeerUDPAddr 保护成 LAN 优先，
-// 判断 "p.UDPAddr 是不是 LAN" 就等于 "LAN 是否有效"。
+// ★ Android 特有：e.udpConn 是 net.PacketConn，用 WriteTo。
 func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	s.mu.Lock()
 	viaTURN := s.viaTURN
@@ -316,6 +337,7 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	// ============ TURN 模式 ============
 	if viaTURN {
 		if e.turnClient == nil || !e.turnClient.IsReady() {
+			// ★ 修复 4：TURN 未就绪也走直连试探（防死锁）
 			if forceDual && e.udpConn != nil {
 				targets := e.collectN2NSTargets(s)
 				sent := 0
@@ -349,7 +371,9 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 			return e.turnClient.Send(buf, ra)
 		}
 
+		// 控制帧：TURN + 直连试探
 		var lastErr error
+
 		if e.udpConn != nil {
 			targets := e.collectN2NSTargets(s)
 			for _, addr := range targets {
@@ -384,31 +408,31 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 		return errors.New("no udp")
 	}
 
-	// ★ 判断依据：p.UDPAddr 本身是 LAN 吗？
-	if !forceDual {
-		e.peersMu.RLock()
-		var addrIsLAN bool
-		if p := e.peers[peerID]; p != nil && p.UDPAddr != nil {
-			addrIsLAN = isPrivateIPv4(p.UDPAddr.IP)
+	e.peersMu.RLock()
+	var lanPreferred bool
+	if p := e.peers[peerID]; p != nil {
+		if p.lastLANRecvAt > 0 &&
+			time.Now().UnixMilli()-p.lastLANRecvAt < 300000 {
+			lanPreferred = true
 		}
-		e.peersMu.RUnlock()
+	}
+	e.peersMu.RUnlock()
 
-		if addrIsLAN {
-			sent := 0
-			for _, addr := range targets {
-				if isPrivateIPv4(addr.IP) {
-					if _, err := e.udpConn.WriteTo(buf, addr); err == nil {
-						sent++
-					}
-				}
+	if lanPreferred && !forceDual {
+		sent := 0
+		for _, addr := range targets {
+			if !isPrivateIPv4(addr.IP) {
+				continue
 			}
-			if sent > 0 {
-				return nil
+			if _, err := e.udpConn.WriteTo(buf, addr); err == nil {
+				sent++
 			}
+		}
+		if sent > 0 {
+			return nil
 		}
 	}
 
-	// 全发
 	var lastErr error
 	sent := 0
 	for _, addr := range targets {
@@ -590,24 +614,49 @@ func (m *P2PStreamManager) acceptSYN(peerID string, peerAddr *net.UDPAddr, viaTU
 	safeGo("p2p-tx", func() { s.readLocalAndSend(m.edge) })
 }
 
+// handleFrame 处理收到的帧。
+//
+// ★ 修复（本版）：PING 首次回 PONG，之后不回
+//
+// 首次回 PONG 的目的：
+//   - 兼容老版对端（只认 PONG 升 P2P）
+//   - 让对端确认本端存活
+//
+// 之后不回的原因：
+//   - 双向 PING 已保活 CGNAT 映射（A 发 PING 保 A→B，B 发 PING 保 B→A）
+//   - PONG 走公网可能扰动状态（虽然前面已修，但这是釜底抽薪）
+//   - 节省 50% 保活流量
 func (m *P2PStreamManager) handleFrame(peerID string, peerAddr *net.UDPAddr, viaTURN bool, f *p2pFrame) {
 	s := m.get(f.StreamID)
 
 	if s == nil {
 		if f.Type == p2pTypePING {
-			safeGo("p2p-pong", func() {
-				resp := &p2pFrame{Type: p2pTypePONG, StreamID: 0}
-				tmp := &P2PStream{
-					ID:       0,
-					PeerID:   peerID,
-					peerAddr: peerAddr,
-					viaTURN:  viaTURN,
-				}
-				_ = m.edge.sendP2PFrame(tmp, resp)
-			})
+			// ★ 检查是否已回过 PONG
+			m.pongMu.Lock()
+			needPong := !m.pongSent[peerID]
+			if needPong {
+				m.pongSent[peerID] = true
+			}
+			m.pongMu.Unlock()
+
+			if needPong {
+				log.Printf("[P2P] %s 首次 PING，回一个 PONG（之后不再回）", peerID)
+				safeGo("p2p-pong", func() {
+					resp := &p2pFrame{Type: p2pTypePONG, StreamID: 0}
+					tmp := &P2PStream{
+						ID:       0,
+						PeerID:   peerID,
+						peerAddr: peerAddr,
+						viaTURN:  viaTURN,
+					}
+					_ = m.edge.sendP2PFrame(tmp, resp)
+				})
+			}
 			return
 		}
 		if f.Type == p2pTypePONG {
+			// 兼容老版对端（可能有对端还在回 PONG）
+			// 收到 PONG 什么都不做——对端存活由它主动发 PING 体现
 			return
 		}
 		if f.Type == p2pTypeSYN {
