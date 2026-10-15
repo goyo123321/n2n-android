@@ -8,7 +8,6 @@ import (
 	"time"
 )
 
-// findPeerIDByAddr 按对端地址查 peerID。
 func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 	if addr == nil {
 		return ""
@@ -68,7 +67,7 @@ func (e *Edge) peerAddrAndMode(peerID string) (*net.UDPAddr, bool) {
 
 // handleP2PFrame 收到 N2NS 帧时的入口。
 //
-// ★ 简化：无条件覆盖 UDPAddr，LAN 时刷新 lastLANRecvAt。
+// ★ 调用 updatePeerUDPAddr 统一处理 UDPAddr（LAN 优先）。
 func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) {
 	if e.p2pStreams == nil {
 		return
@@ -85,12 +84,8 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 	if !viaTURN {
 		e.peersMu.Lock()
 		if p := e.peers[peerID]; p != nil {
-			now := time.Now().UnixMilli()
-			p.UDPAddr = &net.UDPAddr{IP: peerAddr.IP, Port: peerAddr.Port}
-			p.lastRecvAt = now
-			if isPrivateIPv4(peerAddr.IP) {
-				p.lastLANRecvAt = now
-			}
+			e.updatePeerUDPAddr(p, &net.UDPAddr{IP: peerAddr.IP, Port: peerAddr.Port})
+			p.lastRecvAt = time.Now().UnixMilli()
 		}
 		e.peersMu.Unlock()
 	}
