@@ -3,7 +3,6 @@ package internal
 import (
 	"log"
 	"net"
-	"runtime/debug"
 	"sync"
 	"time"
 )
@@ -18,16 +17,7 @@ const (
 	ConnRelay        ConnType = "relay"
 )
 
-func safeGo(name string, fn func()) {
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("[panic] %s: %v\n%s", name, r, debug.Stack())
-			}
-		}()
-		fn()
-	}()
-}
+// 注意：safeGo 定义在 edge.go 里，此处不重复定义。
 
 type RelayManager struct {
 	mu         sync.RWMutex
