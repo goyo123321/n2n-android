@@ -35,9 +35,6 @@ const (
 	p2pIdleTimeout = 120 * time.Second
 )
 
-// LAN 判断窗口：300 秒（5 分钟）
-const lanAliveWindowMs = 300000
-
 type p2pFrame struct {
 	Type     uint8
 	StreamID uint32
@@ -302,22 +299,10 @@ func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 
 // sendP2PFrame 发送一帧到对端的所有候选地址。
 //
-// ★ 唯一的 LAN 判断点
+// ★ 方案 C：判断依据改成 p.UDPAddr 本身
 //
-// 逻辑：
-//   1. 控制帧（PING/PONG/SYN/SYNACK/FIN/RST）→ 全发（LAN + 公网）
-//      - 保 CGNAT 映射
-//      - PING 双发探测 LAN 恢复
-//
-//   2. 数据帧（DATA/ACK）且 peer 的 lastLANRecvAt 有效（< 300 秒）
-//      → 只发 LAN（省带宽 + 低延迟）
-//
-//   3. 其他 → 全发
-//
-// 注意：所有 UDPAddr 更新入口（handleP2PFrame / notePeerCommon /
-// registerPeer / ensureTargetPeer / recordP2PSuccess）都无条件覆盖
-// p.UDPAddr，LAN 时只刷新 p.lastLANRecvAt。这里用 lastLANRecvAt
-// 判断"是否优先走 LAN"，逻辑简单且不会和入口不一致。
+// 因为 UDPAddr 已由 updatePeerUDPAddr 保护成 LAN 优先，
+// 判断 "p.UDPAddr 是不是 LAN" 就等于 "LAN 是否有效"。
 func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	s.mu.Lock()
 	viaTURN := s.viaTURN
@@ -326,13 +311,11 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 
 	buf := encodeP2PFrame(f)
 
-	// 控制帧定义
 	forceDual := f.Type != p2pTypeDATA && f.Type != p2pTypeACK
 
 	// ============ TURN 模式 ============
 	if viaTURN {
 		if e.turnClient == nil || !e.turnClient.IsReady() {
-			// TURN 未就绪也尝试直连试探（防死锁）
 			if forceDual && e.udpConn != nil {
 				targets := e.collectN2NSTargets(s)
 				sent := 0
@@ -349,7 +332,6 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 		}
 
 		if !forceDual {
-			// 数据帧：只走 TURN
 			e.peersMu.RLock()
 			var relayAddr string
 			if p := e.peers[peerID]; p != nil {
@@ -367,9 +349,7 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 			return e.turnClient.Send(buf, ra)
 		}
 
-		// 控制帧在 TURN 模式：TURN + 直连试探都发
 		var lastErr error
-
 		if e.udpConn != nil {
 			targets := e.collectN2NSTargets(s)
 			for _, addr := range targets {
@@ -404,20 +384,16 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 		return errors.New("no udp")
 	}
 
-	// ★ 唯一的 LAN 判断点
+	// ★ 判断依据：p.UDPAddr 本身是 LAN 吗？
 	if !forceDual {
 		e.peersMu.RLock()
-		var lanAlive bool
-		if p := e.peers[peerID]; p != nil {
-			if p.lastLANRecvAt > 0 &&
-				time.Now().UnixMilli()-p.lastLANRecvAt < lanAliveWindowMs {
-				lanAlive = true
-			}
+		var addrIsLAN bool
+		if p := e.peers[peerID]; p != nil && p.UDPAddr != nil {
+			addrIsLAN = isPrivateIPv4(p.UDPAddr.IP)
 		}
 		e.peersMu.RUnlock()
 
-		if lanAlive {
-			// 数据帧 + LAN 存活 → 只发 LAN
+		if addrIsLAN {
 			sent := 0
 			for _, addr := range targets {
 				if isPrivateIPv4(addr.IP) {
@@ -429,11 +405,10 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 			if sent > 0 {
 				return nil
 			}
-			// LAN 全失败，落到下面全发
 		}
 	}
 
-	// 全发（控制帧 或 LAN 不可用）
+	// 全发
 	var lastErr error
 	sent := 0
 	for _, addr := range targets {
