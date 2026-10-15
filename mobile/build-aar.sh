@@ -4,7 +4,7 @@
 # 输出: app/libs/n2nclient.aar
 #
 # 依赖:
-#   - Go 1.21+
+#   - Go 1.26+（★ 与 mobile/go.mod 的 go 1.26.0 保持一致）
 #   - Android NDK 26.1.10909125（或兼容版本）
 #   - gomobile / gobind（会自动安装）
 #
@@ -44,22 +44,29 @@ JAVA_PKG="com.n2n"
 # 1. 检查 Go + 版本校验
 # ============================================================
 if ! command -v go >/dev/null 2>&1; then
-    err "未找到 go 命令。请先安装 Go 1.21+"
+    err "未找到 go 命令。请先安装 Go 1.26+"
     echo "  https://go.dev/dl/"
     exit 1
 fi
 
-GO_VERSION_RAW=$(go version | awk '{print $3}')     # 形如 go1.22.5
-GO_VERSION="${GO_VERSION_RAW#go}"                    # 去掉前缀 → 1.22.5
+GO_VERSION_RAW=$(go version | awk '{print $3}')     # 形如 go1.26.0
+GO_VERSION="${GO_VERSION_RAW#go}"                    # 去掉前缀 → 1.26.0
 log "Go 版本: $GO_VERSION_RAW"
 
 # 只取 major.minor 比较
 GO_MAJOR_MINOR=$(echo "$GO_VERSION" | cut -d. -f1,2)
-REQUIRED="1.21"
+
+# ★ 修复：与 mobile/go.mod 的 "go 1.26.0" 保持一致
+REQUIRED="1.26"
 
 # 用 sort -V 判断版本大小
 if [ "$(printf '%s\n' "$REQUIRED" "$GO_MAJOR_MINOR" | sort -V | head -n1)" != "$REQUIRED" ]; then
     err "Go 版本过低: $GO_VERSION_RAW（需要 go$REQUIRED+）"
+    echo ""
+    echo "  mobile/go.mod 声明了 go $REQUIRED.0，Go 工具链必须 >= $REQUIRED。"
+    echo "  升级方式："
+    echo "    - macOS:  brew upgrade go"
+    echo "    - Linux:  https://go.dev/dl/"
     exit 1
 fi
 ok "Go 版本满足要求 (>= $REQUIRED)"
@@ -131,7 +138,7 @@ if ! gomobile init; then
     echo ""
     echo "常见原因："
     echo "  1. NDK 路径不对：$ANDROID_NDK_HOME"
-    echo "  2. Go 版本过低：需要 go1.21+"
+    echo "  2. Go 版本过低：需要 go$REQUIRED+"
     echo "  3. 网络问题：下载 gomobile 依赖失败"
     exit 1
 fi
