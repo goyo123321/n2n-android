@@ -3,7 +3,6 @@ package internal
 import (
 	"log"
 	"net"
-	"runtime/debug"
 	"sync"
 	"time"
 )
@@ -18,16 +17,7 @@ const (
 	ConnRelay        ConnType = "relay"
 )
 
-func safeGo(name string, fn func()) {
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("[panic] %s: %v\n%s", name, r, debug.Stack())
-			}
-		}()
-		fn()
-	}()
-}
+// 注意：safeGo 定义在 edge.go 里，此处不重复定义。
 
 type RelayManager struct {
 	mu         sync.RWMutex
@@ -331,10 +321,6 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 // Report 定期上报连接状态。
 //
 // ★ 修复：即使为空也上报
-//
-// 空 Map 让服务端知道客户端当前没有 P2P 连接，触发服务端清空 punchState
-// 并重新协调。否则客户端 states 空 → 不上报 → 服务端保留旧状态
-// → 不重新协调 → 死锁。
 func (rm *RelayManager) Report(interval time.Duration) {
 	if rm.edge == nil {
 		return
