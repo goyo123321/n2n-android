@@ -1,531 +1,351 @@
 package internal
 
 import (
-	"fmt"
 	"log"
 	"net"
-	"strconv"
 	"sync"
 	"time"
-
-	"golang.org/x/net/ipv4"
 )
 
-type NatHoleInstruction struct {
-	Role                    int      `json:"role"`
-	TTL                     int      `json:"ttl"`
-	SendDelayMs             int      `json:"sendDelayMs"`
-	PortsRangeFrom          uint32   `json:"portsRangeFrom"`
-	PortsRangeTo            uint32   `json:"portsRangeTo"`
-	TargetMac               string   `json:"targetMac"`
-	TargetVirtualIp         string   `json:"targetVirtualIp"`
-	TargetPubSocket         string   `json:"targetPubSocket"`
-	TargetAssistedEndpoints []string `json:"targetAssistedEndpoints"`
-	TargetLanEndpoints      []string `json:"targetLanEndpoints"`
-	SenderMac               string   `json:"senderMac"`
-	SenderP2PEndpoint       string   `json:"senderP2pEndpoint"`
-	SenderPubSocket         string   `json:"senderPubSocket"`
-	SenderNatType           string   `json:"senderNatType"`
-	SenderBehavior          string   `json:"senderBehavior"`
-	SenderAssistedEndpoints []string `json:"senderAssistedEndpoints"`
-	SenderLanEndpoints      []string `json:"senderLanEndpoints"`
-	ReceiverMac               string   `json:"receiverMac"`
-	ReceiverP2PEndpoint       string   `json:"receiverP2pEndpoint"`
-	ReceiverPubSocket         string   `json:"receiverPubSocket"`
-	ReceiverNatType           string   `json:"receiverNatType"`
-	ReceiverAssistedEndpoints []string `json:"receiverAssistedEndpoints"`
-	PortsDifference    int  `json:"portsDifference"`
-	RegularPortsChange bool `json:"regularPortsChange"`
-	Mode               int  `json:"mode"`
-	BehaviorIndex      int  `json:"behaviorIndex"`
-}
-
-type PunchResult struct {
-	State         int    `json:"state"`
-	Attempts      uint32 `json:"attempts"`
-	Detail        string `json:"detail"`
-	BehaviorIndex int    `json:"behaviorIndex"`
-}
+type ConnType string
 
 const (
-	PunchStateNone       = 0
-	PunchStateInProgress = 1
-	PunchStateFailed     = 2
-	PunchStateSucceeded  = 3
+	ConnUnknown      ConnType = "unknown"
+	ConnP2PAvailable ConnType = "p2p-avail"
+	ConnP2P          ConnType = "p2p"
+	ConnTURN         ConnType = "turn"
+	ConnRelay        ConnType = "relay"
 )
 
-const maxConsecutiveFails = 5
+// 注意：safeGo 定义在 edge.go 里，此处不重复定义。
 
-var (
-	natHoleActiveMu sync.Mutex
-	natHoleActive   map[string]bool
-	failCounts      map[string]int
-)
-
-func init() {
-	natHoleActive = make(map[string]bool)
-	failCounts = make(map[string]int)
+type RelayManager struct {
+	mu         sync.RWMutex
+	ws         *WSTransport
+	turnClient *TURNClient
+	edge       *Edge
+	states     map[string]ConnType
 }
 
-var fullScanTiers = []int{3, 10, 20, 30, 60, 100, 300, 1000, 3000, 10000}
+func NewRelayManager(ws *WSTransport, turnClient *TURNClient, edge *Edge) *RelayManager {
+	return &RelayManager{
+		ws:         ws,
+		turnClient: turnClient,
+		edge:       edge,
+		states:     make(map[string]ConnType),
+	}
+}
 
-func buildTiers(halfWidth int) []int {
-	tiers := []int{}
-	for _, t := range []int{3, 10, 20, 30, 60, 100, 300, 1000, 3000, 10000} {
-		if t < halfWidth {
-			tiers = append(tiers, t)
+// MarkP2PAvailable 从 Unknown / Relay 升级到"打洞握手成功"。
+func (rm *RelayManager) MarkP2PAvailable(peerID string) {
+	rm.mu.Lock()
+	cur := rm.states[peerID]
+	if cur == ConnP2P || cur == ConnP2PAvailable {
+		rm.mu.Unlock()
+		return
+	}
+	rm.states[peerID] = ConnP2PAvailable
+	rm.mu.Unlock()
+
+	log.Printf("[连接] %s → P2PAvailable（打洞握手成功，等待数据帧验证）", peerID)
+	rm.cancelFallbackTimer(peerID)
+
+	if rm.edge != nil {
+		rm.edge.cancelP2PAvailTimeout(peerID)
+	}
+}
+
+// MarkP2P 只有收到真实数据帧或 PONG 才应调用。
+func (rm *RelayManager) MarkP2P(peerId string) {
+	rm.mu.Lock()
+	if rm.states[peerId] == ConnP2P {
+		rm.mu.Unlock()
+		return
+	}
+	prev := rm.states[peerId]
+	rm.states[peerId] = ConnP2P
+	rm.mu.Unlock()
+
+	log.Printf("[连接] %s → P2P 直连（prev=%s，数据面已验证）", peerId, prev)
+	rm.cancelFallbackTimer(peerId)
+
+	if rm.edge != nil {
+		rm.edge.cancelP2PAvailTimeout(peerId)
+	}
+}
+
+// MarkFallback 常规降级路径。保护 P2PAvailable 状态。
+func (rm *RelayManager) MarkFallback(peerId string) {
+	rm.mu.Lock()
+
+	if rm.states[peerId] == ConnP2P || rm.states[peerId] == ConnP2PAvailable {
+		rm.mu.Unlock()
+		rm.cancelFallbackTimer(peerId)
+		log.Printf("[连接] %s 已 P2P/P2PAvailable，忽略 MarkFallback", peerId)
+		return
+	}
+	if rm.states[peerId] == ConnTURN || rm.states[peerId] == ConnRelay {
+		rm.mu.Unlock()
+		rm.cancelFallbackTimer(peerId)
+		return
+	}
+	rm.mu.Unlock()
+
+	if rm.edge != nil {
+		rm.edge.peersMu.RLock()
+		p, ok := rm.edge.peers[peerId]
+		var lastRecv int64 = 0
+		if ok {
+			lastRecv = p.lastRecvAt
+		}
+		rm.edge.peersMu.RUnlock()
+
+		if lastRecv > 0 {
+			idleMs := time.Now().UnixMilli() - lastRecv
+			if idleMs < 3000 {
+				log.Printf("[连接] %s 最近 %dms 收到过 UDP 包，跳过降级", peerId, idleMs)
+				return
+			}
 		}
 	}
-	tiers = append(tiers, halfWidth)
-	return tiers
+
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	if rm.states[peerId] == ConnP2P || rm.states[peerId] == ConnP2PAvailable {
+		rm.cancelFallbackTimer(peerId)
+		return
+	}
+	if rm.states[peerId] == ConnTURN || rm.states[peerId] == ConnRelay {
+		rm.cancelFallbackTimer(peerId)
+		return
+	}
+
+	if rm.turnClient != nil && rm.turnClient.IsReady() {
+		rm.states[peerId] = ConnTURN
+		log.Printf("[连接] %s → TURN 中继 (%s)", peerId, rm.turnClient.GetRelayAddr())
+		rm.cancelFallbackTimer(peerId)
+		return
+	}
+
+	rm.states[peerId] = ConnRelay
+	log.Printf("[连接] %s → WS 中继 (TURN 未就绪，最后兜底)", peerId)
+	rm.cancelFallbackTimer(peerId)
 }
 
-func extractPortFromEndpoint(ep string) int {
-	if ep == "" {
-		return 0
+// ForceFallback 强制降级，允许从 P2PAvailable 降级。
+func (rm *RelayManager) ForceFallback(peerId string, reason string) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	if rm.states[peerId] == ConnP2P {
+		return
 	}
-	i := lastIndexByte(ep, ':')
-	if i < 0 {
-		return 0
+	if rm.states[peerId] == ConnTURN || rm.states[peerId] == ConnRelay {
+		return
 	}
-	port, err := strconv.Atoi(ep[i+1:])
-	if err != nil || port < 1 || port > 65535 {
-		return 0
+
+	if rm.turnClient != nil && rm.turnClient.IsReady() {
+		rm.states[peerId] = ConnTURN
+		log.Printf("[连接] %s → TURN 中继 (force: %s)", peerId, reason)
+	} else {
+		rm.states[peerId] = ConnRelay
+		log.Printf("[连接] %s → WS 中继 (force: %s)", peerId, reason)
 	}
-	return port
+
+	rm.cancelFallbackTimer(peerId)
+	if rm.edge != nil {
+		rm.edge.cancelP2PAvailTimeout(peerId)
+	}
 }
 
-func (e *Edge) startFailCountResetLoop() {
-	safeGo("fail-count-reset", func() {
-		ticker := time.NewTicker(5 * time.Minute)
+func (rm *RelayManager) ClearPeer(peerID string) {
+	if peerID == "" {
+		return
+	}
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	delete(rm.states, peerID)
+}
+
+func (rm *RelayManager) ClearAll() {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	rm.states = make(map[string]ConnType)
+}
+
+func (rm *RelayManager) cancelFallbackTimer(peerID string) {
+	if rm.edge == nil {
+		return
+	}
+	rm.edge.cancelFallbackTimer(peerID)
+}
+
+func (rm *RelayManager) UpgradeRelaysToTURN() {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	if rm.turnClient == nil || !rm.turnClient.IsReady() {
+		return
+	}
+	relayAddr := rm.turnClient.GetRelayAddr()
+	upgraded := 0
+	for peerId, state := range rm.states {
+		if state == ConnRelay {
+			rm.states[peerId] = ConnTURN
+			upgraded++
+			log.Printf("[连接] %s → TURN 中继 (延迟升级, %s)", peerId, relayAddr)
+		}
+	}
+	if upgraded > 0 {
+		log.Printf("[连接] TURN 就绪，升级 %d 个 WS 中继到 TURN", upgraded)
+	}
+}
+
+func (rm *RelayManager) DowngradeToWS(peerId string, reason string) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	if rm.states[peerId] == ConnP2P || rm.states[peerId] == ConnP2PAvailable {
+		return
+	}
+	if rm.states[peerId] != ConnRelay {
+		log.Printf("[连接] %s → WS 中继 (TURN 失败: %s)", peerId, reason)
+		rm.states[peerId] = ConnRelay
+	}
+}
+
+func (rm *RelayManager) MarkRelay(peerId string) {
+	rm.MarkFallback(peerId)
+}
+
+func (rm *RelayManager) ShouldRelay(peerId string) bool {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+	s, ok := rm.states[peerId]
+	if !ok {
+		return true
+	}
+	return s != ConnP2P && s != ConnP2PAvailable
+}
+
+func (rm *RelayManager) IsP2P(peerId string) bool {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+	return rm.states[peerId] == ConnP2P
+}
+
+func (rm *RelayManager) IsP2PAvailable(peerId string) bool {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+	return rm.states[peerId] == ConnP2PAvailable
+}
+
+func (rm *RelayManager) IsTURN(peerId string) bool {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+	return rm.states[peerId] == ConnTURN
+}
+
+func (rm *RelayManager) IsWSRelay(peerId string) bool {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+	return rm.states[peerId] == ConnRelay
+}
+
+func (rm *RelayManager) GetState(peerId string) ConnType {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+	if s, ok := rm.states[peerId]; ok {
+		return s
+	}
+	return ConnUnknown
+}
+
+func (rm *RelayManager) SendViaRelay(data []byte) error {
+	return rm.ws.SendBinary(data)
+}
+
+func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
+	state := rm.GetState(peerId)
+
+	switch state {
+	case ConnP2P, ConnP2PAvailable:
+		if target != nil && target.UDPAddr != nil && rm.edge != nil && rm.edge.udpConn != nil {
+			_, err := rm.edge.udpConn.WriteTo(data, target.UDPAddr)
+			if err == nil {
+				return true
+			}
+			log.Printf("[P2P] UDP 发送到 %s 失败: %v，降级到 WS", peerId, err)
+			rm.MarkFallback(peerId)
+		} else {
+			rm.MarkFallback(peerId)
+		}
+		if rm.ws == nil {
+			return false
+		}
+		return rm.ws.SendBinary(data) == nil
+
+	case ConnTURN:
+		if target != nil && target.TurnRelayAddr != "" && rm.turnClient != nil {
+			relayAddr, err := net.ResolveUDPAddr("udp", target.TurnRelayAddr)
+			if err == nil {
+				if sendErr := rm.turnClient.Send(data, relayAddr); sendErr == nil {
+					return true
+				} else {
+					log.Printf("[TURN] 发送到 %s 失败（临时）: %v", peerId, sendErr)
+					if rm.ws != nil {
+						_ = rm.ws.SendBinary(data)
+					}
+					return false
+				}
+			} else {
+				log.Printf("[TURN] 解析中继地址 %q 失败: %v", target.TurnRelayAddr, err)
+			}
+		}
+		if rm.ws != nil {
+			return rm.ws.SendBinary(data) == nil
+		}
+		return false
+
+	case ConnRelay:
+		if rm.ws == nil {
+			return false
+		}
+		return rm.ws.SendBinary(data) == nil
+	}
+
+	return false
+}
+
+// Report 定期上报连接状态。
+//
+// ★ 修复：即使为空也上报
+func (rm *RelayManager) Report(interval time.Duration) {
+	if rm.edge == nil {
+		return
+	}
+	safeGo("relay-report", func() {
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-e.doneCh:
-				return
 			case <-ticker.C:
-				natHoleActiveMu.Lock()
-				count := len(failCounts)
-				if count > 0 {
-					failCounts = make(map[string]int)
+				rm.mu.RLock()
+				conns := make(map[string]string)
+				for peerId, t := range rm.states {
+					conns[peerId] = string(t)
 				}
-				natHoleActiveMu.Unlock()
-				if count > 0 {
-					log.Printf("[NAT-HOLE] 定期清空 %d 个 target 的失败计数（5 分钟）", count)
+				rm.mu.RUnlock()
+
+				if rm.ws == nil {
+					continue
 				}
+				_ = rm.ws.Send(map[string]interface{}{
+					"type":    "connection_status",
+					"payload": map[string]interface{}{"connections": conns},
+				})
+			case <-rm.edge.doneCh:
+				return
 			}
 		}
 	})
-}
-
-func (e *Edge) chooseScanTiers(targetAddr *net.UDPAddr) (tiers []int, sameStun bool, portDiff int, halfWidth int) {
-	e.mu.Lock()
-	ep := ""
-	if e.natMeta != nil {
-		ep = e.natMeta.PublicEndpoint
-	}
-	e.mu.Unlock()
-
-	if ep == "" || targetAddr == nil {
-		return fullScanTiers, false, 0, 0
-	}
-
-	myIP := extractIPFromEndpoint(ep)
-	myPort := extractPortFromEndpoint(ep)
-	targetIP := targetAddr.IP.String()
-	targetPort := targetAddr.Port
-
-	if myIP == "" || myIP != targetIP {
-		return fullScanTiers, false, 0, 0
-	}
-
-	diff := myPort - targetPort
-	if diff < 0 {
-		diff = -diff
-	}
-
-	if diff > 5000 {
-		return nil, true, diff, -1
-	}
-
-	if diff >= 100 {
-		return fullScanTiers, true, diff, 0
-	}
-
-	hw := diff + 100
-	return buildTiers(hw), true, diff, hw
-}
-
-// collectScanTargets 收集本轮打洞的全部候选地址。
-func (e *Edge) collectScanTargets(instr *NatHoleInstruction) []*net.UDPAddr {
-	var raw []*net.UDPAddr
-
-	e.peersMu.RLock()
-	var pLan, pAssisted []string
-	var pUDPAddr *net.UDPAddr
-	var pLastRecv int64
-	if p := e.peers[instr.TargetMac]; p != nil {
-		pLan = p.LanEndpoints
-		pAssisted = p.AssistedEndpoints
-		pUDPAddr = p.UDPAddr
-		pLastRecv = p.lastRecvAt
-	}
-	e.peersMu.RUnlock()
-
-	log.Printf("[collectScanTargets] target=%s p.Lan=%v p.Assisted=%v instr.TargetLan=%v instr.TargetAssisted=%v TargetPubSocket=%q",
-		instr.TargetMac, pLan, pAssisted, instr.TargetLanEndpoints, instr.TargetAssistedEndpoints, instr.TargetPubSocket)
-
-	for _, lan := range pLan {
-		if addr := parseSockAddr(lan); addr != nil {
-			raw = append(raw, addr)
-		}
-	}
-
-	if pUDPAddr != nil && pLastRecv > 0 {
-		raw = append(raw, &net.UDPAddr{IP: pUDPAddr.IP, Port: pUDPAddr.Port})
-	}
-
-	for _, ep := range instr.TargetAssistedEndpoints {
-		if addr := parseSockAddr(ep); addr != nil {
-			raw = append(raw, addr)
-		}
-	}
-
-	for _, ep := range instr.TargetLanEndpoints {
-		if addr := parseSockAddr(ep); addr != nil {
-			raw = append(raw, addr)
-		}
-	}
-
-	seen := make(map[string]bool)
-	var out []*net.UDPAddr
-	for _, a := range raw {
-		key := a.String()
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		out = append(out, a)
-	}
-	log.Printf("[collectScanTargets] 去重后 %d 个候选: %v", len(out), out)
-	return out
-}
-
-func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
-	if e.relayMgr != nil && e.relayMgr.GetState(instr.TargetMac) == ConnP2P {
-		log.Printf("[NAT-HOLE] 跳过指令 target=%s（已 P2P）", instr.TargetMac)
-		return nil
-	}
-
-	natHoleActiveMu.Lock()
-	fc := failCounts[instr.TargetMac]
-	if fc >= maxConsecutiveFails {
-		natHoleActiveMu.Unlock()
-		log.Printf("[NAT-HOLE] 跳过指令 target=%s（已连续失败 %d 次）", instr.TargetMac, fc)
-		return nil
-	}
-	if natHoleActive[instr.TargetMac] {
-		natHoleActiveMu.Unlock()
-		log.Printf("[NAT-HOLE] 跳过重复指令 target=%s（已在处理中）", instr.TargetMac)
-		return nil
-	}
-	natHoleActive[instr.TargetMac] = true
-	natHoleActiveMu.Unlock()
-	defer func() {
-		natHoleActiveMu.Lock()
-		delete(natHoleActive, instr.TargetMac)
-		natHoleActiveMu.Unlock()
-	}()
-
-	e.reportInProgress(instr)
-
-	startAt := time.Now().UnixMilli()
-
-	res := &PunchResult{
-		State:         PunchStateInProgress,
-		BehaviorIndex: instr.BehaviorIndex,
-	}
-
-	targetAddr := e.resolveTarget(instr)
-	if targetAddr == nil {
-		res.State = PunchStateFailed
-		res.Detail = "无法解析目标地址"
-		log.Printf("[NAT-HOLE] 目标地址解析失败 target=%s", instr.TargetPubSocket)
-		return res
-	}
-
-	var prevTTL int = -1
-	if instr.TTL > 0 && e.udpConn != nil {
-		p := ipv4.NewPacketConn(e.udpConn)
-		if cur, err := p.TTL(); err == nil {
-			prevTTL = cur
-		}
-		if err := p.SetTTL(instr.TTL); err != nil {
-			log.Printf("[NAT-HOLE] 设置 TTL=%d 失败: %v", instr.TTL, err)
-		}
-		defer func() {
-			if prevTTL > 0 {
-				_ = p.SetTTL(prevTTL)
-			}
-		}()
-	}
-
-	log.Printf(
-		"[NAT-HOLE] 开始打洞 role=%d target=%s:%d rung=%d mode=%d ttl=%d",
-		instr.Role, targetAddr.IP, targetAddr.Port,
-		instr.BehaviorIndex, instr.Mode, instr.TTL,
-	)
-
-	assistedTargets := e.collectScanTargets(instr)
-	log.Printf("[NAT-HOLE] 多目标扫描：LAN+raddr+assisted 共 %d 个候选", len(assistedTargets))
-
-	if instr.Role == 0 && instr.SendDelayMs > 0 {
-		time.Sleep(time.Duration(instr.SendDelayMs) * time.Millisecond)
-	}
-
-	probe := buildPunchProbe(e.GetVirtualIP())
-	var attempts uint32
-
-	tiers, sameStun, portDiff, halfWidth := e.chooseScanTiers(targetAddr)
-
-	if sameStun && halfWidth < 0 {
-		res.State = PunchStateFailed
-		res.Detail = fmt.Sprintf("端口差过大 (%d)，放弃打洞", portDiff)
-		log.Printf("[NAT-HOLE] ❌ 端口差=%d 过大（>5000），放弃打洞（直接走 TURN）", portDiff)
-
-		natHoleActiveMu.Lock()
-		failCounts[instr.TargetMac] = maxConsecutiveFails
-		natHoleActiveMu.Unlock()
-
-		return res
-	}
-
-	if sameStun && halfWidth > 0 {
-		log.Printf("[NAT-HOLE] 模式：同 STUN IP，端口差=%d，精准扫描 targetPort±%d，分级 %v",
-			portDiff, halfWidth, tiers)
-	} else if sameStun {
-		log.Printf("[NAT-HOLE] 模式：同 STUN IP 但端口差=%d（≥100），全端口扫描，分级 %v",
-			portDiff, tiers)
-	} else {
-		log.Printf("[NAT-HOLE] 模式：不同 STUN IP，全端口扫描，分级 %v", tiers)
-	}
-
-	if len(assistedTargets) > 0 {
-		log.Printf("[NAT-HOLE] 优先扫描 %d 个候选端点", len(assistedTargets))
-		for _, t := range assistedTargets {
-			if _, err := e.udpConn.WriteTo(probe, t); err == nil {
-				attempts++
-			}
-		}
-
-		select {
-		case <-e.doneCh:
-			res.State = PunchStateFailed
-			res.Detail = "aborted: edge stopped"
-			return res
-		case <-time.After(300 * time.Millisecond):
-		}
-
-		if e.hasTrafficFromTarget(instr.TargetMac, startAt) {
-			res.State = PunchStateSucceeded
-			res.Attempts = attempts
-			res.Detail = fmt.Sprintf("候选命中 (%d 个端点)", len(assistedTargets))
-			e.recordP2PSuccess(instr, targetAddr)
-			log.Printf("[NAT-HOLE] ✅ 成功 (candidates) role=%d target=%s attempts=%d",
-				instr.Role, targetAddr.IP, attempts)
-			e.resetFailCount(instr.TargetMac)
-			return res
-		}
-		log.Printf("[NAT-HOLE] 候选未命中，进入 tier 扫描")
-	}
-
-	lastHalf := 0
-	receiverPort := targetAddr.Port
-
-	for _, half := range tiers {
-		select {
-		case <-e.doneCh:
-			res.State = PunchStateFailed
-			res.Detail = "aborted: edge stopped"
-			return res
-		default:
-		}
-
-		var tierTargets []*net.UDPAddr
-		for port := receiverPort - half; port <= receiverPort+half; port++ {
-			if port < 1 || port > 65535 {
-				continue
-			}
-			if port >= receiverPort-lastHalf && port <= receiverPort+lastHalf {
-				continue
-			}
-			tierTargets = append(tierTargets, &net.UDPAddr{
-				IP:   targetAddr.IP,
-				Port: port,
-			})
-		}
-
-		if lastHalf == 0 && len(assistedTargets) > 0 {
-			tierTargets = append(tierTargets, assistedTargets...)
-		}
-
-		rounds := 3
-		if half > 500 {
-			rounds = 1
-		}
-
-		success := false
-		for r := 0; r < rounds; r++ {
-			select {
-			case <-e.doneCh:
-				res.State = PunchStateFailed
-				res.Detail = "aborted: edge stopped"
-				return res
-			default:
-			}
-
-			for _, t := range tierTargets {
-				if _, err := e.udpConn.WriteTo(probe, t); err == nil {
-					attempts++
-				}
-			}
-
-			if e.hasTrafficFromTarget(instr.TargetMac, startAt) {
-				success = true
-				break
-			}
-
-			select {
-			case <-e.doneCh:
-				res.State = PunchStateFailed
-				res.Detail = "aborted: edge stopped"
-				return res
-			case <-time.After(100 * time.Millisecond):
-			}
-		}
-
-		if success {
-			res.State = PunchStateSucceeded
-			res.Attempts = attempts
-			res.Detail = fmt.Sprintf("端口扫描成功 (tier=±%d)", half)
-			e.recordP2PSuccess(instr, targetAddr)
-			log.Printf("[NAT-HOLE] ✅ 成功 role=%d target=%s attempts=%d tier=±%d",
-				instr.Role, targetAddr.IP, attempts, half)
-			e.resetFailCount(instr.TargetMac)
-			return res
-		}
-
-		log.Printf("[NAT-HOLE] tier=±%d 未命中（本轮 %d 个），扩大范围（累计 attempts=%d）",
-			half, len(tierTargets), attempts)
-		lastHalf = half
-	}
-
-	res.State = PunchStateFailed
-	res.Attempts = attempts
-	res.Detail = "无响应"
-	log.Printf("[NAT-HOLE] ❌ 失败 role=%d target=%s attempts=%d",
-		instr.Role, targetAddr.IP, attempts)
-
-	natHoleActiveMu.Lock()
-	failCounts[instr.TargetMac]++
-	newFc := failCounts[instr.TargetMac]
-	natHoleActiveMu.Unlock()
-	if newFc >= maxConsecutiveFails {
-		log.Printf("[NAT-HOLE] target=%s 连续失败 %d 次，后续指令将跳过（改用中继）",
-			instr.TargetMac, newFc)
-	}
-
-	return res
-}
-
-func (e *Edge) resetFailCount(peerID string) {
-	natHoleActiveMu.Lock()
-	delete(failCounts, peerID)
-	natHoleActiveMu.Unlock()
-}
-
-// recordP2PSuccess 打洞成功时更新 peer 地址。
-//
-// ★ 调用 updatePeerUDPAddr 统一处理 UDPAddr（LAN 优先）。
-func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAddr) {
-	e.peersMu.Lock()
-	if p, ok := e.peers[instr.TargetMac]; ok {
-		e.updatePeerUDPAddr(p, targetAddr)
-		p.lastRecvAt = time.Now().UnixMilli()
-	} else {
-		newPeer := &PeerInfo{
-			ClientID:   instr.TargetMac,
-			VirtualIP:  instr.TargetVirtualIp,
-			lastRecvAt: time.Now().UnixMilli(),
-		}
-		e.updatePeerUDPAddr(newPeer, targetAddr)
-		e.peers[instr.TargetMac] = newPeer
-	}
-	e.peersMu.Unlock()
-}
-
-func (e *Edge) reportInProgress(instr *NatHoleInstruction) {
-	if e.ws == nil {
-		return
-	}
-	_ = e.ws.Send(map[string]interface{}{
-		"type": "p2p_state_info",
-		"payload": map[string]interface{}{
-			"to": []map[string]interface{}{
-				{
-					"macAddr": instr.TargetMac,
-					"punchResult": map[string]interface{}{
-						"state":         PunchStateInProgress,
-						"attempts":      0,
-						"detail":        "round started",
-						"behaviorIndex": instr.BehaviorIndex,
-					},
-					"punchResultPeerMac": instr.TargetMac,
-				},
-			},
-		},
-	})
-}
-
-func parseSockAddr(s string) *net.UDPAddr {
-	if s == "" {
-		return nil
-	}
-	host, portStr, err := net.SplitHostPort(s)
-	if err != nil {
-		return nil
-	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return nil
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil || port < 1 || port > 65535 {
-		return nil
-	}
-	return &net.UDPAddr{IP: ip, Port: port}
-}
-
-// resolveTarget 决定这次打洞往哪个地址发包。
-//
-// 优先使用观测 raddr（已被证明可达）。
-func (e *Edge) resolveTarget(instr *NatHoleInstruction) *net.UDPAddr {
-	e.peersMu.RLock()
-	if p := e.peers[instr.TargetMac]; p != nil && p.UDPAddr != nil && p.lastRecvAt > 0 {
-		raddr := &net.UDPAddr{IP: p.UDPAddr.IP, Port: p.UDPAddr.Port}
-		e.peersMu.RUnlock()
-		log.Printf("[NAT-HOLE] 优先使用观测 raddr %s（已被证明可达）", raddr.String())
-		return raddr
-	}
-	e.peersMu.RUnlock()
-
-	sock := instr.TargetPubSocket
-	if sock == "" {
-		if instr.Role == 1 {
-			sock = instr.SenderPubSocket
-		} else {
-			sock = instr.ReceiverPubSocket
-		}
-	}
-	return parseSockAddr(sock)
 }
