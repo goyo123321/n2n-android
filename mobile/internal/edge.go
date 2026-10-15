@@ -1093,6 +1093,14 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	}
 }
 
+// maybeResetFailCountForPeer 处理对端出口地址变化。
+//
+// ★ 修复：区分 IP 变化 vs 端口漂移
+//
+//   - 端口漂移（同 IP 不同端口）：CGNAT 常态，P2P 通道本身还在用旧地址，
+//     不能清空状态，否则 viaTURN=true → 走 WS 中继（100~300ms）
+//
+//   - IP 变化（对端真的换了网络）：需要清空状态，重新打洞
 func (e *Edge) maybeResetFailCountForPeer(peerID, newPubIP string, newPubPort int) {
 	if peerID == "" || newPubIP == "" || newPubPort <= 0 {
 		return
@@ -1116,12 +1124,18 @@ func (e *Edge) maybeResetFailCountForPeer(peerID, newPubIP string, newPubPort in
 	delete(failCounts, peerID)
 	natHoleActiveMu.Unlock()
 
-	if e.relayMgr != nil {
-		e.relayMgr.ClearPeer(peerID)
+	// ★ 只有 IP 变化才清空连接状态
+	if oldPubIP != newPubIP {
+		if e.relayMgr != nil {
+			e.relayMgr.ClearPeer(peerID)
+		}
+		log.Printf("[NAT-HOLE] %s 出口 IP 变化 %s → %s，清空连接状态 (was=%d)",
+			peerID, oldPubIP, newPubIP, hadCount)
+	} else {
+		// 同 IP 端口漂移：只重置失败计数，保留 P2P 状态
+		log.Printf("[NAT-HOLE] %s 端口漂移 %s:%d → %s:%d，保留 P2P 状态",
+			peerID, oldPubIP, oldPubPort, newPubIP, newPubPort)
 	}
-
-	log.Printf("[NAT-HOLE] %s 出口变化 %s:%d → %s:%d，重置失败计数 (was=%d)",
-		peerID, oldPubIP, oldPubPort, newPubIP, newPubPort, hadCount)
 }
 
 func (e *Edge) maybeResetOwnFailCounts(newEndpoint string) {
@@ -1236,10 +1250,6 @@ func jsonInt(v interface{}) int {
 // registerPeer 注册/更新一个 peer。
 //
 // ★ 修复：LAN 优先保护 UDPAddr
-//
-// udpAddr 来自 joined 消息的 pubIP:pubPort（永远是公网地址）。
-// 如果 peer 当前 UDPAddr 是 LAN，不要被公网覆盖——
-// 否则 SendToPeer 会走公网 CGNAT 回环（100~500ms）。
 func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	var udpAddr *net.UDPAddr
 	if pubIP != "" && pubPort > 0 {
@@ -1303,10 +1313,6 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string,
 // ensureTargetPeer 记录指令里的目标 peer 信息。
 //
 // ★ 修复：LAN 优先保护 UDPAddr
-//
-// instr.TargetPubSocket 来自服务端 nat_hole_instruction，永远是公网。
-// 如果 peer 当前 UDPAddr 是 LAN，不要被服务端下发的公网覆盖——
-// 否则打洞成功后，服务端 30 秒重发指令会再次把 LAN 覆盖成公网。
 func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	if instr.TargetMac == "" {
 		return
@@ -1575,7 +1581,7 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 
 // notePeerCommon 是打洞握手路径的统一入口。
 //
-// ★ 修复：更新 peer.UDPAddr 时采用"LAN 优先"策略，与 handleP2PFrame 保持一致。
+// ★ 修复：LAN 优先 + 300 秒窗口 + lastLANRecvAt > 0 检查
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
 	now := time.Now().UnixMilli()
 
@@ -1648,6 +1654,7 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 	} else if !oldIsLAN && newIsLAN {
 		shouldUpdate = true
 	} else if oldIsLAN && !newIsLAN {
+		// ★ 加 lastLANRecvAt > 0 检查
 		if best.lastLANRecvAt > 0 && now-best.lastLANRecvAt > 300000 {
 			shouldUpdate = true
 			log.Printf("[P2P] %s (note) LAN 超过 300s 无流量，改用公网地址", best.ClientID)
