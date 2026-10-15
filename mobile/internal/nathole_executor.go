@@ -118,15 +118,6 @@ func (e *Edge) startFailCountResetLoop() {
 	})
 }
 
-// chooseScanTiers 根据本机 STUN 出口和 target 选择扫描策略。
-//
-// 返回：
-//   - tiers     分级数组
-//   - sameStun  是否同 STUN IP
-//   - portDiff  端口差（仅同 STUN 时有意义）
-//   - halfWidth 精准扫描的半径
-//               - 0  → 全端口扫描
-//               - -1 → 放弃（端口差过大，打洞无意义）
 func (e *Edge) chooseScanTiers(targetAddr *net.UDPAddr) (tiers []int, sameStun bool, portDiff int, halfWidth int) {
 	e.mu.Lock()
 	ep := ""
@@ -165,13 +156,6 @@ func (e *Edge) chooseScanTiers(targetAddr *net.UDPAddr) (tiers []int, sameStun b
 	return buildTiers(hw), true, diff, hw
 }
 
-// collectScanTargets 收集本轮打洞的全部候选地址。
-//
-// 四类候选（去重，保持首次出现顺序）：
-//   1. 本机 peer 记录里的 LAN 地址
-//   2. 观测 raddr（最高优先）
-//   3. 服务端下发的 TargetAssistedEndpoints
-//   4. 服务端下发的 TargetLanEndpoints
 func (e *Edge) collectScanTargets(instr *NatHoleInstruction) []*net.UDPAddr {
 	var raw []*net.UDPAddr
 
@@ -190,33 +174,28 @@ func (e *Edge) collectScanTargets(instr *NatHoleInstruction) []*net.UDPAddr {
 	log.Printf("[collectScanTargets] target=%s p.Lan=%v p.Assisted=%v instr.TargetLan=%v instr.TargetAssisted=%v TargetPubSocket=%q",
 		instr.TargetMac, pLan, pAssisted, instr.TargetLanEndpoints, instr.TargetAssistedEndpoints, instr.TargetPubSocket)
 
-	// 1. 本机 peer 记录里的 LAN 地址
 	for _, lan := range pLan {
 		if addr := parseSockAddr(lan); addr != nil {
 			raw = append(raw, addr)
 		}
 	}
 
-	// 2. 观测 raddr
 	if pUDPAddr != nil && pLastRecv > 0 {
 		raw = append(raw, &net.UDPAddr{IP: pUDPAddr.IP, Port: pUDPAddr.Port})
 	}
 
-	// 3. 服务端下发的 assisted
 	for _, ep := range instr.TargetAssistedEndpoints {
 		if addr := parseSockAddr(ep); addr != nil {
 			raw = append(raw, addr)
 		}
 	}
 
-	// 4. 服务端下发的 LAN
 	for _, ep := range instr.TargetLanEndpoints {
 		if addr := parseSockAddr(ep); addr != nil {
 			raw = append(raw, addr)
 		}
 	}
 
-	// 去重
 	seen := make(map[string]bool)
 	var out []*net.UDPAddr
 	for _, a := range raw {
@@ -330,7 +309,6 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		log.Printf("[NAT-HOLE] 模式：不同 STUN IP，全端口扫描，分级 %v", tiers)
 	}
 
-	// 优先扫候选列表
 	if len(assistedTargets) > 0 {
 		log.Printf("[NAT-HOLE] 优先扫描 %d 个候选端点", len(assistedTargets))
 		for _, t := range assistedTargets {
@@ -468,15 +446,6 @@ func (e *Edge) resetFailCount(peerID string) {
 // recordP2PSuccess 记录打洞成功后的目标地址。
 //
 // ★ 统一调度：UDPAddr 更新走 updatePeerUDPAddrLocked
-//
-// 场景：
-//   打洞成功后拿到对端的可达地址 targetAddr（可能是 LAN / 公网 assisted / raddr）。
-//   如果 peer 当前 UDPAddr 是 LAN 且还在窗口内 → 保留 LAN（不覆盖）。
-//   否则按 LAN 优先规则更新。
-//
-// 之前直接 p.UDPAddr = targetAddr 会绕过 LAN 优先策略——例如
-// peer 当前 LAN 是 192.168.1.100，打洞成功时 targetAddr 恰好是公网，
-// 就会把 LAN 覆盖成公网，导致后续 SendToPeer 走 CGNAT 回环。
 func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAddr) {
 	e.peersMu.Lock()
 	if p, ok := e.peers[instr.TargetMac]; ok {
@@ -484,7 +453,6 @@ func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAd
 		updatePeerUDPAddrLocked(p, targetAddr, "nat-success")
 		p.lastRecvAt = time.Now().UnixMilli()
 	} else {
-		// 首次创建，直接设置（无"旧地址"）
 		e.peers[instr.TargetMac] = &PeerInfo{
 			ClientID:   instr.TargetMac,
 			VirtualIP:  instr.TargetVirtualIp,
@@ -537,9 +505,6 @@ func parseSockAddr(s string) *net.UDPAddr {
 	return &net.UDPAddr{IP: ip, Port: port}
 }
 
-// resolveTarget 决定这次打洞往哪个地址发包。
-//
-// 优先使用本机观测过的 raddr（已被证明可达）。
 func (e *Edge) resolveTarget(instr *NatHoleInstruction) *net.UDPAddr {
 	e.peersMu.RLock()
 	if p := e.peers[instr.TargetMac]; p != nil && p.UDPAddr != nil && p.lastRecvAt > 0 {
@@ -559,36 +524,4 @@ func (e *Edge) resolveTarget(instr *NatHoleInstruction) *net.UDPAddr {
 		}
 	}
 	return parseSockAddr(sock)
-}
-
-func (e *Edge) hasTrafficFromTarget(peerID string, since int64) bool {
-	if peerID == "" {
-		return false
-	}
-	e.peersMu.RLock()
-	defer e.peersMu.RUnlock()
-	p := e.peers[peerID]
-	if p == nil || p.UDPAddr == nil {
-		return false
-	}
-	return p.lastRecvAt >= since
-}
-
-func (e *Edge) hasTrafficFromAny(ips []net.IP, since int64) bool {
-	if len(ips) == 0 {
-		return false
-	}
-	e.peersMu.RLock()
-	defer e.peersMu.RUnlock()
-	for _, p := range e.peers {
-		if p.UDPAddr == nil || p.lastRecvAt < since {
-			continue
-		}
-		for _, ip := range ips {
-			if p.UDPAddr.IP.Equal(ip) {
-				return true
-			}
-		}
-	}
-	return false
 }
