@@ -17,7 +17,7 @@ const (
 	ConnRelay        ConnType = "relay"
 )
 
-// 注意：safeGo 定义在 edge.go 里，此处不重复定义。
+// safeGo 定义在 edge.go 里。
 
 type RelayManager struct {
 	mu         sync.RWMutex
@@ -36,7 +36,6 @@ func NewRelayManager(ws *WSTransport, turnClient *TURNClient, edge *Edge) *Relay
 	}
 }
 
-// MarkP2PAvailable 从 Unknown / Relay 升级到"打洞握手成功"。
 func (rm *RelayManager) MarkP2PAvailable(peerID string) {
 	rm.mu.Lock()
 	cur := rm.states[peerID]
@@ -55,7 +54,6 @@ func (rm *RelayManager) MarkP2PAvailable(peerID string) {
 	}
 }
 
-// MarkP2P 只有收到真实数据帧或 PONG 才应调用。
 func (rm *RelayManager) MarkP2P(peerId string) {
 	rm.mu.Lock()
 	if rm.states[peerId] == ConnP2P {
@@ -74,7 +72,6 @@ func (rm *RelayManager) MarkP2P(peerId string) {
 	}
 }
 
-// MarkFallback 常规降级路径。★ 保护 P2PAvailable 状态。
 func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.mu.Lock()
 
@@ -133,11 +130,6 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.cancelFallbackTimer(peerId)
 }
 
-// ForceFallback 强制降级，允许从 P2PAvailable 降级。
-//
-// 使用场景：
-//   1. 服务端下发 force_fallback（同 STUN IP 已失败）
-//   2. P2PAvailable 超时兜底
 func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
@@ -163,10 +155,6 @@ func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	}
 }
 
-// ClearPeer 清空某个 peer 的连接状态。
-//
-// 对端离线时调用。避免新会话继承旧状态（如 TURN）导致
-// MarkFallback 被跳过。
 func (rm *RelayManager) ClearPeer(peerID string) {
 	if peerID == "" {
 		return
@@ -176,9 +164,6 @@ func (rm *RelayManager) ClearPeer(peerID string) {
 	delete(rm.states, peerID)
 }
 
-// ClearAll 清空所有 peer 的连接状态。
-//
-// WS 重连时调用（服务端会清所有 pair，客户端对应清）。
 func (rm *RelayManager) ClearAll() {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
@@ -228,7 +213,6 @@ func (rm *RelayManager) MarkRelay(peerId string) {
 	rm.MarkFallback(peerId)
 }
 
-// ShouldRelay 判断是否需要走中继。
 func (rm *RelayManager) ShouldRelay(peerId string) bool {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
@@ -278,6 +262,12 @@ func (rm *RelayManager) SendViaRelay(data []byte) error {
 
 // SendToPeer 按当前状态发送数据。
 //
+// ★ 修复：任何失败情况都不在内部 fallback 到 WS，只返回 false，
+//   让调用方（tunReadLoop）统一走 WS 中继。
+//
+//   旧版在 TURN / Relay 分支内部调用 ws.SendBinary，然后返回 false，
+//   调用方看到 false 又调一次 ws.SendBinary → 数据双发 → DUP。
+//
 // ★ Android 特有：e.udpConn 是 net.PacketConn，用 WriteTo 而非 WriteToUDP。
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
 	state := rm.GetState(peerId)
@@ -294,10 +284,7 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 		} else {
 			rm.MarkFallback(peerId)
 		}
-		if rm.ws == nil {
-			return false
-		}
-		return rm.ws.SendBinary(data) == nil
+		return false
 
 	case ConnTURN:
 		if target != nil && target.TurnRelayAddr != "" && rm.turnClient != nil {
@@ -305,40 +292,24 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 			if err == nil {
 				if sendErr := rm.turnClient.Send(data, relayAddr); sendErr == nil {
 					return true
-				} else {
-					log.Printf("[TURN] 发送到 %s 失败（临时）: %v", peerId, sendErr)
-					if rm.ws != nil {
-						_ = rm.ws.SendBinary(data)
-					}
-					return false
 				}
+				log.Printf("[TURN] 发送到 %s 失败（临时）: %v", peerId, sendErr)
 			} else {
 				log.Printf("[TURN] 解析中继地址 %q 失败: %v", target.TurnRelayAddr, err)
 			}
 		}
-		if rm.ws != nil {
-			return rm.ws.SendBinary(data) == nil
-		}
 		return false
 
 	case ConnRelay:
-		if rm.ws == nil {
-			return false
-		}
-		return rm.ws.SendBinary(data) == nil
+		return false
+
+	case ConnUnknown:
+		return false
 	}
 
 	return false
 }
 
-// Report 定期上报连接状态给服务端。
-//
-// ★ 修复：即使 states 为空也上报
-//
-// 空 Map 让服务端知道客户端当前没有 P2P 连接，
-// 触发服务端清空 punchState 并重新协调。
-// 否则客户端 states 空 → 不上报 → 服务端保留旧状态
-// → 不重新协调 → 死锁。
 func (rm *RelayManager) Report(interval time.Duration) {
 	if rm.edge == nil {
 		return
@@ -356,7 +327,6 @@ func (rm *RelayManager) Report(interval time.Duration) {
 				}
 				rm.mu.RUnlock()
 
-				// ★ 即使为空也上报
 				if rm.ws == nil {
 					continue
 				}
