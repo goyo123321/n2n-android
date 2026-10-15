@@ -138,14 +138,6 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 }
 
 // ForceFallback 强制降级，允许从 P2PAvailable 直接降级。
-//
-// 使用场景：
-//   1. 服务端下发 force_fallback（同 STUN IP 已失败）
-//   2. P2PAvailable 超时兜底
-//   3. 60s 无流量活性检测
-//
-// 与 MarkFallback 的区别：MarkFallback 保护 P2PAvailable，
-// ForceFallback 允许从 P2PAvailable 立即切到 TURN/Relay。
 func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
@@ -171,10 +163,6 @@ func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	}
 }
 
-// ClearPeer 清空某个 peer 的连接状态。
-//
-// 对端离线时调用。避免新会话继承旧状态（如 TURN）导致
-// MarkFallback 被跳过。
 func (rm *RelayManager) ClearPeer(peerID string) {
 	if peerID == "" {
 		return
@@ -184,9 +172,6 @@ func (rm *RelayManager) ClearPeer(peerID string) {
 	delete(rm.states, peerID)
 }
 
-// ClearAll 清空所有 peer 的连接状态。
-//
-// WS 重连时调用（服务端会清所有 pair，客户端对应清）。
 func (rm *RelayManager) ClearAll() {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
@@ -236,7 +221,6 @@ func (rm *RelayManager) MarkRelay(peerId string) {
 	rm.MarkFallback(peerId)
 }
 
-// ShouldRelay 判断是否需要走中继（P2P/P2PAvailable 都返回 false）。
 func (rm *RelayManager) ShouldRelay(peerId string) bool {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
@@ -286,19 +270,26 @@ func (rm *RelayManager) SendViaRelay(data []byte) error {
 
 // SendToPeer 按当前状态发送数据。
 //
-// ★ 单发（不做双发）
+// ★ 半双发策略
 //
 // 数据面路径：
-//   - P2P/P2PAvailable → 走 UDP，目标由 peer.UDPAddr 决定
-//   - TURN             → 走 TURN 中继
-//   - WS Relay         → 走 WS 中继
+//   - P2P/P2PAvailable + UDPAddr 是 LAN → 单发 LAN（无 DUP）
+//   - P2P/P2PAvailable + UDPAddr 是公网 → 双发公网 + 首选 LAN
+//   - TURN                              → 走 TURN 中继
+//   - WS Relay                          → 走 WS 中继
 //
-// 为什么不双发：
-//   - TUN 层没有去重，双发会导致 DUP（ICMP/TCP/UDP 重复交付）
-//   - 5 入口统一（updatePeerUDPAddrLocked）已保证 UDPAddr 最优
-//   - 保活机制（5s STUN + 15s PING）让 CGNAT 映射永远新鲜
-//   - PING 在 N2NS 层已双发（用于探测 LAN 恢复），覆盖了保活需求
-//   - TCP 有自己的重传，不需要应用层双发
+// 为什么 P2P 是公网时补发 LAN：
+//
+//   场景：WiFi 抖动导致本地 peer.UDPAddr 被切公网，但对端 LAN 可能还活着。
+//   单发公网 → 对端 lastLANRecvAt 不刷新 → 永久卡公网。
+//   补发 LAN → 对端收到 LAN 帧 → 刷新 lastLANRecvAt → 15s 内切回 LAN。
+//
+//   DUP 只出现在公网模式（本来就慢 100~500ms），持续到下一次 PING 刷新。
+//   LAN 模式下不补发，无 DUP，延迟 5~15ms。
+//
+// 与 p2p_stream.go 的 sendP2PFrame 区别：
+//   - sendP2PFrame 处理 N2NS 帧（应用层隧道），有 recentlyDelivered 去重
+//   - SendToPeer 处理 TUN 转发（原始 IPv4 包），无去重机制
 //
 // ★ Android 特有：e.udpConn 是 net.PacketConn（不是 *net.UDPConn），
 //   用 WriteTo(addr) 而非 WriteToUDP。
@@ -309,6 +300,14 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 	case ConnP2P, ConnP2PAvailable:
 		if target != nil && target.UDPAddr != nil && rm.edge != nil && rm.edge.udpConn != nil {
 			_, err := rm.edge.udpConn.WriteTo(data, target.UDPAddr)
+
+			// ★ 主路径是公网时，额外发一份首选 LAN
+			if !isPrivateIPv4(target.UDPAddr.IP) {
+				if lanAddr := rm.edge.firstLanEndpoint(peerId); lanAddr != nil {
+					_, _ = rm.edge.udpConn.WriteTo(data, lanAddr)
+				}
+			}
+
 			if err == nil {
 				return true
 			}
