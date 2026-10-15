@@ -56,8 +56,6 @@ const (
 
 const maxConsecutiveFails = 5
 
-// probePrefix 已移到 punch.go，此处不再定义。
-
 var (
 	natHoleActiveMu sync.Mutex
 	natHoleActive   map[string]bool
@@ -120,7 +118,6 @@ func (e *Edge) startFailCountResetLoop() {
 	})
 }
 
-// chooseScanTiers 根据本机 STUN 出口和 target 选择扫描策略。
 func (e *Edge) chooseScanTiers(targetAddr *net.UDPAddr) (tiers []int, sameStun bool, portDiff int, halfWidth int) {
 	e.mu.Lock()
 	ep := ""
@@ -160,14 +157,6 @@ func (e *Edge) chooseScanTiers(targetAddr *net.UDPAddr) (tiers []int, sameStun b
 }
 
 // collectScanTargets 收集本轮打洞的全部候选地址。
-//
-// ★ 对齐 PC：加 LAN 候选 + raddr 候选
-//
-// 四类候选（去重，保持首次出现顺序）：
-//   1. 本机 peer 记录里的 LAN 地址
-//   2. 观测 raddr（最高优先）
-//   3. 服务端下发的 TargetAssistedEndpoints
-//   4. 服务端下发的 TargetLanEndpoints
 func (e *Edge) collectScanTargets(instr *NatHoleInstruction) []*net.UDPAddr {
 	var raw []*net.UDPAddr
 
@@ -461,11 +450,49 @@ func (e *Edge) resetFailCount(peerID string) {
 	natHoleActiveMu.Unlock()
 }
 
+// recordP2PSuccess 打洞成功时更新 peer 地址。
+//
+// ★ 修复：LAN 优先保护
+//
+// targetAddr 来自 resolveTarget，通常是 peer.UDPAddr（已被保护），
+// 但如果 resolveTarget 走到了 fallback 分支（peer.UDPAddr 为 nil），
+// 就会返回指令里的 TargetPubSocket（公网）。
+//
+// 无条件覆盖会把 LAN 打成公网，之后 SendToPeer 走 CGNAT 回环（100~300ms）。
+// 加 LAN 优先后，只有真正需要才切换。
 func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAddr) {
 	e.peersMu.Lock()
 	if p, ok := e.peers[instr.TargetMac]; ok {
-		p.UDPAddr = targetAddr
-		p.lastRecvAt = time.Now().UnixMilli()
+		// ★ LAN 优先保护
+		newIsLAN := isPrivateIPv4(targetAddr.IP)
+		oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
+		now := time.Now().UnixMilli()
+
+		shouldUpdate := false
+		if p.UDPAddr == nil {
+			shouldUpdate = true
+		} else if !oldIsLAN && newIsLAN {
+			shouldUpdate = true
+		} else if oldIsLAN && !newIsLAN {
+			// 旧 LAN → 新公网：只在 lastLANRecvAt 超过 300 秒时才切
+			if p.lastLANRecvAt > 0 && now-p.lastLANRecvAt > 300000 {
+				shouldUpdate = true
+			}
+		} else {
+			// 同类型，端口变了才更新
+			if p.UDPAddr.Port != targetAddr.Port {
+				shouldUpdate = true
+			}
+		}
+
+		if newIsLAN {
+			p.lastLANRecvAt = now
+		}
+
+		if shouldUpdate {
+			p.UDPAddr = targetAddr
+		}
+		p.lastRecvAt = now
 	} else {
 		e.peers[instr.TargetMac] = &PeerInfo{
 			ClientID:   instr.TargetMac,
