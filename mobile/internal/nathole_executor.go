@@ -56,6 +56,8 @@ const (
 
 const maxConsecutiveFails = 5
 
+// probePrefix 已移到 punch.go，此处不再定义。
+
 var (
 	natHoleActiveMu sync.Mutex
 	natHoleActive   map[string]bool
@@ -118,6 +120,7 @@ func (e *Edge) startFailCountResetLoop() {
 	})
 }
 
+// chooseScanTiers 根据本机 STUN 出口和 target 选择扫描策略。
 func (e *Edge) chooseScanTiers(targetAddr *net.UDPAddr) (tiers []int, sameStun bool, portDiff int, halfWidth int) {
 	e.mu.Lock()
 	ep := ""
@@ -156,6 +159,15 @@ func (e *Edge) chooseScanTiers(targetAddr *net.UDPAddr) (tiers []int, sameStun b
 	return buildTiers(hw), true, diff, hw
 }
 
+// collectScanTargets 收集本轮打洞的全部候选地址。
+//
+// ★ 对齐 PC：加 LAN 候选 + raddr 候选
+//
+// 四类候选（去重，保持首次出现顺序）：
+//   1. 本机 peer 记录里的 LAN 地址
+//   2. 观测 raddr（最高优先）
+//   3. 服务端下发的 TargetAssistedEndpoints
+//   4. 服务端下发的 TargetLanEndpoints
 func (e *Edge) collectScanTargets(instr *NatHoleInstruction) []*net.UDPAddr {
 	var raw []*net.UDPAddr
 
@@ -174,28 +186,33 @@ func (e *Edge) collectScanTargets(instr *NatHoleInstruction) []*net.UDPAddr {
 	log.Printf("[collectScanTargets] target=%s p.Lan=%v p.Assisted=%v instr.TargetLan=%v instr.TargetAssisted=%v TargetPubSocket=%q",
 		instr.TargetMac, pLan, pAssisted, instr.TargetLanEndpoints, instr.TargetAssistedEndpoints, instr.TargetPubSocket)
 
+	// 1. 本机 peer 记录里的 LAN 地址
 	for _, lan := range pLan {
 		if addr := parseSockAddr(lan); addr != nil {
 			raw = append(raw, addr)
 		}
 	}
 
+	// 2. 观测 raddr
 	if pUDPAddr != nil && pLastRecv > 0 {
 		raw = append(raw, &net.UDPAddr{IP: pUDPAddr.IP, Port: pUDPAddr.Port})
 	}
 
+	// 3. 服务端下发的 assisted
 	for _, ep := range instr.TargetAssistedEndpoints {
 		if addr := parseSockAddr(ep); addr != nil {
 			raw = append(raw, addr)
 		}
 	}
 
+	// 4. 服务端下发的 LAN
 	for _, ep := range instr.TargetLanEndpoints {
 		if addr := parseSockAddr(ep); addr != nil {
 			raw = append(raw, addr)
 		}
 	}
 
+	// 去重
 	seen := make(map[string]bool)
 	var out []*net.UDPAddr
 	for _, a := range raw {
@@ -309,6 +326,7 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		log.Printf("[NAT-HOLE] 模式：不同 STUN IP，全端口扫描，分级 %v", tiers)
 	}
 
+	// 优先扫候选列表
 	if len(assistedTargets) > 0 {
 		log.Printf("[NAT-HOLE] 优先扫描 %d 个候选端点", len(assistedTargets))
 		for _, t := range assistedTargets {
@@ -443,14 +461,10 @@ func (e *Edge) resetFailCount(peerID string) {
 	natHoleActiveMu.Unlock()
 }
 
-// recordP2PSuccess 记录打洞成功后的目标地址。
-//
-// ★ 统一调度：UDPAddr 更新走 updatePeerUDPAddrLocked
 func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAddr) {
 	e.peersMu.Lock()
 	if p, ok := e.peers[instr.TargetMac]; ok {
-		// ★ 统一走 updatePeerUDPAddrLocked
-		updatePeerUDPAddrLocked(p, targetAddr, "nat-success")
+		p.UDPAddr = targetAddr
 		p.lastRecvAt = time.Now().UnixMilli()
 	} else {
 		e.peers[instr.TargetMac] = &PeerInfo{
@@ -505,6 +519,9 @@ func parseSockAddr(s string) *net.UDPAddr {
 	return &net.UDPAddr{IP: ip, Port: port}
 }
 
+// resolveTarget 决定这次打洞往哪个地址发包。
+//
+// ★ 对齐 PC：优先使用观测 raddr（已被证明可达）。
 func (e *Edge) resolveTarget(instr *NatHoleInstruction) *net.UDPAddr {
 	e.peersMu.RLock()
 	if p := e.peers[instr.TargetMac]; p != nil && p.UDPAddr != nil && p.lastRecvAt > 0 {
@@ -525,3 +542,5 @@ func (e *Edge) resolveTarget(instr *NatHoleInstruction) *net.UDPAddr {
 	}
 	return parseSockAddr(sock)
 }
+
+// buildPunchProbe 已移到 punch.go
