@@ -37,6 +37,9 @@ func NewRelayManager(ws *WSTransport, turnClient *TURNClient, edge *Edge) *Relay
 }
 
 // MarkP2PAvailable 从 Unknown / Relay 升级到"打洞握手成功"。
+//
+// 收到 Punch 或 ACK 时调用。此时对端→本端通道已被证明，
+// 但还需要收到 PONG 或真实数据帧才能确认双向通道。
 func (rm *RelayManager) MarkP2PAvailable(peerID string) {
 	rm.mu.Lock()
 	cur := rm.states[peerID]
@@ -74,10 +77,11 @@ func (rm *RelayManager) MarkP2P(peerId string) {
 	}
 }
 
-// MarkFallback 常规降级路径。保护 P2PAvailable 状态。
+// MarkFallback 常规降级路径。★ 保护 P2PAvailable 状态。
 func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.mu.Lock()
 
+	// 保护 P2PAvailable：给它验证窗口，不因单次 UDP 发送失败就降级
 	if rm.states[peerId] == ConnP2P || rm.states[peerId] == ConnP2PAvailable {
 		rm.mu.Unlock()
 		rm.cancelFallbackTimer(peerId)
@@ -133,7 +137,15 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.cancelFallbackTimer(peerId)
 }
 
-// ForceFallback 强制降级，允许从 P2PAvailable 降级。
+// ForceFallback 强制降级，允许从 P2PAvailable 直接降级。
+//
+// 使用场景：
+//   1. 服务端下发 force_fallback（同 STUN IP 已失败）
+//   2. P2PAvailable 超时兜底
+//   3. 显式放弃 P2P 的场景
+//
+// 与 MarkFallback 的区别：MarkFallback 保护 P2PAvailable，
+// ForceFallback 允许从 P2PAvailable 立即切到 TURN/Relay。
 func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
@@ -159,6 +171,10 @@ func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	}
 }
 
+// ClearPeer 清空某个 peer 的连接状态。
+//
+// 对端离线时调用。避免新会话继承旧状态（如 TURN）导致
+// MarkFallback 被跳过。
 func (rm *RelayManager) ClearPeer(peerID string) {
 	if peerID == "" {
 		return
@@ -168,6 +184,9 @@ func (rm *RelayManager) ClearPeer(peerID string) {
 	delete(rm.states, peerID)
 }
 
+// ClearAll 清空所有 peer 的连接状态。
+//
+// WS 重连时调用（服务端会清所有 pair，客户端对应清）。
 func (rm *RelayManager) ClearAll() {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
@@ -217,6 +236,7 @@ func (rm *RelayManager) MarkRelay(peerId string) {
 	rm.MarkFallback(peerId)
 }
 
+// ShouldRelay 判断是否需要走中继（P2P/P2PAvailable 都返回 false）。
 func (rm *RelayManager) ShouldRelay(peerId string) bool {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
@@ -264,6 +284,9 @@ func (rm *RelayManager) SendViaRelay(data []byte) error {
 	return rm.ws.SendBinary(data)
 }
 
+// SendToPeer 按当前状态发送数据。
+//
+// ★ Android 特有：e.udpConn 是 net.PacketConn，用 WriteTo 而非 WriteToUDP。
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
 	state := rm.GetState(peerId)
 
@@ -316,9 +339,6 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 	return false
 }
 
-// Report 定期上报连接状态。
-//
-// ★ 修复：即使为空也上报
 func (rm *RelayManager) Report(interval time.Duration) {
 	if rm.edge == nil {
 		return
@@ -335,7 +355,9 @@ func (rm *RelayManager) Report(interval time.Duration) {
 					conns[peerId] = string(t)
 				}
 				rm.mu.RUnlock()
-
+				if len(conns) == 0 {
+					continue
+				}
 				if rm.ws == nil {
 					continue
 				}
