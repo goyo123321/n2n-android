@@ -28,7 +28,7 @@ type PeerInfo struct {
 	TurnRelayAddr     string
 	UDPAddr           *net.UDPAddr
 	lastRecvAt        int64
-	lastLANRecvAt     int64 // ★ 最近一次收到 LAN 帧的时间
+	lastLANRecvAt     int64
 	loggedReady       bool
 	hasRealData       bool
 	AssistedEndpoints []string
@@ -210,8 +210,6 @@ func (e *Edge) startKeepalive() {
 // ============ P2P 通道保活 + 活性检测 ============
 
 const p2pKeepaliveInterval = 15 * time.Second
-
-// ★ 从 60 秒延长到 120 秒——容忍更多偶发丢包，避免误判
 const p2pIdleDeadMs = 120000
 
 func (e *Edge) startP2PKeepalive() {
@@ -1099,11 +1097,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 // maybeResetFailCountForPeer 处理对端出口地址变化。
 //
 // ★ 区分 IP 变化 vs 端口漂移
-//
-//   - 端口漂移（同 IP 不同端口）：CGNAT 常态，P2P 通道本身还在用旧地址，
-//     不能清空状态，否则 viaTURN=true → 走 WS 中继（100~300ms）
-//
-//   - IP 变化（对端真的换了网络）：需要清空状态，重新打洞
 func (e *Edge) maybeResetFailCountForPeer(peerID, newPubIP string, newPubPort int) {
 	if peerID == "" || newPubIP == "" || newPubPort <= 0 {
 		return
@@ -1135,7 +1128,6 @@ func (e *Edge) maybeResetFailCountForPeer(peerID, newPubIP string, newPubPort in
 		log.Printf("[NAT-HOLE] %s 出口 IP 变化 %s → %s，清空连接状态 (was=%d)",
 			peerID, oldPubIP, newPubIP, hadCount)
 	} else {
-		// 同 IP 端口漂移：只重置失败计数，保留 P2P 状态
 		log.Printf("[NAT-HOLE] %s 端口漂移 %s:%d → %s:%d，保留 P2P 状态",
 			peerID, oldPubIP, oldPubPort, newPubIP, newPubPort)
 	}
@@ -1452,6 +1444,16 @@ func (e *Edge) udpReadLoop() {
 	}
 }
 
+// tunReadLoop 从 TUN 读 IPv4 包，转发给对应 peer。
+//
+// ★ 修复：TURN 状态异步发送
+//
+//   TURN 的 Send 路径涉及 STUN CreatePermission 请求，可能阻塞 5 秒
+//   （turnRequestTimeout）。tunReadLoop 是单线程——一旦阻塞，后续
+//   所有包全部排队，导致延迟波动（200~500ms 突发）。
+//
+//   修复：TURN 状态时异步 goroutine 发送，不阻塞主循环。
+//   P2P / Relay / Unknown 状态不阻塞（UDP WriteTo 内核缓冲，立即返回）。
 func (e *Edge) tunReadLoop() {
 	buf := make([]byte, 65535)
 	for {
@@ -1491,22 +1493,7 @@ func (e *Edge) tunReadLoop() {
 		}
 		e.peersMu.RUnlock()
 
-		if target != nil {
-			state := ConnUnknown
-			if e.relayMgr != nil {
-				state = e.relayMgr.GetState(target.ClientID)
-			}
-			sent := false
-			if e.relayMgr != nil {
-				sent = e.relayMgr.SendToPeer(target.ClientID, buf[:n], target)
-			}
-			if n >= 10 {
-				e.logTunForward(target.ClientID, dstIP, n, int(buf[9]), sent, state)
-			}
-			if !sent && e.ws != nil {
-				_ = e.ws.SendBinary(buf[:n])
-			}
-		} else {
+		if target == nil {
 			proto := 0
 			if n >= 10 {
 				proto = int(buf[9])
@@ -1518,6 +1505,49 @@ func (e *Edge) tunReadLoop() {
 			} else {
 				e.logNoPeerThrottled(dstIP, n)
 			}
+			continue
+		}
+
+		state := ConnUnknown
+		if e.relayMgr != nil {
+			state = e.relayMgr.GetState(target.ClientID)
+		}
+
+		// ★ TURN 状态：异步发送，避免阻塞主循环
+		if state == ConnTURN {
+			pktCopy := make([]byte, n)
+			copy(pktCopy, buf[:n])
+			targetID := target.ClientID
+			targetCopy := target
+			pktLen := n
+			proto := 0
+			if n >= 10 {
+				proto = int(buf[9])
+			}
+
+			safeGo("tun-send-turn", func() {
+				sent := false
+				if e.relayMgr != nil {
+					sent = e.relayMgr.SendToPeer(targetID, pktCopy, targetCopy)
+				}
+				e.logTunForward(targetID, dstIP, pktLen, proto, sent, ConnTURN)
+				if !sent && e.ws != nil {
+					_ = e.ws.SendBinary(pktCopy)
+				}
+			})
+			continue
+		}
+
+		// ★ P2P / P2PAvailable / Relay / Unknown：同步发送（不阻塞）
+		sent := false
+		if e.relayMgr != nil {
+			sent = e.relayMgr.SendToPeer(target.ClientID, buf[:n], target)
+		}
+		if n >= 10 {
+			e.logTunForward(target.ClientID, dstIP, n, int(buf[9]), sent, state)
+		}
+		if !sent && e.ws != nil {
+			_ = e.ws.SendBinary(buf[:n])
 		}
 	}
 }
@@ -1657,7 +1687,6 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 	} else if !oldIsLAN && newIsLAN {
 		shouldUpdate = true
 	} else if oldIsLAN && !newIsLAN {
-		// ★ 加 lastLANRecvAt > 0 检查
 		if best.lastLANRecvAt > 0 && now-best.lastLANRecvAt > 300000 {
 			shouldUpdate = true
 			log.Printf("[P2P] %s (note) LAN 超过 300s 无流量，改用公网地址", best.ClientID)
