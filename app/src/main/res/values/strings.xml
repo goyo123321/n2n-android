@@ -23,7 +23,7 @@
     <string name="hint_socks5_listen">监听地址（如 127.0.0.1:1080 或 0.0.0.0:1080）</string>
 
     <!-- SOCKS5 说明 -->
-    <string name="socks5_desc">与 VPN 并行运行。开启后，App 内可通过 127.0.0.1:1080 访问组网服务（走 SOCKS5 代理，不经过 TUN）。\n\n若要同手机的 Termux 访问，改成 0.0.0.0:1080。</string>
+    <string name="socks5_desc">与 VPN 并行运行。开启后，App 内可通过 127.0.0.1:1080 访问组网服务（走 SOCKS5 代理，不经过 TUN）。&#10;&#10;若要同手机的 Termux 访问，改成 0.0.0.0:1080。</string>
     <string name="socks5_default_listen">127.0.0.1:1080</string>
     <string name="socks5_invalid">SOCKS5 监听地址格式不对（应为 host:port）</string>
 
@@ -69,7 +69,7 @@
 
     <!-- 首次使用对话框 -->
     <string name="first_use_title">首次使用：请填写服务器地址</string>
-    <string name="first_use_message">你需要填写 edge-signal Worker 的 WSS 地址。\n\n如果你已经部署了 edge-signal：\n  • 打开 Cloudflare Dashboard\n  • Workers &amp; Pages → edge-signal\n  • 复制访问地址（形如 wss://xxx.workers.dev）\n\n如果你还没有部署：\n  • 参考 edge-signal 项目文档\n  • 或使用朋友分享给你的地址</string>
+    <string name="first_use_message">你需要填写 edge-signal Worker 的 WSS 地址。&#10;&#10;如果你已经部署了 edge-signal：&#10;  • 打开 Cloudflare Dashboard&#10;  • Workers &amp; Pages → edge-signal&#10;  • 复制访问地址（形如 wss://xxx.workers.dev）&#10;&#10;如果你还没有部署：&#10;  • 参考 edge-signal 项目文档&#10;  • 或使用朋友分享给你的地址</string>
     <string name="first_use_fill">我现在就填</string>
     <string name="first_use_later">稍后再说</string>
 
