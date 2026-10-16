@@ -23,7 +23,13 @@ object N2nController {
 
     @Volatile private var logPathApplied = false
 
+    // ★ Bug 6 修复：标记正在停止，让 handleStart 能等待
+    @Volatile private var stopping = false
+
     fun isRunning(): Boolean = running.get()
+
+    // ★ Bug 6 修复：暴露给 N2nVpnService.handleStart 用
+    fun isStopping(): Boolean = stopping
 
     fun applySystemTimezone() {
         try {
@@ -40,10 +46,6 @@ object N2nController {
         }
     }
 
-    // ★ 新增：把 filesDir 下的日志文件路径传给 Go 侧。
-    //
-    // 之前 Go 侧 logger.go 硬编码包名，改 applicationId 就废了。
-    // 现在在 App 进程启动早期调用一次。
     fun applyLogFilePath(ctx: Context) {
         if (logPathApplied) return
         try {
@@ -117,6 +119,18 @@ object N2nController {
         }.apply { name = "n2n-start" }.start()
     }
 
+    // ============================================================
+    // ★ Bug 6 修复：stop 加 stopping 标志
+    // ============================================================
+    //
+    // 旧版：running.set(false) 立即置 false，client.stop() 在另一个线程异步
+    //       执行。如果用户马上点"启动"，handleStart 看到 !isRunning 就直接
+    //       往下走，新 Edge 与旧 Edge 会短暂共存（旧 Edge 还在关 socket、
+    //       清理 TURN）。
+    //
+    // 新版：加 stopping 标志。handleStart 检查 isRunning || isStopping
+    //       双重条件，确保旧 Edge 完全清理完再启动新的。
+    //
     fun stop() {
         running.set(false)
 
@@ -126,13 +140,21 @@ object N2nController {
             client = null
         }
 
-        if (c == null) return
+        if (c == null) {
+            // 没有 client 需要停止，stopping 保持 false
+            return
+        }
+
+        stopping = true
 
         Thread {
             try {
                 c.stop()
             } catch (t: Throwable) {
                 Log.e(TAG, "client.stop failed", t)
+            } finally {
+                stopping = false
+                Log.i(TAG, "stop 完成，stopping=false")
             }
         }.apply { name = "n2n-stop" }.start()
     }
