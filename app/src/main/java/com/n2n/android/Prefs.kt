@@ -17,7 +17,9 @@ object Prefs {
     private const val KEY_AUTO_CLIENT_ID = "auto_client_id"
     private const val KEY_FIRST_USE_SEEN = "first_use_seen"
     private const val KEY_EVER_STARTED_VPN = "ever_started_vpn"
-    private const val KEY_SOCKS5_LISTEN = "socks5_listen"   // ★ 新增
+    private const val KEY_SOCKS5_LISTEN = "socks5_listen"
+    // ★ 新增：电池优化询问标记
+    private const val KEY_BATTERY_OPT_ASKED = "battery_opt_asked"
 
     private const val DEFAULT_SIGNALING_URL = ""
     private const val DEFAULT_ROOM_ID = "default-room"
@@ -93,7 +95,7 @@ object Prefs {
         } catch (_: Throwable) {}
     }
 
-    // ============ ★ 新增：SOCKS5 监听地址 ============
+    // ============ SOCKS5 监听地址 ============
 
     fun loadSocks5Listen(ctx: Context): String =
         try {
@@ -144,6 +146,8 @@ object Prefs {
     }
 
     // ============ 首用提示 ============
+    //
+    // ★ Bug 1 修复：这个 key 之前定义了但从未被调用——对话框每次都弹。
 
     fun hasSeenFirstUseDialog(ctx: Context): Boolean =
         try {
@@ -170,6 +174,25 @@ object Prefs {
     fun markVpnStartedOnce(ctx: Context) {
         try {
             sp(ctx)?.edit()?.putBoolean(KEY_EVER_STARTED_VPN, true)?.apply()
+        } catch (_: Throwable) {}
+    }
+
+    // ============ ★ 新增：电池优化询问标记（Bug 3 修复） ============
+    //
+    // 场景：Android 6+ 每次冷启动都会检查 isIgnoringBatteryOptimizations，
+    //       未加入白名单就弹系统对话框。用户点"不允许"后下次进 App 又弹。
+    // 修复：加一次"已询问"标记，只弹一次。
+
+    fun hasAskedBatteryOptimization(ctx: Context): Boolean =
+        try {
+            sp(ctx)?.getBoolean(KEY_BATTERY_OPT_ASKED, false) ?: false
+        } catch (t: Throwable) {
+            false
+        }
+
+    fun markBatteryOptimizationAsked(ctx: Context) {
+        try {
+            sp(ctx)?.edit()?.putBoolean(KEY_BATTERY_OPT_ASKED, true)?.apply()
         } catch (_: Throwable) {}
     }
 }
