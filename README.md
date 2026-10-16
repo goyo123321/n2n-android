@@ -2,7 +2,7 @@
 
 基于 Cloudflare Workers 信令服务的 Android 客户端，配合 [edge-signal](https://github.com/goyo123321/edge-signal) 实现跨 NAT 的 P2P 虚拟组网。
 
-通过 `VpnService` 建立 TUN 虚拟网卡，只接管组网网段（如 `10.64.0.0/24`），其他流量走系统默认。支持 **P2P 打洞 / TURN 中继 / WebSocket 中继** 三级降级，无需 root。
+通过 `VpnService` 建立 TUN 虚拟网卡，只接管组网网段（如 `10.64.0.0/24`），其他流量走系统默认。**支持 TCP / UDP / ICMP（含 ping）**，无需 root。
 
 **内置 SOCKS5 入口**——与 VPN 并行运行，无需 root，可为特定 App 提供代理通道。
 
@@ -26,8 +26,8 @@
          ▼                   ▼                   ▼
    n2n-go-client       n2n-termux          n2n-android
    ┌──────────┐       ┌──────────┐        ┌──────────┐
-   │ TUN 模式  │       │ SOCKS5   │        │VpnService│
-   │ 系统级路由│       │ 代理模式 │        │ + SOCKS5 │
+   │ TUN 模式  │       │SOCKS5 +  │        │VpnService│
+   │ 系统级路由│       │包转发器  │        │ + SOCKS5 │
    │ 需 root  │       │ 无 root  │        │ 无 root  │
    └──────────┘       └──────────┘        └──────────┘
      Linux/macOS         Android              Android
@@ -42,12 +42,15 @@
 | 维度 | n2n-go-client | n2n-termux | **n2n-android** |
 |:---|:---|:---|:---|
 | **运行环境** | Linux / macOS / Windows / 路由器 | Android Termux | **Android APK** |
-| **数据面** | TUN 虚拟网卡 | SOCKS5 代理 | **VpnService + SOCKS5 双入口** |
+| **数据面** | TUN 虚拟网卡 | SOCKS5 + 包转发器 | **VpnService + SOCKS5 双入口** |
 | **权限要求** | root / 管理员 | 无 root | **无 root** |
 | **应用透明** | ✅ 系统级 | ⚠️ 需 App 显式配 SOCKS5 | **✅ VpnService 系统级 + SOCKS5 可选** |
-| **协议支持** | TCP / UDP / ICMP | 仅 TCP | **TCP / UDP / ICMP（VpnService）；TCP（SOCKS5）** |
-| **使用方式** | `curl http://10.64.0.X` | `curl --socks5 127.0.0.1:1080 ...` | **同 TUN + 可选 SOCKS5** |
-| **适用场景** | 服务器 / 桌面 / 路由器 | 临时测试 / 无 root 设备 | **日常手机使用** |
+| **协议支持（主动）** | TCP / UDP / ICMP | 仅 TCP | **TCP / UDP / ICMP（VpnService）** |
+| **协议支持（被动）** | TCP / UDP / ICMP | TCP / UDP / ICMP | **TCP / UDP / ICMP** |
+| **使用方式** | `curl http://10.64.0.X` | `curl --socks5 127.0.0.1:1080 ...` | **同 TUN** |
+| **适用场景** | 服务器 / 桌面 / 路由器 | 无 root 设备 / 临时调试 | **日常手机使用** |
+
+**核心优势**：Android 端是**唯一支持 ping 主动发起**的无 root 客户端——`VpnService` 的 TUN 可以接收 ICMP Echo Reply 并交付给原始 socket，这是 Termux 的 SOCKS5 做不到的。
 
 ---
 
@@ -74,9 +77,9 @@
 | **仅 VpnService** | ✅ 开启 | ❌ 关闭 | 所有 App 走 VPN，应用透明 |
 | **仅 SOCKS5** | ❌ 关闭 | ✅ 开启 | 只有配置了代理的 App 走组网 |
 | **两者都开** | ✅ | ✅ | 双入口并存（互不干扰） |
-| **两者都关** | ❌ | ❌ | 无组网（不可能同时关，至少开一个） |
+| **两者都关** | ❌ | ❌ | 无组网 |
 
-**注意**：无论哪种组合，都需要 VPN 权限（因为 SOCKS5 底层走的是组网通道，而组网需要 TUN）。
+**注意**：无论哪种组合，都需要 VPN 权限（SOCKS5 底层走的是组网通道，而组网需要 TUN）。
 
 ### 使用步骤
 
@@ -149,6 +152,8 @@ export ALL_PROXY=socks5://<手机IP>:1080
 ## ✨ 特性
 
 - **原生 VPN** — `VpnService` + TUN 内核栈，无需 root
+- **完整协议支持** — **TCP / UDP / ICMP（含 ping）**
+- **双向互通** — 主动访问其他端 + 被其他端访问，三端全部支持
 - **SOCKS5 入口** — 与 VpnService 并行，为特定 App 提供代理
 - **三级降级** — `P2P → TURN → WS`，连接永远可用
 - **P2P 直连** — STUN 探测 + NAT 打洞，延迟低至 5ms
@@ -157,6 +162,7 @@ export ALL_PROXY=socks5://<手机IP>:1080
 - **CGNAT hairpin** — 同 STUN 出口 IP 时首次允许尝试，失败后服务端强制降级
 - **UDP 保活** — 每 5 秒无条件刷新 STUN 映射，防止 CGNAT 端口漂移
 - **P2P 通道保活** — 每 15 秒往对端发 N2NS PING 多目标探针
+- **空闲保活** — 每 2 秒刷新空闲 P2P 通道，**防止 WiFi 深度省电导致 ping 尖峰**
 - **TURN 中继** — 支持 Cloudflare TURN + 自建 coturn（UDP / TCP / RFC6062）
 - **WS 中继兜底** — TURN 不可用时自动降级到 Worker 转发
 - **WS 应用层隧道** — 支持 PC / Termux 通过 WS 中继访问 Android 上的服务
@@ -190,9 +196,9 @@ export ALL_PROXY=socks5://<手机IP>:1080
    │   └─ NetInfo              NetInfo      │
    └──────────────────────────────────────┘
             │
-            ├─ VpnService → TUN → 系统流量
+            ├─ VpnService → TUN → 系统流量（TCP/UDP/ICMP）
             │
-            └─ SOCKS5 (127.0.0.1:1080) → 代理流量
+            └─ SOCKS5 (127.0.0.1:1080) → 代理流量（仅 TCP）
                        │
                        ▼
    ┌────────────────────────────────────────┐
@@ -209,18 +215,44 @@ export ALL_PROXY=socks5://<手机IP>:1080
 
 ## 🔥 保活机制
 
+### 为什么需要保活
+
+**Android 息屏后 WiFi 芯片会周期性进入 PS-Poll 深度省电模式**——导致下行包被 AP 缓存 100ms+ 才送达，ping 出现 200-500ms 尖峰。
+
+**n2n-android 用三层保活对抗这个问题**：
+
 | 层 | 间隔 | 目标 | 作用 |
 |:---|:---|:---|:---|
-| **UDP 保活** | 5 秒 | 5 个 STUN 服务器 | 保 socket 的 CGNAT 映射（无条件发送） |
+| **UDP 保活** | 5 秒 | 5 个 STUN 服务器 | 保 socket 的 CGNAT 映射 |
 | **P2P 通道保活** | 15 秒 | 每个 P2P 对端 | 保 A→B 会话 |
-| **WS 心跳** | 20 秒 | 服务端 | 保 WS 连接 |
+| **空闲保活** | 2 秒 | 空闲 P2P 对端 | **强制 WiFi 保持活跃** |
 
-**流量代价**：
-- UDP 保活：~50 MB/天
-- P2P 保活：~180 KB/天 × 对端数
-- 电量代价：几乎可忽略
+### 关键修复：`WIFI_MODE_FULL_LOW_LATENCY`
 
-**真实数据帧天然刷新 CGNAT 映射**（最强保活）。保活机制只在**空闲时**起兜底作用。
+**Android 10（API 29）起，`WIFI_MODE_FULL_HIGH_PERF` 被系统静默降级**。息屏后 WiFi 芯片仍会进入 PS-Poll 省电模式。
+
+**n2n-android 强制使用 `WIFI_MODE_FULL_LOW_LATENCY`**（视频通话/游戏级别）：
+
+```kotlin
+val lockMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+    WifiManager.WIFI_MODE_FULL_LOW_LATENCY   // 息屏后仍保持低延迟
+} else {
+    WifiManager.WIFI_MODE_FULL_HIGH_PERF
+}
+```
+
+**效果**：息屏后 ping 从"双峰（8ms / 200ms）"变成"单峰（8-40ms）"。
+
+### 流量代价
+
+| 场景 | 3 个 peer 全天空闲流量 |
+|:---|:---|
+| STUN 保活（5 秒 × 5 服务器） | ~3 MB/天 |
+| P2P-Keepalive（15 秒） | ~0.3 MB/天 |
+| P2P-Idle-Keepalive（2 秒） | ~6 MB/天 |
+| **合计** | **~9 MB/天** |
+
+**9 MB/天** 对现代手机流量套餐完全可忽略。有真实数据时保活自动跳过。
 
 ---
 
@@ -343,6 +375,7 @@ App 节点列表和 Web 面板使用同一套徽章：
 |:---|:---|
 | `INTERNET` | 网络通信 |
 | `ACCESS_NETWORK_STATE` | 网络状态检测 |
+| `CHANGE_WIFI_STATE` | **WiFi 锁（LOW_LATENCY 模式）** |
 | `FOREGROUND_SERVICE` | 前台服务 |
 | `FOREGROUND_SERVICE_SPECIAL_USE` | VPN 前台服务 |
 | `POST_NOTIFICATIONS` | 通知栏状态显示 |
@@ -415,6 +448,38 @@ App 节点列表和 Web 面板使用同一套徽章：
 
 同时，VpnService 只接管 `10.64.0.0/24`，其他流量走系统默认。
 
+### Q: 息屏后 ping 尖峰很大（200ms+）？
+
+**典型现象**：
+
+```
+64 bytes from 10.64.0.2: icmp_seq=1 time=197 ms   ← 尖峰
+64 bytes from 10.64.0.2: icmp_seq=2 time=9.44 ms  ← 正常
+64 bytes from 10.64.0.2: icmp_seq=3 time=386 ms   ← 尖峰
+64 bytes from 10.64.0.2: icmp_seq=4 time=7.83 ms  ← 正常
+```
+
+**原因**：Android 息屏后 WiFi 芯片进入 PS-Poll 省电模式。
+
+**修复**：本版已内置：
+
+1. `WIFI_MODE_FULL_LOW_LATENCY` WiFi 锁
+2. 空闲 P2P 保活（每 2 秒）
+
+**验证修复生效**：息屏后跑
+
+```bash
+# 从 PC 端
+ping -i 0.2 10.64.0.X
+```
+
+**预期**：RTT 稳定在 **8-40ms**，无 200ms+ 尖峰。
+
+**如果还不行**：
+
+1. **检查电池优化白名单**——App 主界面会弹一次询问，用户同意后加入白名单
+2. **检查 WiFi 锁是否生效**——App 日志里应该有 `[K] WifiLock acquired (mode=4)`（mode=4 = `WIFI_MODE_FULL_LOW_LATENCY`）
+
 ### Q: Firefox 怎么配 SOCKS5？
 
 ```
@@ -475,9 +540,14 @@ SOCKS5 会**拒绝**并返回 `Host unreachable`。因为 `findPeerByVIP` 只识
 
 ### Q: `ping 10.64.0.3` 不通？
 
-Android 的 TUN 对 ICMP 支持不完整，部分 ROM 直接丢弃 TUN 上写回的 ICMP reply。
+**Android 的 TUN 对 ICMP 支持完整**——如果 ping 不通，可能是：
 
-**用 TCP 测**：
+1. **打洞失败** → 服务端面板显示 `TURN-BD` 或 `ws-BD`
+   - 修复：等几秒 P2P 建立，或检查两端网络
+2. **对端是 Termux 且走了 P2P 单向** → 见 Termux 的 README
+3. **TUN 路由问题** → `adb shell ip route` 检查是否有 `10.64.0.0/24`
+
+**用 TCP 测**（更可靠）：
 
 ```bash
 curl -v --max-time 5 http://10.64.0.3:8080/
@@ -524,7 +594,33 @@ curl -v --max-time 5 http://10.64.0.3:8080/
 2. 在系统设置里将 App 加入电池优化白名单
 3. 长时间不使用请在 App 内停止 VPN
 
-**注意**：保活（5 秒 STUN + 15 秒 P2P）的电量开销可忽略，不是耗电原因。
+**注意**：保活（5 秒 STUN + 15 秒 P2P + 2 秒空闲）的电量开销可忽略，不是耗电原因。
+
+### Q: 面板显示 `--` 连接状态？
+
+**客户端没上报 `connection_status`**，或者 `relayMgr.states` 为空。
+
+**排查**：
+
+1. Worker 日志搜 `[Room] p2p_metadata from` —— 是否有客户端的 metadata 上报
+2. Worker 日志搜 `[NAT] pair-` —— 协调器是否派发了打洞指令
+3. 如果完全没有协调器日志 —— 客户端 `natType` 是 `unknown`，被 `classifyNat` 跳过
+
+### Q: 怎么看实时日志？
+
+**App 内**：菜单 → 日志
+
+**通过 ADB**：
+
+```bash
+adb logcat -s N2nVpnService N2nController MainActivity
+```
+
+**导出日志文件**：
+
+```bash
+adb pull /data/data/com.n2n.android/files/n2n.log
+```
 
 ---
 
