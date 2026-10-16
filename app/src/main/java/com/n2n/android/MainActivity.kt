@@ -104,7 +104,7 @@ class MainActivity : AppCompatActivity() {
             toast(getString(R.string.dialog_saved))
         }
 
-        // ★ 新增：SOCKS5 开关联动
+        // SOCKS5 开关联动
         binding.switchSocks5.setOnCheckedChangeListener { _, checked ->
             if (!::binding.isInitialized) return@setOnCheckedChangeListener
             if (checked) {
@@ -117,7 +117,6 @@ class MainActivity : AppCompatActivity() {
                 binding.tilSocks5Listen.visibility = View.GONE
             }
         }
-        // 初始可见性
         binding.tilSocks5Listen.visibility =
             if (binding.switchSocks5.isChecked) View.VISIBLE else View.GONE
 
@@ -182,7 +181,7 @@ class MainActivity : AppCompatActivity() {
         outState.putString("clientId", binding.etClientId.text.toString())
         outState.putString("nodeName", binding.etNodeName.text.toString())
         outState.putString("connectToken", binding.etConnectToken.text.toString())
-        outState.putString("socks5Listen", binding.etSocks5Listen.text.toString())   // ★ 新增
+        outState.putString("socks5Listen", binding.etSocks5Listen.text.toString())
     }
 
     // ============================================================
@@ -256,13 +255,33 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ============================================================
+    // ★ Bug 3 修复：电池优化提示只弹一次
+    // ============================================================
+    //
+    // 旧版：每次冷启动都检查 isIgnoringBatteryOptimizations，未加入白名单就弹
+    //       系统对话框。用户点"不允许"后下次进 App 又弹——骚扰用户。
+    //
+    // 新版：加"已询问"标记，无论用户是否同意，只弹一次。
+    //
     @android.annotation.SuppressLint("BatteryLife")
     private fun requestIgnoreBatteryOptimizationIfNeeded() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+
+        // ★ 只问一次
+        if (Prefs.hasAskedBatteryOptimization(this)) return
+
         try {
             val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
             val pkg = packageName
-            if (pm.isIgnoringBatteryOptimizations(pkg)) return
+            if (pm.isIgnoringBatteryOptimizations(pkg)) {
+                // 已在白名单，标记一下避免后续再检查
+                Prefs.markBatteryOptimizationAsked(this)
+                return
+            }
+
+            // ★ 先标记，避免弹窗过程中 Activity 重建导致重入
+            Prefs.markBatteryOptimizationAsked(this)
 
             try {
                 val intent = Intent(
@@ -281,16 +300,31 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ============================================================
+    // ★ Bug 1 修复：首次使用对话框只弹一次
+    // ============================================================
+    //
+    // 旧版：只检查 hasEverStartedVpn，未成功启动过 VPN 就每次都弹
+    //       （setCancelable(false) 必须选一个按钮，用户体验很差）。
+    //       Prefs.hasSeenFirstUseDialog 定义了但从未被调用。
+    //
+    // 新版：加 hasSeenFirstUseDialog 检查，无论用户点"现在就填"还是
+    //       "稍后再说"，都标记已看过。
+    //
     private fun checkSignalingUrl() {
         if (!::binding.isInitialized) return
         val currentUrl = binding.etSignalingUrl.text.toString().trim()
         if (currentUrl.isNotEmpty()) return
         if (Prefs.hasEverStartedVpn(this)) return
 
+        // ★ 关键：只看一次
+        if (Prefs.hasSeenFirstUseDialog(this)) return
+
         AlertDialog.Builder(this)
             .setTitle(getString(R.string.first_use_title))
             .setMessage(getString(R.string.first_use_message))
             .setPositiveButton(getString(R.string.first_use_fill)) { _, _ ->
+                Prefs.markFirstUseDialogSeen(this)   // ★ 点"现在就填"也标记
                 if (isFinishing || isDestroyed || !::binding.isInitialized) return@setPositiveButton
                 binding.etSignalingUrl.requestFocus()
                 binding.etSignalingUrl.setSelection(
@@ -304,7 +338,9 @@ class MainActivity : AppCompatActivity() {
                     )
                 } catch (_: Throwable) {}
             }
-            .setNegativeButton(getString(R.string.first_use_later), null)
+            .setNegativeButton(getString(R.string.first_use_later)) { _, _ ->
+                Prefs.markFirstUseDialogSeen(this)   // ★ 点"稍后再说"也标记
+            }
             .setCancelable(false)
             .show()
     }
@@ -323,7 +359,6 @@ class MainActivity : AppCompatActivity() {
                 binding.etClientId.setText(savedInstanceState.getString("clientId", ""))
                 binding.etNodeName.setText(savedInstanceState.getString("nodeName", ""))
                 binding.etConnectToken.setText(savedInstanceState.getString("connectToken", ""))
-                // ★ 新增：恢复 SOCKS5
                 val socks5 = savedInstanceState.getString("socks5Listen", "") ?: ""
                 binding.etSocks5Listen.setText(socks5)
                 binding.switchSocks5.isChecked = socks5.isNotEmpty()
@@ -336,7 +371,6 @@ class MainActivity : AppCompatActivity() {
             binding.etClientId.setText(cfg.clientId)
             binding.etNodeName.setText(cfg.nodeName)
             binding.etConnectToken.setText(cfg.connectToken)
-            // ★ 新增：加载 SOCKS5
             val socks5 = Prefs.loadSocks5Listen(this)
             binding.etSocks5Listen.setText(socks5)
             binding.switchSocks5.isChecked = socks5.isNotEmpty()
@@ -345,6 +379,14 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ============================================================
+    // ★ Bug 4 修复：深链空值保护
+    // ============================================================
+    //
+    // 旧版：data.getQueryParameter("socks5")?.let { ... } 会把空字符串
+    //       当成有效值，覆盖用户已配置的 SOCKS5（清空 + 关开关）。
+    // 新版：用 isNullOrBlank() 判断，空值直接跳过。
+    //
     private fun handleIntentParams(intent: Intent?) {
         if (!::binding.isInitialized) return
         intent ?: return
@@ -353,16 +395,30 @@ class MainActivity : AppCompatActivity() {
             if (intent.action == Intent.ACTION_VIEW && intent.data != null) {
                 val data = intent.data!!
                 if (data.scheme == "n2n" && data.host == "connect") {
-                    data.getQueryParameter("url")?.let { binding.etSignalingUrl.setText(it) }
-                    data.getQueryParameter("ip")?.let { binding.etPreferredIp.setText(it) }
-                    data.getQueryParameter("room")?.let { binding.etRoomId.setText(it) }
-                    data.getQueryParameter("cid")?.let { binding.etClientId.setText(it) }
-                    data.getQueryParameter("name")?.let { binding.etNodeName.setText(it) }
-                    data.getQueryParameter("token")?.let { binding.etConnectToken.setText(it) }
-                    // ★ 新增：深链支持 socks5
+                    // ★ 空值保护：只覆盖非空值
+                    data.getQueryParameter("url")?.let {
+                        if (it.isNotBlank()) binding.etSignalingUrl.setText(it)
+                    }
+                    data.getQueryParameter("ip")?.let {
+                        if (it.isNotBlank()) binding.etPreferredIp.setText(it)
+                    }
+                    data.getQueryParameter("room")?.let {
+                        if (it.isNotBlank()) binding.etRoomId.setText(it)
+                    }
+                    data.getQueryParameter("cid")?.let {
+                        if (it.isNotBlank()) binding.etClientId.setText(it)
+                    }
+                    data.getQueryParameter("name")?.let {
+                        if (it.isNotBlank()) binding.etNodeName.setText(it)
+                    }
+                    data.getQueryParameter("token")?.let {
+                        if (it.isNotBlank()) binding.etConnectToken.setText(it)
+                    }
                     data.getQueryParameter("socks5")?.let {
-                        binding.etSocks5Listen.setText(it)
-                        binding.switchSocks5.isChecked = it.isNotEmpty()
+                        if (it.isNotBlank()) {
+                            binding.etSocks5Listen.setText(it)
+                            binding.switchSocks5.isChecked = true
+                        }
                     }
 
                     saveCurrentInput()
@@ -379,7 +435,7 @@ class MainActivity : AppCompatActivity() {
             val cid = intent.getStringExtra(N2nVpnService.EXTRA_CLIENT_ID)
             val name = intent.getStringExtra(N2nVpnService.EXTRA_NODE_NAME)
             val token = intent.getStringExtra(N2nVpnService.EXTRA_CONNECT_TOKEN)
-            val socks5 = intent.getStringExtra(N2nVpnService.EXTRA_SOCKS5_LISTEN)   // ★ 新增
+            val socks5 = intent.getStringExtra(N2nVpnService.EXTRA_SOCKS5_LISTEN)
 
             var changed = false
             if (!url.isNullOrEmpty()) { binding.etSignalingUrl.setText(url); changed = true }
@@ -420,7 +476,6 @@ class MainActivity : AppCompatActivity() {
                 connectToken = binding.etConnectToken.text.toString().trim(),
             ))
             Prefs.savePreferredIp(this, binding.etPreferredIp.text.toString().trim())
-            // ★ 新增：保存 SOCKS5
             if (binding.switchSocks5.isChecked) {
                 Prefs.saveSocks5Listen(this, binding.etSocks5Listen.text.toString().trim())
             } else {
@@ -472,7 +527,6 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // ★ 新增：SOCKS5 校验
         if (binding.switchSocks5.isChecked) {
             val socks5 = binding.etSocks5Listen.text.toString().trim()
             if (socks5.isEmpty() || !isValidHostPort(socks5)) {
@@ -506,7 +560,6 @@ class MainActivity : AppCompatActivity() {
         return s.all { it.code in 33..126 }
     }
 
-    // ★ 新增：host:port 校验
     private fun isValidHostPort(s: String): Boolean {
         val idx = s.lastIndexOf(':')
         if (idx <= 0 || idx == s.length - 1) return false
@@ -523,7 +576,6 @@ class MainActivity : AppCompatActivity() {
         try {
             val preferredIp = binding.etPreferredIp.text.toString().trim()
             val token = binding.etConnectToken.text.toString().trim()
-            // ★ 新增：SOCKS5
             val socks5 = if (binding.switchSocks5.isChecked) {
                 binding.etSocks5Listen.text.toString().trim()
             } else ""
@@ -536,7 +588,7 @@ class MainActivity : AppCompatActivity() {
                 putExtra(N2nVpnService.EXTRA_CLIENT_ID, binding.etClientId.text.toString().trim())
                 putExtra(N2nVpnService.EXTRA_NODE_NAME, binding.etNodeName.text.toString().trim())
                 putExtra(N2nVpnService.EXTRA_CONNECT_TOKEN, token)
-                putExtra(N2nVpnService.EXTRA_SOCKS5_LISTEN, socks5)   // ★ 新增
+                putExtra(N2nVpnService.EXTRA_SOCKS5_LISTEN, socks5)
             }
             startForegroundService(intent)
             toast(getString(R.string.dialog_starting))
@@ -566,6 +618,14 @@ class MainActivity : AppCompatActivity() {
     // UI 刷新
     // ============================================================
 
+    // ============================================================
+    // ★ Bug 2 修复：运行中隐藏整个 bottomBarIdle
+    // ============================================================
+    //
+    // 旧版：只隐藏 btnStart，btnSave 靠 FrameLayout 恰好被 btnStop 覆盖。
+    //       如果未来布局调整（margin / padding），btnSave 可能漏出来。
+    // 新版：直接隐藏整组，btns 一起消失。
+    //
     private fun refreshStatus() {
         if (isFinishing || isDestroyed || !::binding.isInitialized) return
         try {
@@ -602,13 +662,12 @@ class MainActivity : AppCompatActivity() {
                     binding.tvClientId.visibility = View.GONE
                 }
 
-                binding.btnStart.visibility = View.GONE
+                // ★ 隐藏整组空闲按钮，而不是只隐藏 btnStart
+                binding.bottomBarIdle.visibility = View.GONE
                 binding.btnStop.visibility = View.VISIBLE
                 binding.cardPeers.visibility = View.VISIBLE
 
-                binding.btnSave.isEnabled = false
-                binding.btnSave.alpha = 0.5f
-                // ★ 运行中禁止改 SOCKS5
+                // 运行中禁止改 SOCKS5
                 binding.switchSocks5.isEnabled = false
                 binding.switchSocks5.alpha = 0.5f
                 binding.etSocks5Listen.isEnabled = false
@@ -620,13 +679,12 @@ class MainActivity : AppCompatActivity() {
                 binding.tvClientId.visibility = View.GONE
                 binding.cardStatus.setStrokeColor(getColor(R.color.brand_border))
 
-                binding.btnStart.visibility = View.VISIBLE
+                // ★ 恢复整组
+                binding.bottomBarIdle.visibility = View.VISIBLE
                 binding.btnStop.visibility = View.GONE
                 binding.cardPeers.visibility = View.GONE
 
-                binding.btnSave.isEnabled = true
-                binding.btnSave.alpha = 1.0f
-                // ★ 未运行时可改 SOCKS5
+                // 未运行时可改 SOCKS5
                 binding.switchSocks5.isEnabled = true
                 binding.switchSocks5.alpha = 1.0f
                 binding.etSocks5Listen.isEnabled = true
