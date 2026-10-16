@@ -454,11 +454,7 @@ func (e *Edge) resetFailCount(peerID string) {
 //
 // ★ LAN 优先保护
 //
-// targetAddr 来自 resolveTarget，通常是 peer.UDPAddr（已被保护），
-// 但如果 resolveTarget 走到了 fallback 分支（peer.UDPAddr 为 nil），
-// 就会返回指令里的 TargetPubSocket（公网）。
-//
-// 无条件覆盖会把 LAN 打成公网，之后 SendToPeer 走 CGNAT 回环（100~300ms）。
+// ★★ 补丁 2（本次修复）：LAN→公网切换窗口 300000（5 分钟） → 30000（30 秒）。
 func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAddr) {
 	e.peersMu.Lock()
 	if p, ok := e.peers[instr.TargetMac]; ok {
@@ -473,8 +469,8 @@ func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAd
 		} else if !oldIsLAN && newIsLAN {
 			shouldUpdate = true
 		} else if oldIsLAN && !newIsLAN {
-			// 旧 LAN → 新公网：只在 lastLANRecvAt 超过 300 秒时才切
-			if p.lastLANRecvAt > 0 && now-p.lastLANRecvAt > 300000 {
+			// ★★ 补丁 2：5 分钟 → 30 秒
+			if p.lastLANRecvAt > 0 && now-p.lastLANRecvAt > 30000 {
 				shouldUpdate = true
 			}
 		} else {
