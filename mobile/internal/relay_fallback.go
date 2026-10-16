@@ -275,6 +275,9 @@ func (rm *RelayManager) SendViaRelay(data []byte) error {
 //
 //	这解决了 ping 忽高忽低（8ms ↔ 200ms）的核心问题——只要 LAN 可达，
 //	就永远走 LAN。
+//
+// ★ 编译修复：TURN 分支的 sendErr 从 if-init 位置挪出来，
+//   否则作用域不覆盖后面的 log.Printf。
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
 	state := rm.GetState(peerId)
 
@@ -324,7 +327,9 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 		if target != nil && target.TurnRelayAddr != "" && rm.turnClient != nil {
 			relayAddr, err := net.ResolveUDPAddr("udp", target.TurnRelayAddr)
 			if err == nil {
-				if sendErr := rm.turnClient.Send(data, relayAddr); sendErr == nil {
+				// ★ 编译修复：sendErr 从 if-init 挪出来
+				sendErr := rm.turnClient.Send(data, relayAddr)
+				if sendErr == nil {
 					return true
 				}
 				log.Printf("[TURN] 发送到 %s 失败（临时）: %v", peerId, sendErr)
