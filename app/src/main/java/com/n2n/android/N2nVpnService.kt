@@ -51,7 +51,7 @@ class N2nVpnService : VpnService() {
         const val EXTRA_NODE_NAME = "node_name"
         const val EXTRA_CONNECT_TOKEN = "connect_token"
         const val EXTRA_PREFERRED_IP = "preferred_ip"
-        const val EXTRA_SOCKS5_LISTEN = "socks5_listen"   // ★ 新增
+        const val EXTRA_SOCKS5_LISTEN = "socks5_listen"
 
         private val crashHandlerInstalled = AtomicBoolean(false)
     }
@@ -237,16 +237,28 @@ class N2nVpnService : VpnService() {
             return
         }
 
-        if (N2nController.isRunning()) {
-            ktLog("handleStart: Controller 仍在 running，异步等待 500ms 后重试")
-            try { N2nController.stop() } catch (t: Throwable) {
-                Log.e(TAG, "force stop failed", t)
+        // ============================================================
+        // ★ Bug 6 修复：同时检查 isRunning 和 isStopping
+        // ============================================================
+        //
+        // 旧版：只检查 isRunning()。N2nController.stop() 会立即把 running 置
+        //       false，然后异步关 socket。这期间用户点"启动"，handleStart 看到
+        //       !isRunning 就直接往下走，新 Edge 与旧 Edge 短暂共存。
+        //
+        // 新版：同时检查 isStopping()，等旧 Edge 完全清理完再启动。
+        //
+        if (N2nController.isRunning() || N2nController.isStopping()) {
+            ktLog("handleStart: Controller running=${N2nController.isRunning()} stopping=${N2nController.isStopping()}，异步等待 500ms 后重试")
+            if (N2nController.isRunning()) {
+                try { N2nController.stop() } catch (t: Throwable) {
+                    Log.e(TAG, "force stop failed", t)
+                }
             }
             val retryIntent = Intent(intent)
             handler.postDelayed({
                 if (destroyed || stopping.get()) return@postDelayed
-                if (N2nController.isRunning()) {
-                    ktLog("handleStart: 等待后仍 running，放弃启动")
+                if (N2nController.isRunning() || N2nController.isStopping()) {
+                    ktLog("handleStart: 等待后仍 running/stopping，放弃启动")
                     stopVpn()
                     return@postDelayed
                 }
@@ -275,7 +287,7 @@ class N2nVpnService : VpnService() {
         val clientId = intent.getStringExtra(EXTRA_CLIENT_ID) ?: ""
         val nodeName = intent.getStringExtra(EXTRA_NODE_NAME) ?: "Android"
         val connectToken = intent.getStringExtra(EXTRA_CONNECT_TOKEN) ?: ""
-        val socks5Listen = intent.getStringExtra(EXTRA_SOCKS5_LISTEN) ?: ""   // ★ 新增
+        val socks5Listen = intent.getStringExtra(EXTRA_SOCKS5_LISTEN) ?: ""
 
         ktLog("参数读取完成 room=$roomId token=${if (connectToken.isEmpty()) "<empty>" else "***"} socks5=${if (socks5Listen.isEmpty()) "<disabled>" else socks5Listen}")
 
@@ -299,7 +311,7 @@ class N2nVpnService : VpnService() {
                 setConnectToken(connectToken)
                 setPreferredIP(preferredIp)
                 setPreferredPort(443)
-                setSocks5Listen(socks5Listen)   // ★ 新增
+                setSocks5Listen(socks5Listen)
             }
         } catch (t: Throwable) {
             ktLog("Config 构造失败: ${t.message}")
@@ -573,7 +585,21 @@ class N2nVpnService : VpnService() {
         }.apply { name = "n2n-stop" }.start()
     }
 
+    // ============================================================
+    // ★ WiFi 锁：Android 10+ 用 LOW_LATENCY 模式
+    // ============================================================
+    //
+    // 问题：
+    //   Android 10（API 29）起，WIFI_MODE_FULL_HIGH_PERF 被系统静默降级。
+    //   息屏后 WiFi 芯片进入 PS-Poll 省电模式，每 100ms 才唤醒一次，
+    //   导致下行包被 AP 缓存 100ms 才送达 → n2n ping 出现 200-500ms 尖峰。
+    //
+    // 修复：
+    //   Android 10+ 用 WIFI_MODE_FULL_LOW_LATENCY（视频通话/游戏级别，
+    //   息屏后仍保持低延迟）。API < 29 保持用 WIFI_MODE_FULL_HIGH_PERF。
+    //
     private fun acquireLocks() {
+        // CPU 唤醒锁（保持 CPU 运行）
         try {
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
             wakeLock = pm.newWakeLock(
@@ -582,22 +608,42 @@ class N2nVpnService : VpnService() {
                 setReferenceCounted(false)
                 acquire()
             }
-        } catch (t: Throwable) { ktLog("acquire WakeLock 失败: ${t.message}") }
+            ktLog("WakeLock acquired (PARTIAL_WAKE_LOCK)")
+        } catch (t: Throwable) {
+            ktLog("acquire WakeLock 失败: ${t.message}")
+        }
+
+        // WiFi 锁（防止 WiFi 芯片进入 PS-Poll 省电模式）
         try {
             val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            wifiLock = wm.createWifiLock(
-                WifiManager.WIFI_MODE_FULL_HIGH_PERF, "n2n:vpn_wifilock"
-            ).apply {
+
+            val lockMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                // ★ Android 10+：LOW_LATENCY 专为低延迟设计，息屏后仍保活
+                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+            } else {
+                @Suppress("DEPRECATION")
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            }
+
+            wifiLock = wm.createWifiLock(lockMode, "n2n:vpn_wifilock").apply {
                 setReferenceCounted(false)
                 acquire()
             }
-        } catch (t: Throwable) { ktLog("acquire WifiLock 失败: ${t.message}") }
+            ktLog("WifiLock acquired (mode=$lockMode)")
+        } catch (t: Throwable) {
+            ktLog("acquire WifiLock 失败: ${t.message}")
+        }
     }
 
     private fun releaseLocks() {
-        try { wakeLock?.let { if (it.isHeld) it.release() } } catch (_: Throwable) {}
+        try {
+            wakeLock?.let { if (it.isHeld) it.release() }
+        } catch (_: Throwable) {}
         wakeLock = null
-        try { wifiLock?.let { if (it.isHeld) it.release() } } catch (_: Throwable) {}
+
+        try {
+            wifiLock?.let { if (it.isHeld) it.release() }
+        } catch (_: Throwable) {}
         wifiLock = null
     }
 
