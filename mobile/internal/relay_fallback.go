@@ -265,25 +265,59 @@ func (rm *RelayManager) SendViaRelay(data []byte) error {
 // ★ 修复：任何失败情况都不在内部 fallback 到 WS，只返回 false，
 //   让调用方（tunReadLoop）统一走 WS 中继。
 //
-//   旧版在 TURN / Relay 分支内部调用 ws.SendBinary，然后返回 false，
-//   调用方看到 false 又调一次 ws.SendBinary → 数据双发 → DUP。
-//
 // ★ Android 特有：e.udpConn 是 net.PacketConn，用 WriteTo 而非 WriteToUDP。
+//
+// ★★ 补丁 1（本次修复）：LAN 优先发送。
+//
+//	同 WiFi 场景下，如果 UDPAddr 已经被切到公网（如对端从公网发过包导致
+//	服务端下发的 targetPubSocket 是公网），但 peer 仍有 LAN 端点，就直接
+//	走 LAN，避免 CGNAT hairpin（200-400ms + DUP）。
+//
+//	这解决了 ping 忽高忽低（8ms ↔ 200ms）的核心问题——只要 LAN 可达，
+//	就永远走 LAN。
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
 	state := rm.GetState(peerId)
 
 	switch state {
 	case ConnP2P, ConnP2PAvailable:
-		if target != nil && target.UDPAddr != nil && rm.edge != nil && rm.edge.udpConn != nil {
+		if target == nil {
+			rm.MarkFallback(peerId)
+			return false
+		}
+		if rm.edge == nil || rm.edge.udpConn == nil {
+			rm.MarkFallback(peerId)
+			return false
+		}
+
+		// ★★ 补丁 1：LAN 优先
+		//
+		// 条件：UDPAddr 存在且是公网（非 RFC1918），且 peer 有 LAN 端点。
+		// 动作：先尝试所有 LAN 端点；成功一个即返回 true。
+		//       全失败才回退 UDPAddr（保留原有的降级语义）。
+		if target.UDPAddr != nil &&
+			!isPrivateIPv4(target.UDPAddr.IP) &&
+			len(target.LanEndpoints) > 0 {
+			for _, lan := range target.LanEndpoints {
+				ra, err := net.ResolveUDPAddr("udp", lan)
+				if err != nil || ra == nil || ra.IP == nil {
+					continue
+				}
+				if _, err := rm.edge.udpConn.WriteTo(data, ra); err == nil {
+					return true
+				}
+			}
+			// 所有 LAN 端点都发送失败，继续走 UDPAddr
+		}
+
+		// 常规路径：发 UDPAddr（可能是 LAN，也可能是公网）
+		if target.UDPAddr != nil {
 			_, err := rm.edge.udpConn.WriteTo(data, target.UDPAddr)
 			if err == nil {
 				return true
 			}
 			log.Printf("[P2P] UDP 发送到 %s 失败: %v，降级到 WS", peerId, err)
-			rm.MarkFallback(peerId)
-		} else {
-			rm.MarkFallback(peerId)
 		}
+		rm.MarkFallback(peerId)
 		return false
 
 	case ConnTURN:
