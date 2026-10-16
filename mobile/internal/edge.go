@@ -1245,6 +1245,13 @@ func jsonInt(v interface{}) int {
 // registerPeer 注册/更新一个 peer。
 //
 // ★ LAN 优先保护 UDPAddr
+//
+// ★★ 补丁 3（本次修复）：新建 peer 时，若对端有 LAN 端点，初始 UDPAddr 用 LAN。
+//
+//	旧版新建 peer 时 udpAddr 直接用服务端下发的公网地址（pubIP:pubPort），
+//	导致连接刚建立时前几个 ping 走 CGNAT hairpin（200-400ms + DUP），
+//	直到收到第一个 LAN 帧才切回 LAN。
+//	新版优先用 sortedLAN[0] 初始化，LAN 不可达时回退公网地址。
 func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	var udpAddr *net.UDPAddr
 	if pubIP != "" && pubPort > 0 {
@@ -1287,12 +1294,27 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string,
 			p.LanEndpoints = sortedLAN
 		}
 	} else {
+		// ★★ 补丁 3：新建 peer 时优先用 LAN 初始化 UDPAddr
+		var initialUDP *net.UDPAddr
+		if len(sortedLAN) > 0 {
+			for _, lan := range sortedLAN {
+				if ra, err := net.ResolveUDPAddr("udp", lan); err == nil && ra != nil && ra.IP != nil {
+					initialUDP = ra
+					log.Printf("[P2P] %s 新建 peer，初始 UDPAddr 用 LAN: %s", pid, lan)
+					break
+				}
+			}
+		}
+		if initialUDP == nil {
+			initialUDP = udpAddr
+		}
+
 		e.peers[pid] = &PeerInfo{
 			ClientID:          pid,
 			VirtualIP:         vip,
 			PubIP:             pubIP,
 			PubPort:           pubPort,
-			UDPAddr:           udpAddr,
+			UDPAddr:           initialUDP,
 			NATType:           natType,
 			AssistedEndpoints: assisted,
 			LanEndpoints:      sortedLAN,
@@ -1308,6 +1330,8 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string,
 // ensureTargetPeer 记录指令里的目标 peer 信息。
 //
 // ★ LAN 优先保护 UDPAddr
+//
+// ★★ 补丁 3（本次修复）：新建时优先用 LAN 端点初始化 UDPAddr。
 func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	if instr.TargetMac == "" {
 		return
@@ -1330,8 +1354,27 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 			p.VirtualIP = instr.TargetVirtualIp
 		}
 	} else {
+		// ★★ 补丁 3：优先使用 LAN 端点
+		var initialUDP *net.UDPAddr
+		if len(instr.TargetLanEndpoints) > 0 {
+			for _, lan := range instr.TargetLanEndpoints {
+				if ra, err := net.ResolveUDPAddr("udp", lan); err == nil && ra != nil && ra.IP != nil {
+					initialUDP = ra
+					log.Printf("[P2P] %s 新建 peer（ensureTargetPeer），初始 UDPAddr 用 LAN: %s",
+						instr.TargetMac, lan)
+					break
+				}
+			}
+		}
+		if initialUDP == nil {
+			initialUDP = udpAddr
+		}
+
 		e.peers[instr.TargetMac] = &PeerInfo{
-			ClientID: instr.TargetMac, VirtualIP: instr.TargetVirtualIp, UDPAddr: udpAddr,
+			ClientID:     instr.TargetMac,
+			VirtualIP:    instr.TargetVirtualIp,
+			UDPAddr:      initialUDP,
+			LanEndpoints: instr.TargetLanEndpoints,
 		}
 	}
 }
@@ -1614,7 +1657,13 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 
 // notePeerCommon 是打洞握手路径的统一入口。
 //
-// ★ LAN 优先 + 300 秒窗口 + lastLANRecvAt > 0 检查
+// ★ LAN 优先 + 30 秒窗口 + lastLANRecvAt > 0 检查
+//
+// ★★ 补丁 2（本次修复）：LAN→公网切换窗口 300000（5 分钟）→ 30000（30 秒）。
+//
+//	旧版 5 分钟窗口意味着 WiFi 一断，LAN 侧连续 5 分钟没收到包就固化公网，
+//	导致 ping 从 5ms 跳 200ms，并且要等下一个 LAN 帧回来才能切回。
+//	30 秒窗口让 LAN 恢复后能快速切回，符合实际 WiFi 抖动场景。
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
 	now := time.Now().UnixMilli()
 
@@ -1687,9 +1736,10 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 	} else if !oldIsLAN && newIsLAN {
 		shouldUpdate = true
 	} else if oldIsLAN && !newIsLAN {
-		if best.lastLANRecvAt > 0 && now-best.lastLANRecvAt > 300000 {
+		// ★★ 补丁 2：5 分钟 → 30 秒
+		if best.lastLANRecvAt > 0 && now-best.lastLANRecvAt > 30000 {
 			shouldUpdate = true
-			log.Printf("[P2P] %s (note) LAN 超过 300s 无流量，改用公网地址", best.ClientID)
+			log.Printf("[P2P] %s (note) LAN 超过 30s 无流量，改用公网地址", best.ClientID)
 		}
 	} else {
 		if best.UDPAddr.Port != addrPort {
