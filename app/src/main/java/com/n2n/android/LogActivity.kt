@@ -20,8 +20,28 @@ class LogActivity : AppCompatActivity() {
 
     @Volatile private var ticking = false
 
-    // 记录上次日志长度，未变则跳过刷新
-    @Volatile private var lastLogsLen = 0
+    // ============================================================
+    // ★ Bug 7 修复：用指纹去重替代长度去重
+    // ============================================================
+    //
+    // 旧版：用 logs.length 比较，日志轮转（超过 1000 行，头尾同时变化）
+    //       时长度可能相同，界面迟迟不更新。
+    //
+    // 新版：指纹 = 长度 + 首字符 + 末字符 + 中段 hash。
+    //       任何位置的内容变化都会触发刷新，成本可忽略。
+    //
+    @Volatile private var lastLogFingerprint = Long.MIN_VALUE
+
+    private fun fingerprint(s: String): Long {
+        var h = s.length.toLong()
+        if (s.isNotEmpty()) h = h * 31 + s.first().code
+        if (s.length > 1) h = h * 31 + s.last().code
+        if (s.length > 20) {
+            val mid = s.length / 2
+            h = h * 31 + s.substring(mid - 10, mid + 10).hashCode()
+        }
+        return h
+    }
 
     private val ticker = object : Runnable {
         override fun run() {
@@ -48,8 +68,8 @@ class LogActivity : AppCompatActivity() {
                     try { N2nController.clearLogs() } catch (t: Throwable) {
                         Log.e(TAG, "clearLogs failed", t)
                     }
-                    // 清空后重置缓存长度，强制下一次刷新
-                    lastLogsLen = -1
+                    // 清空后重置指纹，强制下一次刷新
+                    lastLogFingerprint = Long.MIN_VALUE
                     refresh()
                     toast(getString(R.string.log_cleared))
                     true
@@ -82,8 +102,8 @@ class LogActivity : AppCompatActivity() {
             )
         }
 
-        // 首次刷新：重置 lastLogsLen 确保触发
-        lastLogsLen = -1
+        // 首次刷新
+        lastLogFingerprint = Long.MIN_VALUE
         refresh()
     }
 
@@ -115,9 +135,10 @@ class LogActivity : AppCompatActivity() {
         try {
             val logs = N2nController.getLogs()
 
-            // 日志长度没变 → 跳过（避免每秒重建 TextView）
-            if (logs.length == lastLogsLen) return
-            lastLogsLen = logs.length
+            // ★ 指纹没变 → 跳过（避免每秒重建 TextView）
+            val fp = fingerprint(logs)
+            if (fp == lastLogFingerprint) return
+            lastLogFingerprint = fp
 
             val text = if (logs.isEmpty()) getString(R.string.log_empty) else logs
             binding.tvLogs.text = text
