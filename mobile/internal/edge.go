@@ -1006,6 +1006,21 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			log.Printf("[NAT-HOLE] 忽略指令 target=%s（peer 不在线）", instr.TargetMac)
 			return
 		}
+
+		// ★★★ 新增（本次修复）：已 P2P 时，主动上报 p2p_status=3，
+		//     让服务端 punchState 里的 aState/bState 变成 3，
+		//     anySucceeded 分支生效，停止每 15 秒重发 nat_hole_instruction。
+		//
+		// 场景：客户端在收到指令前就已经通过 PING/PONG 建立了 P2P（比如两端
+		// 同时连接、或 NAT 友好不需要打洞）。旧版直接 return，服务端不知道
+		// 客户端已经 P2P，会一直重发指令（日志里每 15 秒一次"跳过指令"）。
+		if e.relayMgr != nil && e.relayMgr.GetState(instr.TargetMac) == ConnP2P {
+			log.Printf("[NAT-HOLE] 跳过指令 target=%s（已 P2P），上报 p2p_status=3",
+				instr.TargetMac)
+			e.reportP2PStatus(instr.TargetMac, 3)
+			return
+		}
+
 		e.ensureTargetPeer(&instr)
 		e.scheduleFallbackTimer(instr.TargetMac)
 		instrCopy := instr
@@ -1246,12 +1261,7 @@ func jsonInt(v interface{}) int {
 //
 // ★ LAN 优先保护 UDPAddr
 //
-// ★★ 补丁 3（本次修复）：新建 peer 时，若对端有 LAN 端点，初始 UDPAddr 用 LAN。
-//
-//	旧版新建 peer 时 udpAddr 直接用服务端下发的公网地址（pubIP:pubPort），
-//	导致连接刚建立时前几个 ping 走 CGNAT hairpin（200-400ms + DUP），
-//	直到收到第一个 LAN 帧才切回 LAN。
-//	新版优先用 sortedLAN[0] 初始化，LAN 不可达时回退公网地址。
+// ★★ 补丁 3（上轮修复）：新建 peer 时，若对端有 LAN 端点，初始 UDPAddr 用 LAN。
 func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	var udpAddr *net.UDPAddr
 	if pubIP != "" && pubPort > 0 {
@@ -1331,7 +1341,7 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string,
 //
 // ★ LAN 优先保护 UDPAddr
 //
-// ★★ 补丁 3（本次修复）：新建时优先用 LAN 端点初始化 UDPAddr。
+// ★★ 补丁 3（上轮修复）：新建时优先用 LAN 端点初始化 UDPAddr。
 func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	if instr.TargetMac == "" {
 		return
@@ -1422,6 +1432,44 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	})
 }
 
+// reportP2PStatus 主动上报当前 P2P 状态，让服务端停止重发 nat_hole_instruction。
+//
+// ★★★ 新增（本次修复）：
+//
+// 场景：客户端在收到指令前就已经通过 PING/PONG 建立了 P2P（比如两端同时连接，
+// 或 NAT 友好不需要打洞）。此时客户端会跳过打洞指令，但服务端不知道——
+// punchState 里 aState/bState 一直是 0，anySucceeded = false，服务端每 15 秒
+// 重发一次 nat_hole_instruction。日志里会看到大量
+// "[NAT-HOLE] 跳过指令 target=...（已 P2P）"。
+//
+// 主动上报 state=3 + p2pStatus=3 后，服务端 recordPunchResult：
+//   - state=3 → 交叉校验（self >= P2P_AVAILABLE(2) 通过）
+//   - entry.aState = 3 → anySucceeded = true → 停止重发
+//
+// status 参数：
+//   3 — ConnP2P（数据面已验证）
+//   2 — ConnP2PAvailable（握手成功，数据面未验证）
+func (e *Edge) reportP2PStatus(peerID string, status int) {
+	if e.ws == nil || peerID == "" {
+		return
+	}
+	_ = e.ws.Send(map[string]interface{}{
+		"type": "p2p_state_info",
+		"payload": map[string]interface{}{
+			"to": []map[string]interface{}{{
+				"macAddr": peerID,
+				"punchResult": map[string]interface{}{
+					"state":    3,
+					"attempts": 0,
+					"detail":   "already-p2p",
+				},
+				"punchResultPeerMac": peerID,
+				"p2pStatus":          status,
+			}},
+		},
+	})
+}
+
 // ============ IO ============
 
 func (e *Edge) udpReadLoop() {
@@ -1490,13 +1538,6 @@ func (e *Edge) udpReadLoop() {
 // tunReadLoop 从 TUN 读 IPv4 包，转发给对应 peer。
 //
 // ★ 修复：TURN 状态异步发送
-//
-//   TURN 的 Send 路径涉及 STUN CreatePermission 请求，可能阻塞 5 秒
-//   （turnRequestTimeout）。tunReadLoop 是单线程——一旦阻塞，后续
-//   所有包全部排队，导致延迟波动（200~500ms 突发）。
-//
-//   修复：TURN 状态时异步 goroutine 发送，不阻塞主循环。
-//   P2P / Relay / Unknown 状态不阻塞（UDP WriteTo 内核缓冲，立即返回）。
 func (e *Edge) tunReadLoop() {
 	buf := make([]byte, 65535)
 	for {
@@ -1659,11 +1700,7 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 //
 // ★ LAN 优先 + 30 秒窗口 + lastLANRecvAt > 0 检查
 //
-// ★★ 补丁 2（本次修复）：LAN→公网切换窗口 300000（5 分钟）→ 30000（30 秒）。
-//
-//	旧版 5 分钟窗口意味着 WiFi 一断，LAN 侧连续 5 分钟没收到包就固化公网，
-//	导致 ping 从 5ms 跳 200ms，并且要等下一个 LAN 帧回来才能切回。
-//	30 秒窗口让 LAN 恢复后能快速切回，符合实际 WiFi 抖动场景。
+// ★★ 补丁 2（上轮修复）：LAN→公网切换窗口 300000（5 分钟）→ 30000（30 秒）。
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
 	now := time.Now().UnixMilli()
 
