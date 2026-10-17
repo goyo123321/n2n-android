@@ -36,7 +36,6 @@ type PeerInfo struct {
 	LanEndpoints      []string
 }
 
-// ★ 补上漏掉的结构体
 type PeerSnapshot struct {
 	Code      string `json:"code"`
 	ClientID  string `json:"clientId"`
@@ -138,6 +137,8 @@ func generateDefaultClientID() string {
 	return fmt.Sprintf("%s-%s", hostname, hex.EncodeToString(b[:]))
 }
 
+// ============ UDP 保活 ============
+
 const keepaliveInterval = 5 * time.Second
 
 var keepaliveServers = []string{
@@ -207,6 +208,8 @@ func (e *Edge) startKeepalive() {
 	})
 }
 
+// ============ P2P 通道保活 + 活性检测 ============
+
 const p2pKeepaliveInterval = 15 * time.Second
 const p2pIdleDeadMs = 120000
 
@@ -273,6 +276,8 @@ func (e *Edge) getVirtualIPLocked() string {
 	return e.virtualIP
 }
 
+// ============ 日志节流 ============
+
 func (e *Edge) logNoPeerThrottled(dstIP string, n int) {
 	now := time.Now().UnixMilli()
 	e.lastNoPeerLogMu.Lock()
@@ -305,6 +310,8 @@ func (e *Edge) forgetTunState(peerID string) {
 	delete(e.tunStateLog, peerID)
 	e.tunStateLogMu.Unlock()
 }
+
+// ============ 主流程 ============
 
 func FetchVirtualIP(cfg *Config) string {
 	if cfg.SignalingURL == "" {
@@ -496,6 +503,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 
 	e.p2pStreams = NewP2PStreamManager(e)
 
+	// ★ 修改点：拦截 N2NW 二进制包
 	ws.SetHandlers(
 		e.handleSignaling,
 		func(data []byte) {
@@ -742,6 +750,8 @@ func lastIndexByte(s string, c byte) int {
 	return -1
 }
 
+// ============ 超时降级 ============
+
 func (e *Edge) scheduleFallbackTimer(peerID string) {
 	if e.relayMgr == nil || peerID == "" {
 		return
@@ -823,6 +833,8 @@ func (e *Edge) cancelP2PAvailTimeout(peerID string) {
 		delete(e.p2pAvailTimers, peerID)
 	}
 }
+
+// ============ 信令 ============
 
 func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	defer func() {
@@ -1087,4 +1099,777 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		return
 	}
 }
-// 保持文件其余部分（maybeResetFailCountForPeer 等）不变
+
+// maybeResetFailCountForPeer 处理对端出口地址变化。
+//
+// ★ 区分 IP 变化 vs 端口漂移
+func (e *Edge) maybeResetFailCountForPeer(peerID, newPubIP string, newPubPort int) {
+	if peerID == "" || newPubIP == "" || newPubPort <= 0 {
+		return
+	}
+
+	e.peersMu.RLock()
+	oldPubIP := ""
+	oldPubPort := 0
+	if p, ok := e.peers[peerID]; ok {
+		oldPubIP = p.PubIP
+		oldPubPort = p.PubPort
+	}
+	e.peersMu.RUnlock()
+
+	if oldPubIP == "" || (oldPubIP == newPubIP && oldPubPort == newPubPort) {
+		return
+	}
+
+	natHoleActiveMu.Lock()
+	hadCount := failCounts[peerID]
+	delete(failCounts, peerID)
+	natHoleActiveMu.Unlock()
+
+	// ★ 只有 IP 变化才清空连接状态
+	if oldPubIP != newPubIP {
+		if e.relayMgr != nil {
+			e.relayMgr.ClearPeer(peerID)
+		}
+		log.Printf("[NAT-HOLE] %s 出口 IP 变化 %s → %s，清空连接状态 (was=%d)",
+			peerID, oldPubIP, newPubIP, hadCount)
+	} else {
+		log.Printf("[NAT-HOLE] %s 端口漂移 %s:%d → %s:%d，保留 P2P 状态",
+			peerID, oldPubIP, oldPubPort, newPubIP, newPubPort)
+	}
+}
+
+func (e *Edge) maybeResetOwnFailCounts(newEndpoint string) {
+	if newEndpoint == "" {
+		return
+	}
+
+	newIP := extractIPFromEndpoint(newEndpoint)
+	if newIP == "" {
+		return
+	}
+
+	e.mu.Lock()
+	oldEndpoint := ""
+	if e.natMeta != nil {
+		oldEndpoint = e.natMeta.PublicEndpoint
+	}
+	e.mu.Unlock()
+
+	oldIP := extractIPFromEndpoint(oldEndpoint)
+
+	if oldIP == "" || oldIP == newIP {
+		return
+	}
+
+	e.mu.Lock()
+	if e.natMeta != nil {
+		e.natMeta.PublicEndpoint = newEndpoint
+		e.natMeta.P2PEndpoint = newEndpoint
+	}
+	e.mu.Unlock()
+
+	natHoleActiveMu.Lock()
+	count := len(failCounts)
+	if count > 0 {
+		failCounts = make(map[string]int)
+	}
+	natHoleActiveMu.Unlock()
+
+	log.Printf("[NAT-HOLE] 本机出口 IP 变化 %s → %s，重置所有失败计数 (count=%d)",
+		oldIP, newIP, count)
+}
+
+func (e *Edge) peerExists(peerID string) bool {
+	if peerID == "" {
+		return false
+	}
+	e.peersMu.RLock()
+	defer e.peersMu.RUnlock()
+	_, ok := e.peers[peerID]
+	return ok
+}
+
+func (e *Edge) reportMetadata() {
+	e.mu.Lock()
+	nm := e.natMeta
+	ws := e.ws
+	serverSeenIP := e.serverSeenIP
+	e.mu.Unlock()
+
+	if nm == nil {
+		nm = &NATMetadata{NATType: "unknown", Behavior: "BehaviorPortChanged"}
+	}
+
+	if serverSeenIP != "" && nm.PublicEndpoint != "" {
+		stunIP := extractIPFromEndpoint(nm.PublicEndpoint)
+		if stunIP != "" && stunIP != serverSeenIP {
+			nm.MultiExit = true
+			nm.NATType = "HardNAT"
+			nm.Behavior = "BehaviorPortChanged"
+		}
+	}
+
+	metaPayload := map[string]interface{}{
+		"name":               e.nodeName,
+		"natType":            nm.NATType,
+		"portsDifference":    nm.PortsDifference,
+		"regularPortsChange": nm.RegularPortsChange,
+		"behavior":           nm.Behavior,
+		"p2pEndpoint":        nm.P2PEndpoint,
+		"multiExit":          nm.MultiExit,
+	}
+	if nm.PublicEndpoint != "" {
+		metaPayload["publicEndpoint"] = nm.PublicEndpoint
+	}
+	if len(nm.AllEndpoints) > 0 {
+		metaPayload["assistedEndpoints"] = nm.AllEndpoints
+	}
+
+	vip := e.GetVirtualIP()
+	lanEndpoints := collectLANEndpoints(e.udpPort, vip)
+	if len(lanEndpoints) > 0 {
+		metaPayload["lanEndpoints"] = lanEndpoints
+	}
+
+	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%q multiExit=%v assisted=%d lan=%d",
+		nm.NATType, nm.PublicEndpoint, nm.MultiExit, len(nm.AllEndpoints), len(lanEndpoints))
+
+	if ws == nil {
+		return
+	}
+	_ = ws.Send(map[string]interface{}{"type": "p2p_metadata", "payload": metaPayload})
+}
+
+func jsonInt(v interface{}) int {
+	if f, ok := v.(float64); ok {
+		return int(f)
+	}
+	return 0
+}
+
+func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
+	var udpAddr *net.UDPAddr
+	if pubIP != "" && pubPort > 0 {
+		udpAddr = &net.UDPAddr{IP: net.ParseIP(pubIP), Port: pubPort}
+	}
+
+	selfVIP := e.GetVirtualIP()
+	prefixes := localPrefixes(selfVIP)
+	sortedLAN := sortLANByAffinity(lanEndpoints, prefixes)
+
+	e.peersMu.Lock()
+	_, existed := e.peers[pid]
+	if existed {
+		p := e.peers[pid]
+		if vip != "" {
+			p.VirtualIP = vip
+		}
+		if pubIP != "" {
+			p.PubIP = pubIP
+		}
+		if pubPort > 0 {
+			p.PubPort = pubPort
+		}
+
+		if udpAddr != nil {
+			oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
+			if !oldIsLAN {
+				p.UDPAddr = udpAddr
+			}
+		}
+
+		if natType != "" {
+			p.NATType = natType
+		}
+		if len(assisted) > 0 {
+			p.AssistedEndpoints = assisted
+		}
+		if len(sortedLAN) > 0 {
+			p.LanEndpoints = sortedLAN
+		}
+	} else {
+		var initialUDP *net.UDPAddr
+		if len(sortedLAN) > 0 {
+			for _, lan := range sortedLAN {
+				if ra, err := net.ResolveUDPAddr("udp", lan); err == nil && ra != nil && ra.IP != nil {
+					initialUDP = ra
+					log.Printf("[P2P] %s 新建 peer，初始 UDPAddr 用 LAN: %s", pid, lan)
+					break
+				}
+			}
+		}
+		if initialUDP == nil {
+			initialUDP = udpAddr
+		}
+
+		e.peers[pid] = &PeerInfo{
+			ClientID:          pid,
+			VirtualIP:         vip,
+			PubIP:             pubIP,
+			PubPort:           pubPort,
+			UDPAddr:           initialUDP,
+			NATType:           natType,
+			AssistedEndpoints: assisted,
+			LanEndpoints:      sortedLAN,
+		}
+	}
+	e.peersMu.Unlock()
+
+	if !existed {
+		e.scheduleFallbackTimer(pid)
+	}
+}
+
+func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
+	if instr.TargetMac == "" {
+		return
+	}
+	var udpAddr *net.UDPAddr
+	if instr.TargetPubSocket != "" {
+		udpAddr = parseSockAddr(instr.TargetPubSocket)
+	}
+	e.peersMu.Lock()
+	defer e.peersMu.Unlock()
+	if p, ok := e.peers[instr.TargetMac]; ok {
+		if udpAddr != nil {
+			oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
+			if !oldIsLAN {
+				p.UDPAddr = udpAddr
+			}
+		}
+		if instr.TargetVirtualIp != "" {
+			p.VirtualIP = instr.TargetVirtualIp
+		}
+	} else {
+		var initialUDP *net.UDPAddr
+		if len(instr.TargetLanEndpoints) > 0 {
+			for _, lan := range instr.TargetLanEndpoints {
+				if ra, err := net.ResolveUDPAddr("udp", lan); err == nil && ra != nil && ra.IP != nil {
+					initialUDP = ra
+					log.Printf("[P2P] %s 新建 peer（ensureTargetPeer），初始 UDPAddr 用 LAN: %s",
+						instr.TargetMac, lan)
+					break
+				}
+			}
+		}
+		if initialUDP == nil {
+			initialUDP = udpAddr
+		}
+
+		e.peers[instr.TargetMac] = &PeerInfo{
+			ClientID:     instr.TargetMac,
+			VirtualIP:    instr.TargetVirtualIp,
+			UDPAddr:      initialUDP,
+			LanEndpoints: instr.TargetLanEndpoints,
+		}
+	}
+}
+
+func (e *Edge) runNatHole(instr *NatHoleInstruction) {
+	res := e.executeNatHole(instr)
+	if res == nil {
+		return
+	}
+
+	if res.State == PunchStateSucceeded {
+		e.relayMgr.MarkP2PAvailable(instr.TargetMac)
+		if e.p2pStreams != nil {
+			safeGo("p2p-probe", func() {
+				e.p2pStreams.sendP2PProbe(instr.TargetMac)
+			})
+		}
+		e.scheduleP2PAvailTimeout(instr.TargetMac)
+	} else if res.State == PunchStateFailed {
+		e.relayMgr.MarkFallback(instr.TargetMac)
+	}
+
+	p2pStatus := 0
+	switch e.relayMgr.GetState(instr.TargetMac) {
+	case ConnP2P:
+		p2pStatus = 3
+	case ConnP2PAvailable:
+		p2pStatus = 2
+	default:
+		p2pStatus = 0
+	}
+
+	if e.ws == nil {
+		return
+	}
+	_ = e.ws.Send(map[string]interface{}{
+		"type": "p2p_state_info",
+		"payload": map[string]interface{}{
+			"to": []map[string]interface{}{{
+				"macAddr": instr.TargetMac, "observedRaddr": "",
+				"punchResult": res, "punchResultPeerMac": instr.TargetMac,
+				"p2pStatus": p2pStatus,
+			}},
+		},
+	})
+}
+
+// ============ IO ============
+
+func (e *Edge) udpReadLoop() {
+	buf := make([]byte, 65535)
+	for {
+		select {
+		case <-e.doneCh:
+			return
+		default:
+		}
+
+		n, addr, err := e.udpConn.ReadFrom(buf)
+		if err != nil {
+			select {
+			case <-e.doneCh:
+				return
+			default:
+			}
+			if isTransientReadError(err) {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			log.Printf("[P2P] UDP 读错误，退出读循环: %v", err)
+			return
+		}
+		if n < 4 {
+			continue
+		}
+
+		if buf[0] == 0x01 && buf[1] == 0x01 {
+			if ip, port, ok := parseSTUNResponse(buf[:n]); ok {
+				e.addAssistedEndpoint(ip, port)
+			}
+			continue
+		}
+
+		if isP2PFrame(buf[:n]) {
+			if ua, ok := addr.(*net.UDPAddr); ok {
+				e.handleP2PFrame(ua, false, buf[:n])
+			}
+			continue
+		}
+
+		if isPunchProbe(buf[:n]) {
+			if ua, ok := addr.(*net.UDPAddr); ok {
+				e.notePeerProbe(ua)
+			}
+			continue
+		}
+		if isPunchAck(buf[:n]) {
+			if ua, ok := addr.(*net.UDPAddr); ok {
+				e.notePeerAck(ua)
+			}
+			continue
+		}
+
+		if buf[0]>>4 == 4 {
+			if ua, ok := addr.(*net.UDPAddr); ok {
+				e.notePeerTraffic(ua)
+			}
+			e.onRemotePacket(buf[:n])
+		}
+	}
+}
+
+func (e *Edge) tunReadLoop() {
+	buf := make([]byte, 65535)
+	for {
+		select {
+		case <-e.doneCh:
+			return
+		default:
+		}
+
+		n, err := e.tun.Read(buf)
+		if err != nil {
+			select {
+			case <-e.doneCh:
+				return
+			default:
+			}
+			if isTransientReadError(err) {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			log.Printf("[TUN] 读错误，退出读循环: %v", err)
+			return
+		}
+		if n < 20 || buf[0]>>4 != 4 {
+			continue
+		}
+
+		dstIP := net.IP(buf[16:20]).String()
+
+		e.peersMu.RLock()
+		var target *PeerInfo
+		for _, p := range e.peers {
+			if p.VirtualIP == dstIP {
+				target = p
+				break
+			}
+		}
+		e.peersMu.RUnlock()
+
+		if target == nil {
+			proto := 0
+			if n >= 10 {
+				proto = int(buf[9])
+			}
+			if proto == 17 && n < 200 {
+				if e.ws != nil {
+					_ = e.ws.SendBinary(buf[:n])
+				}
+			} else {
+				e.logNoPeerThrottled(dstIP, n)
+			}
+			continue
+		}
+
+		state := ConnUnknown
+		if e.relayMgr != nil {
+			state = e.relayMgr.GetState(target.ClientID)
+		}
+
+		if state == ConnTURN {
+			pktCopy := make([]byte, n)
+			copy(pktCopy, buf[:n])
+			targetID := target.ClientID
+			targetCopy := target
+			pktLen := n
+			proto := 0
+			if n >= 10 {
+				proto = int(buf[9])
+			}
+
+			safeGo("tun-send-turn", func() {
+				sent := false
+				if e.relayMgr != nil {
+					sent = e.relayMgr.SendToPeer(targetID, pktCopy, targetCopy)
+				}
+				e.logTunForward(targetID, dstIP, pktLen, proto, sent, ConnTURN)
+				if !sent && e.ws != nil {
+					_ = e.ws.SendBinary(pktCopy)
+				}
+			})
+			continue
+		}
+
+		sent := false
+		if e.relayMgr != nil {
+			sent = e.relayMgr.SendToPeer(target.ClientID, buf[:n], target)
+		}
+		if n >= 10 {
+			e.logTunForward(target.ClientID, dstIP, n, int(buf[9]), sent, state)
+		}
+		if !sent && e.ws != nil {
+			_ = e.ws.SendBinary(buf[:n])
+		}
+	}
+}
+
+func (e *Edge) tunWriteLoop() {
+	for {
+		select {
+		case <-e.doneCh:
+			return
+		case data := <-e.tunWriteCh:
+			if e.tun != nil {
+				_, _ = e.tun.Write(data)
+			}
+		}
+	}
+}
+
+func (e *Edge) enqueueTUN(data []byte) {
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	select {
+	case e.tunWriteCh <- cp:
+	default:
+	}
+}
+
+func (e *Edge) onRemotePacket(data []byte) {
+	if len(data) < 20 || data[0]>>4 != 4 {
+		return
+	}
+	dstIP := net.IP(data[16:20]).String()
+	vip := e.GetVirtualIP()
+	if dstIP != vip {
+		return
+	}
+	e.enqueueTUN(data)
+}
+
+// ============ peer 探测处理（score 制） ============
+
+func (e *Edge) notePeerProbe(addr *net.UDPAddr) {
+	e.notePeerCommon(addr, false, false, false)
+}
+
+func (e *Edge) notePeerAck(addr *net.UDPAddr) {
+	e.notePeerCommon(addr, false, false, true)
+}
+
+func (e *Edge) notePeerProbeTURN(addr *net.UDPAddr) {
+	e.notePeerCommon(addr, false, true, false)
+}
+
+func (e *Edge) notePeerAckTURN(addr *net.UDPAddr) {
+	e.notePeerCommon(addr, false, true, true)
+}
+
+func (e *Edge) notePeerTraffic(addr *net.UDPAddr) {
+	e.notePeerCommon(addr, true, false, false)
+}
+
+func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
+	e.notePeerCommon(addr, true, true, false)
+}
+
+func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
+	now := time.Now().UnixMilli()
+
+	e.peersMu.Lock()
+	var best *PeerInfo
+	bestScore := 0
+	addrIP := addr.IP
+	addrPort := addr.Port
+
+	for _, p := range e.peers {
+		score := 0
+
+		if p.UDPAddr != nil && p.UDPAddr.IP.Equal(addrIP) {
+			if p.UDPAddr.Port == addrPort {
+				score = 4
+			} else {
+				score = 3
+			}
+		}
+
+		for _, lan := range p.LanEndpoints {
+			la, err := net.ResolveUDPAddr("udp", lan)
+			if err != nil || la == nil || la.IP == nil {
+				continue
+			}
+			if la.IP.Equal(addrIP) {
+				if la.Port == addrPort {
+					if score < 5 {
+						score = 5
+					}
+				} else if score < 2 {
+					score = 2
+				}
+			}
+		}
+
+		for _, ass := range p.AssistedEndpoints {
+			aa, err := net.ResolveUDPAddr("udp", ass)
+			if err != nil || aa == nil || aa.IP == nil {
+				continue
+			}
+			if aa.IP.Equal(addrIP) {
+				if aa.Port == addrPort {
+					if score < 4 {
+						score = 4
+					}
+				} else if score < 1 {
+					score = 1
+				}
+			}
+		}
+
+		if score > 0 && score > bestScore {
+			best = p
+			bestScore = score
+		}
+	}
+	if best == nil {
+		e.peersMu.Unlock()
+		return
+	}
+
+	newIsLAN := isPrivateIPv4(addr.IP)
+	oldIsLAN := best.UDPAddr != nil && isPrivateIPv4(best.UDPAddr.IP)
+
+	shouldUpdate := false
+	if best.UDPAddr == nil {
+		shouldUpdate = true
+	} else if !oldIsLAN && newIsLAN {
+		shouldUpdate = true
+	} else if oldIsLAN && !newIsLAN {
+		if best.lastLANRecvAt > 0 && now-best.lastLANRecvAt > 30000 {
+			shouldUpdate = true
+			log.Printf("[P2P] %s (note) LAN 超过 30s 无流量，改用公网地址", best.ClientID)
+		}
+	} else {
+		if best.UDPAddr.Port != addrPort {
+			shouldUpdate = true
+		}
+	}
+
+	if newIsLAN {
+		best.lastLANRecvAt = now
+	}
+
+	if shouldUpdate {
+		best.UDPAddr = &net.UDPAddr{IP: addr.IP, Port: addrPort}
+	}
+
+	best.lastRecvAt = now
+	if isRealData {
+		best.hasRealData = true
+	}
+	clientID := best.ClientID
+	ip := addr.IP.String()
+	e.peersMu.Unlock()
+
+	if e.relayMgr == nil {
+		return
+	}
+
+	if isRealData {
+		if e.relayMgr.GetState(clientID) != ConnP2P {
+			log.Printf("[P2P] 从 %s (%s) 收到真实数据帧 → P2P 直连", clientID, ip)
+			e.relayMgr.MarkP2P(clientID)
+		}
+		return
+	}
+
+	curState := e.relayMgr.GetState(clientID)
+	justUpgraded := false
+	if curState != ConnP2P && curState != ConnP2PAvailable {
+		kind := "Punch"
+		if isAck {
+			kind = "ACK"
+		}
+		log.Printf("[P2P] 从 %s (%s) 收到 %s → P2PAvailable（等待数据帧验证）", clientID, ip, kind)
+		e.relayMgr.MarkP2PAvailable(clientID)
+		justUpgraded = true
+	}
+
+	if justUpgraded {
+		if e.p2pStreams != nil {
+			safeGo("p2p-probe", func() {
+				e.p2pStreams.sendP2PProbe(clientID)
+			})
+		}
+		e.scheduleP2PAvailTimeout(clientID)
+	}
+
+	if isAck {
+		return
+	}
+	if e.punchAckLimiter == nil || !e.punchAckLimiter.allow(clientID, time.Now()) {
+		return
+	}
+
+	safeGo("punch-ack", func() {
+		ack := buildPunchAck()
+		e.writeProbe(addr, ack, viaTURN)
+	})
+}
+
+func (e *Edge) writeProbe(addr *net.UDPAddr, probe []byte, viaTURN bool) {
+	if addr == nil {
+		return
+	}
+	if viaTURN {
+		if e.turnClient == nil || !e.turnClient.IsReady() {
+			return
+		}
+		_ = e.turnClient.Send(probe, addr)
+		return
+	}
+	if e.udpConn == nil {
+		return
+	}
+	_, _ = e.udpConn.WriteTo(probe, addr)
+}
+
+func (e *Edge) sendProbeTo(addr *net.UDPAddr) {
+	if e.udpConn == nil || addr == nil {
+		return
+	}
+	probe := buildPunchProbe(e.GetVirtualIP())
+	e.writeProbe(addr, probe, false)
+}
+
+func (e *Edge) hasTrafficFromTarget(peerID string, since int64) bool {
+	if peerID == "" {
+		return false
+	}
+	e.peersMu.RLock()
+	defer e.peersMu.RUnlock()
+	p := e.peers[peerID]
+	if p == nil || p.UDPAddr == nil {
+		return false
+	}
+	return p.lastRecvAt >= since
+}
+
+func (e *Edge) hasTrafficFromAny(ips []net.IP, since int64) bool {
+	if len(ips) == 0 {
+		return false
+	}
+	e.peersMu.RLock()
+	defer e.peersMu.RUnlock()
+	for _, p := range e.peers {
+		if p.UDPAddr == nil || p.lastRecvAt < since {
+			continue
+		}
+		for _, ip := range ips {
+			if p.UDPAddr.IP.Equal(ip) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ============ 多 STUN 端点收集 ============
+
+func (e *Edge) addAssistedEndpoint(ip string, port int) {
+	if ip == "" || port <= 0 {
+		return
+	}
+	ep := net.JoinHostPort(ip, strconv.Itoa(port))
+
+	e.mu.Lock()
+	if e.natMeta == nil {
+		e.mu.Unlock()
+		return
+	}
+	for _, existing := range e.natMeta.AllEndpoints {
+		if existing == ep {
+			e.mu.Unlock()
+			return
+		}
+	}
+	if len(e.natMeta.AllEndpoints) >= 5 {
+		e.natMeta.AllEndpoints = e.natMeta.AllEndpoints[1:]
+	}
+	e.natMeta.AllEndpoints = append(e.natMeta.AllEndpoints, ep)
+	count := len(e.natMeta.AllEndpoints)
+	e.mu.Unlock()
+
+	e.maybeResetOwnFailCounts(ep)
+
+	log.Printf("[NAT] +assisted: %s (total=%d)", ep, count)
+	e.reportMetadataThrottled()
+}
+
+func (e *Edge) reportMetadataThrottled() {
+	now := time.Now().UnixMilli()
+	last := atomic.LoadInt64(&e.lastMetadataReportAt)
+	if now-last < 30000 {
+		return
+	}
+	if !atomic.CompareAndSwapInt64(&e.lastMetadataReportAt, last, now) {
+		return
+	}
+	e.reportMetadata()
+}
