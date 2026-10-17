@@ -1499,6 +1499,17 @@ func (e *Edge) udpReadLoop() {
 	}
 }
 
+// tunReadLoop 从 TUN 读出 IPv4 包，按 peer 状态选择 P2P / TURN / WS 中继发送。
+//
+// ★ 关键修复（vs 旧版）：
+//   - WS 中继路径改用 N2NW 帧（显式携带目标 clientId），而非裸 IPv4：
+//     · 服务端无需解析 IPv4 头，直接按 peerId 精确路由
+//     · 多 peer 房间下不会广播，节省带宽
+//     · 帧头 peerId 由服务端重写为发送方 ID，接收方能识别来源
+//
+//   - 保留裸 IPv4 的唯一场景：target == nil（本机 VIP 表里没有该 dstIP，
+//     通常是小 UDP 包探测），此时拿不到目标 clientId，只能让服务端按
+//     dstIP 查表。
 func (e *Edge) tunReadLoop() {
 	buf := make([]byte, 65535)
 	for {
@@ -1538,6 +1549,8 @@ func (e *Edge) tunReadLoop() {
 		}
 		e.peersMu.RUnlock()
 
+		// ★ 无目标：仍发裸 IPv4，服务端按 dstIP 查表
+		//   限制 UDP 小包（ping/探测），避免误广播大流量
 		if target == nil {
 			proto := 0
 			if n >= 10 {
@@ -1558,6 +1571,8 @@ func (e *Edge) tunReadLoop() {
 			state = e.relayMgr.GetState(target.ClientID)
 		}
 
+		// TURN 路径：优先通过 TURN 中继发出
+		// 失败时降级到 WS 中继（用 N2NW 帧）
 		if state == ConnTURN {
 			pktCopy := make([]byte, n)
 			copy(pktCopy, buf[:n])
@@ -1576,12 +1591,15 @@ func (e *Edge) tunReadLoop() {
 				}
 				e.logTunForward(targetID, dstIP, pktLen, proto, sent, ConnTURN)
 				if !sent && e.ws != nil {
-					_ = e.ws.SendBinary(pktCopy)
+					// ★ TURN 失败 → WS 中继，改用 N2NW 帧
+					frame := buildN2NWFrame(targetID, pktCopy)
+					_ = e.ws.SendBinary(frame)
 				}
 			})
 			continue
 		}
 
+		// P2P / P2PAvailable / unknown / relay 一律尝试直发
 		sent := false
 		if e.relayMgr != nil {
 			sent = e.relayMgr.SendToPeer(target.ClientID, buf[:n], target)
@@ -1590,7 +1608,9 @@ func (e *Edge) tunReadLoop() {
 			e.logTunForward(target.ClientID, dstIP, n, int(buf[9]), sent, state)
 		}
 		if !sent && e.ws != nil {
-			_ = e.ws.SendBinary(buf[:n])
+			// ★ 打洞/TURN 都失败 → WS 中继，改用 N2NW 帧
+			frame := buildN2NWFrame(target.ClientID, buf[:n])
+			_ = e.ws.SendBinary(frame)
 		}
 	}
 }
