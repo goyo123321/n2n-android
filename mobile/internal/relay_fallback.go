@@ -1,9 +1,8 @@
-package main
+package internal
 
 import (
 	"log"
 	"net"
-	"runtime/debug"
 	"sync"
 	"time"
 )
@@ -18,16 +17,7 @@ const (
 	ConnRelay        ConnType = "relay"
 )
 
-func safeGo(name string, fn func()) {
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("[panic] %s: %v\n%s", name, r, debug.Stack())
-			}
-		}()
-		fn()
-	}()
-}
+// safeGo 定义在 edge.go 里。
 
 type RelayManager struct {
 	mu         sync.RWMutex
@@ -44,7 +34,7 @@ func NewRelayManager(ws *WSTransport, turnClient *TURNClient, edge *Edge) *Relay
 		turnClient: turnClient,
 		edge:       edge,
 		states:     make(map[string]ConnType),
-		failCounts: make(map[string]int), // ★ 初始化
+		failCounts: make(map[string]int),
 	}
 }
 
@@ -86,7 +76,6 @@ func (rm *RelayManager) MarkP2P(peerId string) {
 }
 
 // MarkFallback 常规降级路径。保护 P2PAvailable 状态。
-//
 // ★ 修复：3s → 10s（TCP 空闲连接更宽容）
 func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.mu.Lock()
@@ -115,7 +104,7 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 
 		if lastRecv > 0 {
 			idleMs := time.Now().UnixMilli() - lastRecv
-			// ★ 3s → 10s（TCP 空闲连接更宽容）
+			// ★ 3s → 10s
 			if idleMs < 10000 {
 				log.Printf("[连接] %s 最近 %dms 收到过 UDP 包，跳过降级", peerId, idleMs)
 				return
@@ -179,14 +168,14 @@ func (rm *RelayManager) ClearPeer(peerID string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 	delete(rm.states, peerID)
-	delete(rm.failCounts, peerID) // ★ 清理失败计数
+	delete(rm.failCounts, peerID)
 }
 
 func (rm *RelayManager) ClearAll() {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 	rm.states = make(map[string]ConnType)
-	rm.failCounts = make(map[string]int) // ★ 清理
+	rm.failCounts = make(map[string]int)
 }
 
 func (rm *RelayManager) cancelFallbackTimer(peerID string) {
@@ -281,11 +270,7 @@ func (rm *RelayManager) SendViaRelay(data []byte) error {
 
 // SendToPeer 按当前状态发送数据。
 //
-// ★ 修复：ConnP2P 分支加连续失败计数，连续 5 次失败才降级。
-//
-//	单次 WriteTo 失败通常是临时网络问题（ENOBUFS、瞬时路由），
-//	不应该立即降级到 TURN/WS。5 次失败才认为通道真的坏了。
-//
+// ★ ConnP2P 分支加连续失败计数，连续 5 次失败才降级。
 // ★ Android 特有：e.udpConn 是 net.PacketConn，用 WriteTo 而非 WriteToUDP。
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
 	state := rm.GetState(peerId)
@@ -329,7 +314,6 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 		}
 
 		if sent {
-			// ★ 成功：重置失败计数
 			rm.mu.Lock()
 			delete(rm.failCounts, peerId)
 			rm.mu.Unlock()
@@ -343,11 +327,9 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 		rm.mu.Unlock()
 
 		if fc < 5 {
-			// 5 次以内：静默失败，下个包再试
 			return false
 		}
 
-		// 5 次以上：真降级
 		rm.mu.Lock()
 		delete(rm.failCounts, peerId)
 		rm.mu.Unlock()
