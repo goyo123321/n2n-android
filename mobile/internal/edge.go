@@ -31,7 +31,6 @@ type PeerInfo struct {
 	lastLANRecvAt     int64
 	loggedReady       bool
 	hasRealData       bool
-	probeReplied      bool
 	AssistedEndpoints []string
 	LanEndpoints      []string
 }
@@ -62,6 +61,8 @@ type Edge struct {
 
 	udpConn net.PacketConn
 	udpPort int
+
+	pktFwd *PacketForwarder // ★ 新增：TCP 中继 + UDP 转发 + ICMP 响应
 
 	peers   map[string]*PeerInfo
 	peersMu sync.RWMutex
@@ -400,6 +401,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	}
 	e.punchAckLimiter = newPunchAckLimiter()
 	e.streamMgr = NewAppStreamManager()
+	e.pktFwd = NewPacketForwarder(e) // ★ 新增：用于处理 PC/Android 访问 Termux 的包
 
 	tun, err := setupTUNFromFD(tunFd)
 	if err != nil {
@@ -503,14 +505,15 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 
 	e.p2pStreams = NewP2PStreamManager(e)
 
-	// ★ 修改点：拦截 N2NW 二进制包
 	ws.SetHandlers(
 		e.handleSignaling,
 		func(data []byte) {
+			// ★ 拦截 AppStream 二进制包 (N2NW)
 			if len(data) >= 4 && string(data[:4]) == "N2NW" {
 				e.handleAppStreamBinary(data)
 				return
 			}
+			// 原有的裸 IPv4 包处理
 			e.onRemotePacket(data)
 		},
 	)
@@ -647,6 +650,9 @@ func (e *Edge) Stop() {
 	}
 	if e.p2pStreams != nil {
 		e.p2pStreams.closeAll()
+	}
+	if e.pktFwd != nil {
+		e.pktFwd.Stop()
 	}
 	if e.tun != nil {
 		_ = e.tun.Close()
@@ -874,9 +880,14 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		if failCount > 0 {
 			failCounts = make(map[string]int)
 		}
+		nActive := len(natHoleActive)
+		if nActive > 0 {
+			natHoleActive = make(map[string]bool)
+		}
 		natHoleActiveMu.Unlock()
-		if failCount > 0 {
-			log.Printf("[NAT-HOLE] WS 重连，清空 %d 个 peer 的失败计数", failCount)
+		if failCount > 0 || nActive > 0 {
+			log.Printf("[NAT-HOLE] WS 重连，清空 %d 个失败计数 / %d 个 in-flight 标记",
+				failCount, nActive)
 		}
 
 		e.reportMetadata()
@@ -1012,6 +1023,15 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			log.Printf("[NAT-HOLE] 忽略指令 target=%s（peer 不在线）", instr.TargetMac)
 			return
 		}
+
+		// ★★★ 已 P2P 时，主动上报 p2p_status=3，让服务端停止重发 nat_hole_instruction。
+		if e.relayMgr != nil && e.relayMgr.GetState(instr.TargetMac) == ConnP2P {
+			log.Printf("[NAT-HOLE] 跳过指令 target=%s（已 P2P），上报 p2p_status=3",
+				instr.TargetMac)
+			e.reportP2PStatus(instr.TargetMac, 3)
+			return
+		}
+
 		e.ensureTargetPeer(&instr)
 		e.scheduleFallbackTimer(instr.TargetMac)
 		instrCopy := instr
@@ -1054,14 +1074,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			log.Printf("[TURN] 记录 %s 的中继地址: %s", edgeMac, relayAddr)
 		}
 
-	case "app_stream_open":
-		safeGo("app-stream-open", func() { e.onRemoteStreamOpen(msg) })
-	case "app_stream_open_ack":
-		e.onRemoteStreamAck(msg)
-	case "app_stream_data":
-		e.onRemoteStreamData(msg)
-	case "app_stream_close":
-		e.onRemoteStreamClose(msg)
+	// ❌ 原有的 JSON 版 app_stream_* 已被彻底删除
 
 	case "pong":
 		return
@@ -1248,6 +1261,7 @@ func jsonInt(v interface{}) int {
 	return 0
 }
 
+// registerPeer 注册/更新一个 peer。
 func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	var udpAddr *net.UDPAddr
 	if pubIP != "" && pubPort > 0 {
@@ -1404,6 +1418,27 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 				"macAddr": instr.TargetMac, "observedRaddr": "",
 				"punchResult": res, "punchResultPeerMac": instr.TargetMac,
 				"p2pStatus": p2pStatus,
+			}},
+		},
+	})
+}
+
+func (e *Edge) reportP2PStatus(peerID string, status int) {
+	if e.ws == nil || peerID == "" {
+		return
+	}
+	_ = e.ws.Send(map[string]interface{}{
+		"type": "p2p_state_info",
+		"payload": map[string]interface{}{
+			"to": []map[string]interface{}{{
+				"macAddr": peerID,
+				"punchResult": map[string]interface{}{
+					"state":    3,
+					"attempts": 0,
+					"detail":   "already-p2p",
+				},
+				"punchResultPeerMac": peerID,
+				"p2pStatus":          status,
 			}},
 		},
 	})
@@ -1716,7 +1751,7 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 	}
 
 	if shouldUpdate {
-		best.UDPAddr = &net.UDPAddr{IP: addr.IP, Port: addrPort}
+		best.UDPAddr = &net.UDPAddr{IP: addr.IP, Port: addr.Port}
 	}
 
 	best.lastRecvAt = now
