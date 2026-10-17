@@ -62,8 +62,6 @@ type Edge struct {
 	udpConn net.PacketConn
 	udpPort int
 
-	pktFwd *PacketForwarder // ★ 新增：TCP 中继 + UDP 转发 + ICMP 响应
-
 	peers   map[string]*PeerInfo
 	peersMu sync.RWMutex
 
@@ -401,7 +399,6 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	}
 	e.punchAckLimiter = newPunchAckLimiter()
 	e.streamMgr = NewAppStreamManager()
-	e.pktFwd = NewPacketForwarder(e) // ★ 新增：用于处理 PC/Android 访问 Termux 的包
 
 	tun, err := setupTUNFromFD(tunFd)
 	if err != nil {
@@ -650,9 +647,6 @@ func (e *Edge) Stop() {
 	}
 	if e.p2pStreams != nil {
 		e.p2pStreams.closeAll()
-	}
-	if e.pktFwd != nil {
-		e.pktFwd.Stop()
 	}
 	if e.tun != nil {
 		_ = e.tun.Close()
@@ -1024,7 +1018,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			return
 		}
 
-		// ★★★ 已 P2P 时，主动上报 p2p_status=3，让服务端停止重发 nat_hole_instruction。
 		if e.relayMgr != nil && e.relayMgr.GetState(instr.TargetMac) == ConnP2P {
 			log.Printf("[NAT-HOLE] 跳过指令 target=%s（已 P2P），上报 p2p_status=3",
 				instr.TargetMac)
@@ -1073,8 +1066,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			e.peersMu.Unlock()
 			log.Printf("[TURN] 记录 %s 的中继地址: %s", edgeMac, relayAddr)
 		}
-
-	// ❌ 原有的 JSON 版 app_stream_* 已被彻底删除
 
 	case "pong":
 		return
@@ -1261,7 +1252,6 @@ func jsonInt(v interface{}) int {
 	return 0
 }
 
-// registerPeer 注册/更新一个 peer。
 func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	var udpAddr *net.UDPAddr
 	if pubIP != "" && pubPort > 0 {
