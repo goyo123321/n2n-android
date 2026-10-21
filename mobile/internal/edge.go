@@ -33,7 +33,7 @@ type PeerInfo struct {
 	hasRealData       bool
 	AssistedEndpoints []string
 	LanEndpoints      []string
-	Features          []string   // ★ 新增：["n2na", "n2nw", ...]
+	Features          []string
 }
 
 type PeerSnapshot struct {
@@ -89,10 +89,8 @@ type Edge struct {
 
 	lastMetadataReportAt int64
 
-	// ★ P0-3：最近一次真实数据帧发送时间（用于自适应保活）
 	lastDataFrameAt int64
 
-	// ★ Bug 2 修复：已上报 P2P 状态的目标（避免并行指令重复上报 p2p_status=3）
 	p2pStatusReported   map[string]bool
 	p2pStatusReportedMu sync.Mutex
 
@@ -172,7 +170,6 @@ func buildSTUNBindingRequest() []byte {
 	return buf
 }
 
-// ★ P0-3 自适应保活：最近 10s 有真实数据帧 → 跳过 STUN
 func (e *Edge) startKeepalive() {
 	if e.udpConn == nil {
 		return
@@ -194,7 +191,6 @@ func (e *Edge) startKeepalive() {
 
 	safeGo("keepalive", func() {
 		sendOnce := func() {
-			// ★ 自适应：10s 内有数据帧 → 跳过（真实数据天然刷新映射）
 			last := atomic.LoadInt64(&e.lastDataFrameAt)
 			if last > 0 && time.Now().UnixMilli()-last < 10000 {
 				return
@@ -545,9 +541,6 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		log.Printf("[SOCKS5] 已启用，监听 %s", cfg.Socks5Listen)
 	}
 
-	// ============================================================
-	// nat-probe：STUN 探测完成后合并端点（Bug 1 修复）
-	// ============================================================
 	safeGo("nat-probe", func() {
 		log.Printf("[NAT] 开始异步 STUN 探测...")
 		var meta *NATMetadata
@@ -581,7 +574,6 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		}
 
 		e.mu.Lock()
-		// ★ Bug 1 修复：保留已有的 assisted endpoints（可能是保活响应添加的）
 		if e.natMeta != nil && len(e.natMeta.AllEndpoints) > 0 {
 			existing := make(map[string]bool, len(meta.AllEndpoints))
 			for _, ep := range meta.AllEndpoints {
@@ -980,7 +972,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 						}
 					}
 				}
-				// ★ 新增：解析 features
 				var features []string
 				if raw, ok := pm["features"].([]interface{}); ok {
 					for _, v := range raw {
@@ -1003,7 +994,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 						pi.TurnRelayAddr = relayAddr
 					}
 					if len(features) > 0 {
-						pi.Features = features   // ★ 新增
+						pi.Features = features
 					}
 				}
 				e.peersMu.Unlock()
@@ -1039,7 +1030,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 				}
 			}
 		}
-		// ★ 新增：解析 features
 		var features []string
 		if raw, ok := payload["features"].([]interface{}); ok {
 			for _, v := range raw {
@@ -1062,12 +1052,11 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 					pi.TurnRelayAddr = relayAddr
 				}
 				if len(features) > 0 {
-					pi.Features = features   // ★ 新增
+					pi.Features = features
 				}
 			}
 			e.peersMu.Unlock()
 
-			// ★ P0-2 预连接：立即发一次 PING 试探
 			if e.p2pStreams != nil && e.relayMgr != nil {
 				if e.relayMgr.GetState(from) != ConnP2P {
 					targetID := from
@@ -1277,11 +1266,6 @@ func (e *Edge) peerExists(peerID string) bool {
 	return ok
 }
 
-// reportMetadata 上报 p2p_metadata。
-//
-// ★ 新增：上报 features = ["n2na", "n2nw"]，让服务端在 WS 中继时
-//   知道本端支持 N2NA（app_stream 二进制）和 N2NW（IPv4 二进制）。
-//   服务端按目标端 features 决定发二进制还是降级文本。
 func (e *Edge) reportMetadata() {
 	e.mu.Lock()
 	nm := e.natMeta
@@ -1310,7 +1294,7 @@ func (e *Edge) reportMetadata() {
 		"behavior":           nm.Behavior,
 		"p2pEndpoint":        nm.P2PEndpoint,
 		"multiExit":          nm.MultiExit,
-		"features":           []string{"n2na", "n2nw"},   // ★ 新增
+		"features":           []string{"n2na", "n2nw"},
 	}
 	if nm.PublicEndpoint != "" {
 		metaPayload["publicEndpoint"] = nm.PublicEndpoint
@@ -1405,7 +1389,6 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string,
 			NATType:           natType,
 			AssistedEndpoints: assisted,
 			LanEndpoints:      sortedLAN,
-			// Features 由调用方在 registerPeer 之后直接设置
 		}
 	}
 	e.peersMu.Unlock()
@@ -1503,9 +1486,6 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	})
 }
 
-// reportP2PStatus 上报 P2P 状态。
-//
-// ★ Bug 2 修复：同一 peer 只上报一次（避免并行打洞导致重复）。
 func (e *Edge) reportP2PStatus(peerID string, status int) {
 	if e.ws == nil || peerID == "" {
 		return
@@ -1601,9 +1581,6 @@ func (e *Edge) udpReadLoop() {
 	}
 }
 
-// tunReadLoop 从 TUN 读出 IPv4 包。
-// ★ ICMP 分支绕过状态机。
-// ★ P0-3：发送数据后更新 lastDataFrameAt。
 func (e *Edge) tunReadLoop() {
 	buf := make([]byte, 65535)
 	for {
@@ -1715,14 +1692,52 @@ func (e *Edge) tunReadLoop() {
 	}
 }
 
-// sendICMPDirect 是 ICMP 专用的发送路径，绕过 relayMgr 状态机。
-// 顺序：LAN → UDPAddr → TURN → WS
+// ★ P0 修复：selfIsOnTargetLAN 判断本机是否在 target 的 LAN 上
+//
+// 用于 sendICMPDirect / SendToPeer 的 LAN 分支，避免跨网络时写黑洞。
+//
+// 返回 true 的条件：target.LanEndpoints 中至少有一个地址与本机某个私网前缀匹配。
+func (e *Edge) selfIsOnTargetLAN(target *PeerInfo) bool {
+	if target == nil || len(target.LanEndpoints) == 0 {
+		return false
+	}
+	myPrefixes := localPrefixes(e.getVirtualIPLocked())
+	if len(myPrefixes) == 0 {
+		return false
+	}
+	for _, lan := range target.LanEndpoints {
+		ra, err := net.ResolveUDPAddr("udp", lan)
+		if err != nil || ra == nil || ra.IP == nil {
+			continue
+		}
+		for _, p := range myPrefixes {
+			if p.Contains(ra.IP) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ★ P0 修复：sendICMPDirect 的 LAN 分支加 selfIsOnTargetLAN 判断
+//
+// 旧版问题：WriteToUDP 返回 nil 只表示"写到本地 socket"，不表示"对方收到"。
+// 跨网络场景下，target.LanEndpoints 是旧 LAN 地址，写进去就是黑洞。
+//
+// 新版逻辑：
+//   1. 只有本机也在 target 的 LAN 上，才走 LAN 分支
+//   2. UDPAddr 如果是"当前不可达的私网"，也跳过
+//   3. TURN 兜底（必做，ICMP 走 TURN 比走黑洞好）
+//   4. WS 兜底（必做）
 func (e *Edge) sendICMPDirect(target *PeerInfo, pkt []byte) {
 	if target == nil {
 		return
 	}
 
-	if len(target.LanEndpoints) > 0 && e.udpConn != nil {
+	selfOnLAN := e.selfIsOnTargetLAN(target)
+
+	// 1. LAN 优先：只有本机也在该 LAN 上
+	if selfOnLAN && len(target.LanEndpoints) > 0 && e.udpConn != nil {
 		for _, lan := range target.LanEndpoints {
 			ra, err := net.ResolveUDPAddr("udp", lan)
 			if err != nil || ra == nil || ra.IP == nil {
@@ -1734,12 +1749,23 @@ func (e *Edge) sendICMPDirect(target *PeerInfo, pkt []byte) {
 		}
 	}
 
+	// 2. UDPAddr：只有不是"本机不可达的私网"时，才写
 	if target.UDPAddr != nil && e.udpConn != nil {
-		if _, err := e.udpConn.WriteTo(pkt, target.UDPAddr); err == nil {
-			return
+		skip := false
+		if isPrivateIPv4(target.UDPAddr.IP) && !selfOnLAN {
+			// 私网 + 本机不在该 LAN → 黑洞，跳过
+			skip = true
+			log.Printf("[ICMP] %s UDPAddr=%s 是私网且本机不在该 LAN，跳过（避免黑洞）",
+				target.ClientID, target.UDPAddr)
+		}
+		if !skip {
+			if _, err := e.udpConn.WriteTo(pkt, target.UDPAddr); err == nil {
+				return
+			}
 		}
 	}
 
+	// 3. TURN 兜底
 	if target.TurnRelayAddr != "" && e.turnClient != nil && e.turnClient.IsReady() {
 		relayAddr, err := net.ResolveUDPAddr("udp", target.TurnRelayAddr)
 		if err == nil {
@@ -1749,6 +1775,7 @@ func (e *Edge) sendICMPDirect(target *PeerInfo, pkt []byte) {
 		}
 	}
 
+	// 4. WS 兜底（ICMP 走 WS 中继兜底，牺牲延迟换可靠）
 	if e.ws != nil {
 		frame := buildN2NWFrame(target.ClientID, pkt)
 		_ = e.ws.SendBinary(frame)
