@@ -25,7 +25,7 @@ type RelayManager struct {
 	turnClient *TURNClient
 	edge       *Edge
 	states     map[string]ConnType
-	failCounts map[string]int // ★ 新增：UDP 连续发送失败计数
+	failCounts map[string]int
 }
 
 func NewRelayManager(ws *WSTransport, turnClient *TURNClient, edge *Edge) *RelayManager {
@@ -64,7 +64,7 @@ func (rm *RelayManager) MarkP2P(peerId string) {
 	}
 	prev := rm.states[peerId]
 	rm.states[peerId] = ConnP2P
-	delete(rm.failCounts, peerId) // ★ 重置失败计数
+	delete(rm.failCounts, peerId)
 	rm.mu.Unlock()
 
 	log.Printf("[连接] %s → P2P 直连（prev=%s，数据面已验证）", peerId, prev)
@@ -75,8 +75,6 @@ func (rm *RelayManager) MarkP2P(peerId string) {
 	}
 }
 
-// MarkFallback 常规降级路径。保护 P2PAvailable 状态。
-// ★ 修复：3s → 10s（TCP 空闲连接更宽容）
 func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.mu.Lock()
 
@@ -104,7 +102,6 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 
 		if lastRecv > 0 {
 			idleMs := time.Now().UnixMilli() - lastRecv
-			// ★ 3s → 10s
 			if idleMs < 10000 {
 				log.Printf("[连接] %s 最近 %dms 收到过 UDP 包，跳过降级", peerId, idleMs)
 				return
@@ -269,9 +266,8 @@ func (rm *RelayManager) SendViaRelay(data []byte) error {
 }
 
 // SendToPeer 按当前状态发送数据。
-//
 // ★ ConnP2P 分支加连续失败计数，连续 5 次失败才降级。
-// ★ Android 特有：e.udpConn 是 net.PacketConn，用 WriteTo 而非 WriteToUDP。
+// ★ Android 特有：udpConn 是 net.PacketConn，用 WriteTo。
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
 	state := rm.GetState(peerId)
 
@@ -288,7 +284,6 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 
 		sent := false
 
-		// LAN 优先
 		if target.UDPAddr != nil &&
 			!isPrivateIPv4(target.UDPAddr.IP) &&
 			len(target.LanEndpoints) > 0 {
@@ -304,7 +299,6 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 			}
 		}
 
-		// UDPAddr
 		if !sent && target.UDPAddr != nil {
 			if _, err := rm.edge.udpConn.WriteTo(data, target.UDPAddr); err == nil {
 				sent = true
@@ -320,7 +314,6 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 			return true
 		}
 
-		// ★ 失败：累积计数，连续 5 次才降级
 		rm.mu.Lock()
 		rm.failCounts[peerId]++
 		fc := rm.failCounts[peerId]
