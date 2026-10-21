@@ -1266,65 +1266,22 @@ func (e *Edge) peerExists(peerID string) bool {
 	return ok
 }
 
-func (e *Edge) reportMetadata() {
-	e.mu.Lock()
-	nm := e.natMeta
-	ws := e.ws
-	serverSeenIP := e.serverSeenIP
-	e.mu.Unlock()
-
-	if nm == nil {
-		nm = &NATMetadata{NATType: "unknown", Behavior: "BehaviorPortChanged"}
-	}
-
-	if serverSeenIP != "" && nm.PublicEndpoint != "" {
-		stunIP := extractIPFromEndpoint(nm.PublicEndpoint)
-		if stunIP != "" && stunIP != serverSeenIP {
-			nm.MultiExit = true
-			nm.NATType = "HardNAT"
-			nm.Behavior = "BehaviorPortChanged"
-		}
-	}
-
-	metaPayload := map[string]interface{}{
-		"name":               e.nodeName,
-		"natType":            nm.NATType,
-		"portsDifference":    nm.PortsDifference,
-		"regularPortsChange": nm.RegularPortsChange,
-		"behavior":           nm.Behavior,
-		"p2pEndpoint":        nm.P2PEndpoint,
-		"multiExit":          nm.MultiExit,
-		"features":           []string{"n2na", "n2nw"},
-	}
-	if nm.PublicEndpoint != "" {
-		metaPayload["publicEndpoint"] = nm.PublicEndpoint
-	}
-	if len(nm.AllEndpoints) > 0 {
-		metaPayload["assistedEndpoints"] = nm.AllEndpoints
-	}
-
-	vip := e.GetVirtualIP()
-	lanEndpoints := collectLANEndpoints(e.udpPort, vip)
-	if len(lanEndpoints) > 0 {
-		metaPayload["lanEndpoints"] = lanEndpoints
-	}
-
-	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%q multiExit=%v assisted=%d lan=%d features=[n2na,n2nw]",
-		nm.NATType, nm.PublicEndpoint, nm.MultiExit, len(nm.AllEndpoints), len(lanEndpoints))
-
-	if ws == nil {
-		return
-	}
-	_ = ws.Send(map[string]interface{}{"type": "p2p_metadata", "payload": metaPayload})
-}
-
-func jsonInt(v interface{}) int {
-	if f, ok := v.(float64); ok {
-		return int(f)
-	}
-	return 0
-}
-
+// ★ P0 修复（本次）：registerPeer 检测出口 IP 变化时无条件更新 UDPAddr
+//
+// 旧版问题：
+//   - peer 的 UDPAddr 初始是 LAN 地址（同 WiFi 场景）
+//   - 对端从 WiFi 切到移动数据，出口 IP 从 58.253.240.119 变成 120.230.253.3
+//   - registerPeer 收到新的 pubIP 更新了 PubIP，但 UDPAddr 没更新（因为 oldIsLAN=true）
+//   - UDPAddr 永远是旧 LAN → 写包到旧 LAN 是黑洞
+//   - 结果：sendICMPDirect / SendToPeer 都走黑洞 → 永远收不到对端 UDP
+//   - 面板显示 TURN-A，但对端显示 p2p-B（单向 P2P）
+//
+// 修复：检测出口 IP 变化（oldPubIP != newPubIP），此时无条件把 UDPAddr 切到新公网地址。
+//
+// 效果：
+//   - B 从 WiFi 切到移动数据 → A 的 UDPAddr 自动切到 120.230.253.3:xxx
+//   - A 能通过 UDP 直连到 B → 收到 PONG via UDP 直连 → MarkP2P
+//   - 双向都显示 p2p，面板一致，延迟更低
 func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	var udpAddr *net.UDPAddr
 	if pubIP != "" && pubPort > 0 {
@@ -1339,6 +1296,11 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string,
 	_, existed := e.peers[pid]
 	if existed {
 		p := e.peers[pid]
+
+		// ★ P0 修复：出口 IP 变化检测必须在更新 PubIP 之前
+		oldPubIP := p.PubIP
+		pubIpChanged := oldPubIP != "" && pubIP != "" && oldPubIP != pubIP
+
 		if vip != "" {
 			p.VirtualIP = vip
 		}
@@ -1351,8 +1313,13 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string,
 
 		if udpAddr != nil {
 			oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
-			if !oldIsLAN {
+			// ★ 出口 IP 变化时，无条件切到新公网地址（即使旧地址是 LAN）
+			if !oldIsLAN || pubIpChanged {
 				p.UDPAddr = udpAddr
+				if pubIpChanged {
+					log.Printf("[P2P] %s 出口 IP 变化 %s → %s，UDPAddr 切到新公网: %s",
+						pid, oldPubIP, pubIP, udpAddr)
+				}
 			}
 		}
 
@@ -1693,10 +1660,6 @@ func (e *Edge) tunReadLoop() {
 }
 
 // ★ P0 修复：selfIsOnTargetLAN 判断本机是否在 target 的 LAN 上
-//
-// 用于 sendICMPDirect / SendToPeer 的 LAN 分支，避免跨网络时写黑洞。
-//
-// 返回 true 的条件：target.LanEndpoints 中至少有一个地址与本机某个私网前缀匹配。
 func (e *Edge) selfIsOnTargetLAN(target *PeerInfo) bool {
 	if target == nil || len(target.LanEndpoints) == 0 {
 		return false
@@ -1720,15 +1683,6 @@ func (e *Edge) selfIsOnTargetLAN(target *PeerInfo) bool {
 }
 
 // ★ P0 修复：sendICMPDirect 的 LAN 分支加 selfIsOnTargetLAN 判断
-//
-// 旧版问题：WriteToUDP 返回 nil 只表示"写到本地 socket"，不表示"对方收到"。
-// 跨网络场景下，target.LanEndpoints 是旧 LAN 地址，写进去就是黑洞。
-//
-// 新版逻辑：
-//   1. 只有本机也在 target 的 LAN 上，才走 LAN 分支
-//   2. UDPAddr 如果是"当前不可达的私网"，也跳过
-//   3. TURN 兜底（必做，ICMP 走 TURN 比走黑洞好）
-//   4. WS 兜底（必做）
 func (e *Edge) sendICMPDirect(target *PeerInfo, pkt []byte) {
 	if target == nil {
 		return
@@ -1753,7 +1707,6 @@ func (e *Edge) sendICMPDirect(target *PeerInfo, pkt []byte) {
 	if target.UDPAddr != nil && e.udpConn != nil {
 		skip := false
 		if isPrivateIPv4(target.UDPAddr.IP) && !selfOnLAN {
-			// 私网 + 本机不在该 LAN → 黑洞，跳过
 			skip = true
 			log.Printf("[ICMP] %s UDPAddr=%s 是私网且本机不在该 LAN，跳过（避免黑洞）",
 				target.ClientID, target.UDPAddr)
