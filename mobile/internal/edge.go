@@ -1266,7 +1266,7 @@ func (e *Edge) peerExists(peerID string) bool {
 	return ok
 }
 
-// ★ P0 修复（本次）：registerPeer 检测出口 IP 变化时无条件更新 UDPAddr
+// ★ P0 修复：registerPeer 检测出口 IP 变化时无条件更新 UDPAddr
 //
 // 旧版问题：
 //   - peer 的 UDPAddr 初始是 LAN 地址（同 WiFi 场景）
@@ -1277,11 +1277,6 @@ func (e *Edge) peerExists(peerID string) bool {
 //   - 面板显示 TURN-A，但对端显示 p2p-B（单向 P2P）
 //
 // 修复：检测出口 IP 变化（oldPubIP != newPubIP），此时无条件把 UDPAddr 切到新公网地址。
-//
-// 效果：
-//   - B 从 WiFi 切到移动数据 → A 的 UDPAddr 自动切到 120.230.253.3:xxx
-//   - A 能通过 UDP 直连到 B → 收到 PONG via UDP 直连 → MarkP2P
-//   - 双向都显示 p2p，面板一致，延迟更低
 func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	var udpAddr *net.UDPAddr
 	if pubIP != "" && pubPort > 0 {
@@ -2037,4 +2032,65 @@ func (e *Edge) reportMetadataThrottled() {
 		return
 	}
 	e.reportMetadata()
+}
+
+// ★ 本轮补齐：reportMetadata 上报 p2p_metadata
+func (e *Edge) reportMetadata() {
+	e.mu.Lock()
+	nm := e.natMeta
+	ws := e.ws
+	serverSeenIP := e.serverSeenIP
+	e.mu.Unlock()
+
+	if nm == nil {
+		nm = &NATMetadata{NATType: "unknown", Behavior: "BehaviorPortChanged"}
+	}
+
+	if serverSeenIP != "" && nm.PublicEndpoint != "" {
+		stunIP := extractIPFromEndpoint(nm.PublicEndpoint)
+		if stunIP != "" && stunIP != serverSeenIP {
+			nm.MultiExit = true
+			nm.NATType = "HardNAT"
+			nm.Behavior = "BehaviorPortChanged"
+		}
+	}
+
+	metaPayload := map[string]interface{}{
+		"name":               e.nodeName,
+		"natType":            nm.NATType,
+		"portsDifference":    nm.PortsDifference,
+		"regularPortsChange": nm.RegularPortsChange,
+		"behavior":           nm.Behavior,
+		"p2pEndpoint":        nm.P2PEndpoint,
+		"multiExit":          nm.MultiExit,
+		"features":           []string{"n2na", "n2nw"},
+	}
+	if nm.PublicEndpoint != "" {
+		metaPayload["publicEndpoint"] = nm.PublicEndpoint
+	}
+	if len(nm.AllEndpoints) > 0 {
+		metaPayload["assistedEndpoints"] = nm.AllEndpoints
+	}
+
+	vip := e.GetVirtualIP()
+	lanEndpoints := collectLANEndpoints(e.udpPort, vip)
+	if len(lanEndpoints) > 0 {
+		metaPayload["lanEndpoints"] = lanEndpoints
+	}
+
+	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%q multiExit=%v assisted=%d lan=%d features=[n2na,n2nw]",
+		nm.NATType, nm.PublicEndpoint, nm.MultiExit, len(nm.AllEndpoints), len(lanEndpoints))
+
+	if ws == nil {
+		return
+	}
+	_ = ws.Send(map[string]interface{}{"type": "p2p_metadata", "payload": metaPayload})
+}
+
+// ★ 本轮补齐：jsonInt 把 JSON number 转 int
+func jsonInt(v interface{}) int {
+	if f, ok := v.(float64); ok {
+		return int(f)
+	}
+	return 0
 }
