@@ -23,12 +23,10 @@ object N2nController {
 
     @Volatile private var logPathApplied = false
 
-    // ★ Bug 6 修复：标记正在停止，让 handleStart 能等待
     @Volatile private var stopping = false
 
     fun isRunning(): Boolean = running.get()
 
-    // ★ Bug 6 修复：暴露给 N2nVpnService.handleStart 用
     fun isStopping(): Boolean = stopping
 
     fun applySystemTimezone() {
@@ -98,6 +96,14 @@ object N2nController {
                     }
                     if (!accepted) {
                         Log.w(TAG, "startAsync 完成时 running 已被置 false，回收 Client")
+                        // ★ P2 修复：明确告知 UI 启动被取消，避免 UI 误以为成功
+                        //
+                        // 触发条件：c.start() 成功后、执行到 synchronized 前，
+                        //          另一个线程调用了 stop()（running.set(false)）。
+                        // 旧行为：result 仍为 ""，UI 认为成功 → 状态显示"运行中"，
+                        //         但 isRunning() 返回 false → 状态每秒刷新回"未运行"。
+                        // 新行为：result = "cancelled" → 调用方走失败分支。
+                        result = "cancelled"
                         try {
                             c.stop()
                         } catch (t: Throwable) {
@@ -119,18 +125,6 @@ object N2nController {
         }.apply { name = "n2n-start" }.start()
     }
 
-    // ============================================================
-    // ★ Bug 6 修复：stop 加 stopping 标志
-    // ============================================================
-    //
-    // 旧版：running.set(false) 立即置 false，client.stop() 在另一个线程异步
-    //       执行。如果用户马上点"启动"，handleStart 看到 !isRunning 就直接
-    //       往下走，新 Edge 与旧 Edge 会短暂共存（旧 Edge 还在关 socket、
-    //       清理 TURN）。
-    //
-    // 新版：加 stopping 标志。handleStart 检查 isRunning || isStopping
-    //       双重条件，确保旧 Edge 完全清理完再启动新的。
-    //
     fun stop() {
         running.set(false)
 
@@ -141,7 +135,6 @@ object N2nController {
         }
 
         if (c == null) {
-            // 没有 client 需要停止，stopping 保持 false
             return
         }
 
