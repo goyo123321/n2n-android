@@ -68,24 +68,26 @@ func (e *Edge) peerAddrAndMode(peerID string) (*net.UDPAddr, bool) {
 
 // handleP2PFrame 收到 N2NS 帧时的入口。
 //
-// ★ 核心逻辑：
+// ★ 三端统一（本次修复）：PING/PONG 状态机对齐 PC/Termux。
 //
-//   - 收到 PING：
-//     - 本端非 P2P → 回一个 PONG（让对端升级）+ 本端也升 P2P
-//     - 本端已是 P2P → 不回（双向 PING 已保活，节省流量）
+// 旧 Android 行为：
+//   - 收到 PING → 回 PONG + 自己升 P2P
+//   - 后果：单向 P2P（A→B 通、B→A 断）时 B 误以为双向可达，
+//           向 A 发数据全部丢失，卡在 P2P 丢包，无法降级
 //
-//   - 收到 PONG：升 P2P（兼容旧版对端）
+// 新行为（对齐 PC/Termux）：
+//   - 收到 PING → 只更新 lastRecvAt（由调用方已完成），不升级、不回 PONG
+//   - 收到 PONG → 升级 P2P（证明双向可达）
+//   - 收到数据帧 → 升级 P2P（数据面已验证）
+//   - PONG 由 p2pStreams.handleFrame 统一回复（避免双 PONG）
 //
-//   - 收到数据帧（SYN/SYNACK/DATA/ACK/FIN/RST）：升 P2P
+// 单向 P2P 场景下，B 保持 ConnP2PAvailable，
+// 60s 后由 scheduleP2PAvailTimeout 触发 ForceFallback → 走 TURN/WS，
+// 比"卡在 P2P 丢包"可靠得多。
 //
 // ★ LAN 优先 + 30 秒窗口 + lastLANRecvAt > 0 检查
 //
-// ★★ 补丁 2（本次修复）：窗口从 300000（5 分钟）改成 30000（30 秒）。
-//
-//	旧版 5 分钟窗口意味着 WiFi 一断（信道切换、2.4G 干扰、路由器 buffering），
-//	LAN 侧只要连续 5 分钟没收到包就固化公网，导致 ping 从 5ms 跳 200ms，
-//	并且要等下一个 LAN 帧回来才能切回。
-//	30 秒窗口让 LAN 恢复后能快速切回，符合实际 WiFi 抖动场景。
+// ★★ 补丁 2：LAN→公网切换窗口 300000（5 分钟）→ 30000（30 秒）。
 func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) {
 	if e.p2pStreams == nil {
 		return
@@ -141,37 +143,19 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 		e.peersMu.Unlock()
 	}
 
-	// 状态处理
+	// ★ 状态处理：PING/PONG 逻辑对齐 PC/Termux
 	if e.relayMgr != nil {
 		switch f.Type {
 		case p2pTypePING:
-			curState := e.relayMgr.GetState(peerID)
-
-			if curState != ConnP2P {
-				// ★ 本端非 P2P → 回一个 PONG 让对端升级
-				log.Printf("[P2P] 收到 PING（当前 %s）→ 回 PONG + 升 P2P", curState)
-
-				// 先回 PONG（让对端也能升）
-				safeGo("p2p-pong-first", func() {
-					resp := &p2pFrame{Type: p2pTypePONG, StreamID: 0}
-					tmp := &P2PStream{
-						ID:       0,
-						PeerID:   peerID,
-						peerAddr: peerAddr,
-						viaTURN:  viaTURN,
-					}
-					_ = e.sendP2PFrame(tmp, resp)
-				})
-
-				// 本端也升 P2P（PING 到达本身就是证据）
-				e.relayMgr.MarkP2P(peerID)
-			} else {
-				// ★ 本端已是 P2P → 不回 PONG（双向 PING 已保活）
-				// 静默丢弃
-			}
+			// ★ 三端统一：收到 PING 只更新 lastRecvAt（上方已完成），
+			// 不升级 P2P、不回 PONG。PONG 由 p2pStreams.handleFrame 负责。
+			//
+			// 原因：PING 只证明"对方能发到我"，不证明"我能发到对方"。
+			// 只有收到 PONG（对方能收到我的 PING 并回复）才证明双向可达。
+			// 修复前 Android 收到 PING 就升级，导致单向 P2P 场景丢包。
 
 		case p2pTypePONG:
-			// 兼容旧版对端：收到 PONG 也升 P2P
+			// 兼容旧版对端：收到 PONG 升 P2P
 			if e.relayMgr.GetState(peerID) != ConnP2P {
 				log.Printf("[P2P] 收到 PONG → P2P 直连（双向通道已验证）")
 				e.relayMgr.MarkP2P(peerID)
