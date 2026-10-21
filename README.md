@@ -160,12 +160,15 @@ export ALL_PROXY=socks5://<手机IP>:1080
 - **LAN 直连** — 同 WiFi 自动内网直连，延迟 <10ms
 - **多目标打洞** — LAN + STUN 反射 + 观测 raddr 同时扫描，命中率大幅提升
 - **CGNAT hairpin** — 同 STUN 出口 IP 时首次允许尝试，失败后服务端强制降级
+- **单向 P2P 自动降级** — 只收到对端 PING 而收不到 PONG 时，60 秒后自动降级到 TURN/WS（见下方 FAQ）
 - **UDP 保活** — 每 5 秒无条件刷新 STUN 映射，防止 CGNAT 端口漂移
 - **P2P 通道保活** — 每 15 秒往对端发 N2NS PING 多目标探针
 - **空闲保活** — 每 2 秒刷新空闲 P2P 通道，**防止 WiFi 深度省电导致 ping 尖峰**
 - **TURN 中继** — 支持 Cloudflare TURN + 自建 coturn（UDP / TCP / RFC6062）
 - **WS 中继兜底** — TURN 不可用时自动降级到 Worker 转发
+- **WS 二进制传输** — 支持 N2NW（IPv4）和 N2NA（app_stream）二进制帧，比 base64 省 ~27% 带宽
 - **WS 应用层隧道** — 支持 PC / Termux 通过 WS 中继访问 Android 上的服务
+- **协议能力协商** — 上报 `features=["n2na","n2nw"]`，服务端自动协商帧格式，**混合房间零丢包**
 - **优选 IP** — 支持 Cloudflare 优选 IP，绕过 DNS 解析加速信令
 - **断线重连** — WebSocket 指数退避重连 + 90 秒读超时检测下行僵死
 - **深链支持** — `n2n://connect?url=...&token=...` 一键组网
@@ -413,12 +416,62 @@ App 节点列表和 Web 面板使用同一套徽章：
 | 目标版本 | Android 14（API 34） |
 | ABI | arm64-v8a / armeabi-v7a / x86_64 |
 | IPv6 | 部分支持（P2P 打洞暂只支持 IPv4） |
+| **与旧版客户端互通** | ✅ 完全兼容。新版上报 `features=["n2na","n2nw"]`，旧版为 `[]`，服务端自动协商帧格式 |
 
 ### 与其他 VPN 冲突
 
 同一台 Android 设备**同时只能启用一个 VpnService**。与 Clash / 其他 VPN 类 App 需二选一。
 
 **但 SOCKS5 入口可以与 Clash 共存**——只要端口不冲突。
+
+---
+
+## 🆕 版本行为变化说明
+
+### PING/PONG 状态机修复（单向 P2P 自动降级）
+
+**行为变化**：从最新版本起，**单向 P2P 场景（A→B 通，B→A 断）会自动降级到 TURN/WS，不再卡在 P2P 丢包**。
+
+**为什么改**：
+
+旧版 Android 收到对端的 PING 就升级 P2P，但 **PING 只证明"对方能发到我"，不证明"我能发到对方"**。单向 P2P 场景下：
+
+1. 本端误以为双向可达
+2. 向对端发数据全部丢失
+3. 因持续收到对端的 PING 而**永远不降级**
+
+**新行为**（与 PC / Termux 对齐）：
+
+- 收到 PING → **只更新活跃时间，不升级 P2P、不回 PONG**
+- 收到 PONG → 升级 P2P（证明双向可达）
+- 收到数据帧 → 升级 P2P（数据面已验证）
+- **单向 P2P 场景**：本端保持 `ConnP2PAvailable`，60 秒后 `scheduleP2PAvailTimeout` 触发 `ForceFallback` → TURN/WS
+
+**日志表现**：
+
+```
+[P2P] 收到 PONG → P2P 直连（双向通道已验证）    ← 正常双向 P2P
+[P2P] xxx P2PAvailable 超时 60s 未验证数据面，强制降级   ← 单向 P2P 降级
+```
+
+**用户影响**：单向 P2P 场景下延迟从"看起来很低但丢包"变成"稍高但可靠"。**整体体验更好**。
+
+### 协议能力协商（features）
+
+从最新版本起，客户端在 `p2p_metadata` 里上报 `features=["n2na","n2nw"]`。
+
+**服务端自动协商 WS 中继帧格式**：
+
+| 场景 | 服务端行为 |
+|:---|:---|
+| 新 Android ↔ 新 PC / 新 Termux | N2NA 二进制（省 ~27% 带宽） |
+| 新 Android ↔ 旧客户端 | 自动降级到文本 `app_stream_data` |
+
+**旧客户端完全兼容**，无需升级。
+
+### Client ID 兜底
+
+从最新版本起，即使通过 SDK / 命令行 / `adb shell am start` 传入空 `client_id`，也会自动兜底到持久化 ID，**避免 TUN IP 和 Go 层 VIP 不一致导致数据不通**。
 
 ---
 
@@ -578,6 +631,21 @@ curl -v --max-time 5 http://10.64.0.3:8080/
 
 **`p2p-avail`** = 打洞握手成功，但 PONG 或真实数据帧还没到。正常 1-2 秒内会升级到 `p2p`。**一直停在 `p2p-avail`** → 30 秒后自动降级。
 
+### Q: 单向 P2P 场景（A→B 通，B→A 断）会怎样？
+
+**从最新版本起：自动降级到 TURN/WS，不再卡在 P2P 丢包。**
+
+**原因**：旧版 Android 收到对端的 PING 就升级 P2P，但 PING 只证明"对方能发到我"，**不证明"我能发到对方"**。单向 P2P 场景下，本端误以为双向可达，向对端发数据全部丢失，且因持续收到对端的 PING 而永远不降级。
+
+**修复**：收到 PING 只更新活跃时间，**只有收到 PONG 或数据帧才升级 P2P**（与 PC / Termux 对齐）。单向 P2P 场景保持 `P2PAvailable`，60 秒后自动降级到 TURN/WS。
+
+**日志表现**：
+
+```
+[P2P] 收到 PONG → P2P 直连（双向通道已验证）    ← 正常
+[P2P] xxx P2PAvailable 超时 60s 未验证数据面，强制降级   ← 单向 P2P
+```
+
 ### Q: 同 WiFi 延迟波动很大（100ms+）？
 
 **已修复**。原因是两端同时向 LAN + 公网发包，导致对端 `peer.UDPAddr` 被公网地址覆盖，回程走 CGNAT 回环。
@@ -606,6 +674,27 @@ curl -v --max-time 5 http://10.64.0.3:8080/
 2. Worker 日志搜 `[NAT] pair-` —— 协调器是否派发了打洞指令
 3. 如果完全没有协调器日志 —— 客户端 `natType` 是 `unknown`，被 `classifyNat` 跳过
 
+### Q: 管理面板为什么显示 `无能力上报`？
+
+**旧客户端**（升级 features 之前的版本）不上报 `features` 字段。
+
+- **不影响功能**：服务端自动降级到文本 `app_stream_data`
+- **升级后消失**：升级到最新版本后，管理面板会显示 `n2na` / `n2nw` chips
+
+### Q: 混合房间（新旧客户端共存）会丢数据吗？
+
+**不会**。
+
+服务端按目标端 `features` 自动协商：
+
+| 发送方 | 接收方 | 数据面 |
+|:---|:---|:---|
+| 新 Android | 新 PC / 新 Termux | N2NA 二进制 |
+| 新 Android | 旧客户端 | 文本 `app_stream_data` |
+| 旧客户端 | 新 Android | 文本（新 Android 兼容） |
+
+**旧客户端完全无感知**，新客户端自动获得二进制优化。
+
 ### Q: 怎么看实时日志？
 
 **App 内**：菜单 → 日志
@@ -620,6 +709,34 @@ adb logcat -s N2nVpnService N2nController MainActivity
 
 ```bash
 adb pull /data/data/com.n2n.android/files/n2n.log
+```
+
+### Q: 通过 SDK / 命令行传入空 client_id 会怎样？
+
+**从最新版本起：自动兜底到持久化 ID，正常组网。**
+
+旧版问题：`FetchVIP` 和 `Start` 两次调用会各自生成随机 ID，导致 TUN 的 IP 和 Go 层 VIP 不一致，**连接建立但数据不通**。
+
+新版修复：`N2nVpnService.handleStart` 里 `clientId` 为空时调用 `Prefs.loadOrCreateClientId(this)` 兜底，与 UI 输入路径一致。
+
+**日志表现**：
+
+```
+[K] 参数读取完成 room=test cid=android-xxxx token=*** socks5=<disabled>
+```
+
+### Q: 快速点击启动/停止后 UI 状态错乱？
+
+**从最新版本起已修复**。
+
+**原因**：`c.start()` 成功后、`synchronized` 前，另一个线程调用 `stop()`，旧版 `result` 仍为空，UI 以为成功，但 `isRunning()` 返回 `false`。
+
+**修复**：`accepted=false` 时显式 `result = "cancelled"`，UI 走失败分支。
+
+**日志表现**：
+
+```
+[N2nController] startAsync 完成时 running 已被置 false，回收 Client
 ```
 
 ---
