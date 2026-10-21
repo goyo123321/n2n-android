@@ -898,7 +898,7 @@ func (s *P2PStream) close(reason string) {
 //
 // handleAppStreamBinary 是 WS 二进制的统一入口：
 //   1. 先判 N2NA（app_stream 二进制）→ 交给 handleN2NAFrame
-//   2. 再判 N2NW（IPv4 数据面）→ 提取 senderID 后送 onRemotePacket
+//   2. 再判 N2NW（IPv4 数据面）→ 提取 senderID 后送 TUN
 //   3. 其他 → 丢弃
 
 const (
@@ -927,7 +927,7 @@ func buildN2NWFrame(targetID string, payload []byte) []byte {
 
 // handleAppStreamBinary 处理服务端转发来的 WS 二进制帧。
 //
-// ★ 新增：先判 N2NA（app_stream 二进制），再判 N2NW（IPv4 数据面）。
+// ★ 先判 N2NA（app_stream 二进制），再判 N2NW（IPv4 数据面）。
 func (e *Edge) handleAppStreamBinary(data []byte) {
 	// ★ N2NA 分支（app_stream 二进制数据面）
 	if isN2NAFrame(data) {
@@ -964,8 +964,8 @@ func (e *Edge) handleAppStreamBinary(data []byte) {
 	// 更新发送方 peer 的活跃时间
 	//
 	// 用途：
-	//   - P2P 空闲检测（sendP2PKeepalive 里的 120s p2pIdleDeadMs）
-	//   - MarkFallback 的 3 秒保护（relay_fallback.go）
+	//   - P2P 空闲检测（sendP2PKeepalive 里的 30s p2pIdleDeadMs）   ← P3 修复：120s → 30s
+	//   - MarkFallback 的 10 秒保护（relay_fallback.go）              ← P3 修复：3 秒 → 10 秒
 	//   - 面板 lastSeen / idleFor
 	now := time.Now().UnixMilli()
 	e.peersMu.Lock()
