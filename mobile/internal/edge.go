@@ -33,6 +33,7 @@ type PeerInfo struct {
 	hasRealData       bool
 	AssistedEndpoints []string
 	LanEndpoints      []string
+	Features          []string   // ★ 新增：["n2na", "n2nw", ...]
 }
 
 type PeerSnapshot struct {
@@ -403,7 +404,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		p2pAvailTimers:    make(map[string]*time.Timer),
 		lastNoPeerLog:     make(map[string]int64),
 		tunStateLog:       make(map[string]ConnType),
-		p2pStatusReported: make(map[string]bool), // ★ Bug 2 修复
+		p2pStatusReported: make(map[string]bool),
 		tunWriteCh:        make(chan []byte, 4096),
 		doneCh:            make(chan struct{}),
 		natMeta: &NATMetadata{
@@ -439,7 +440,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		u, err := net.ListenUDP("udp", addr)
 		if err != nil {
 			_ = tun.Close()
-			return nil, fmt.Errorf("绑定 UDP 失败: %w", err)
+			return nil, fmt.Errorf("绑定 UDP 失败: %v", err)
 		}
 		udpConn = u
 		log.Printf("[P2P] 使用默认 UDP socket（无保护）")
@@ -523,6 +524,10 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 				e.handleAppStreamBinary(data)
 				return
 			}
+			if len(data) >= 4 && string(data[:4]) == "N2NA" {
+				e.handleAppStreamBinary(data)
+				return
+			}
 			e.onRemotePacket(data)
 		},
 	)
@@ -541,7 +546,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	}
 
 	// ============================================================
-	// ★ nat-probe：STUN 探测完成后合并端点（Bug 1 修复）
+	// nat-probe：STUN 探测完成后合并端点（Bug 1 修复）
 	// ============================================================
 	safeGo("nat-probe", func() {
 		log.Printf("[NAT] 开始异步 STUN 探测...")
@@ -975,6 +980,15 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 						}
 					}
 				}
+				// ★ 新增：解析 features
+				var features []string
+				if raw, ok := pm["features"].([]interface{}); ok {
+					for _, v := range raw {
+						if s, ok := v.(string); ok && s != "" {
+							features = append(features, s)
+						}
+					}
+				}
 
 				if pid == "" || pip == "" {
 					continue
@@ -983,15 +997,18 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 				e.maybeResetFailCountForPeer(pid, pubIP, pubPort)
 
 				e.registerPeer(pid, pip, pubIP, pubPort, natType, assisted, lanEndpoints)
-				if relayAddr != "" {
-					e.peersMu.Lock()
-					if pi, ok := e.peers[pid]; ok {
+				e.peersMu.Lock()
+				if pi, ok := e.peers[pid]; ok {
+					if relayAddr != "" {
 						pi.TurnRelayAddr = relayAddr
 					}
-					e.peersMu.Unlock()
+					if len(features) > 0 {
+						pi.Features = features   // ★ 新增
+					}
 				}
-				log.Printf("[信令] 已有节点: %s vip=%s pub=%s:%d nat=%s assisted=%d lan=%d",
-					pid, pip, pubIP, pubPort, natType, len(assisted), len(lanEndpoints))
+				e.peersMu.Unlock()
+				log.Printf("[信令] 已有节点: %s vip=%s pub=%s:%d nat=%s assisted=%d lan=%d features=%v",
+					pid, pip, pubIP, pubPort, natType, len(assisted), len(lanEndpoints), features)
 			}
 		}
 
@@ -1022,21 +1039,33 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 				}
 			}
 		}
+		// ★ 新增：解析 features
+		var features []string
+		if raw, ok := payload["features"].([]interface{}); ok {
+			for _, v := range raw {
+				if s, ok := v.(string); ok && s != "" {
+					features = append(features, s)
+				}
+			}
+		}
 
-		log.Printf("[信令] joined: from=%s vip=%s pub=%s:%d nat=%s assisted=%d lan=%d",
-			from, pip, pubIP, pubPort, natType, len(assisted), len(lanEndpoints))
+		log.Printf("[信令] joined: from=%s vip=%s pub=%s:%d nat=%s assisted=%d lan=%d features=%v",
+			from, pip, pubIP, pubPort, natType, len(assisted), len(lanEndpoints), features)
 
 		if from != "" && pip != "" {
 			e.maybeResetFailCountForPeer(from, pubIP, pubPort)
 
 			e.registerPeer(from, pip, pubIP, pubPort, natType, assisted, lanEndpoints)
-			if relayAddr != "" {
-				e.peersMu.Lock()
-				if pi, ok := e.peers[from]; ok {
+			e.peersMu.Lock()
+			if pi, ok := e.peers[from]; ok {
+				if relayAddr != "" {
 					pi.TurnRelayAddr = relayAddr
 				}
-				e.peersMu.Unlock()
+				if len(features) > 0 {
+					pi.Features = features   // ★ 新增
+				}
 			}
+			e.peersMu.Unlock()
 
 			// ★ P0-2 预连接：立即发一次 PING 试探
 			if e.p2pStreams != nil && e.relayMgr != nil {
@@ -1112,7 +1141,19 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			log.Printf("[TURN] 记录 %s 的中继地址: %s", edgeMac, relayAddr)
 		}
 
+	case "app_stream_open":
+		safeGo("app-stream-open", func() { e.onRemoteStreamOpen(msg) })
+	case "app_stream_open_ack":
+		e.onRemoteStreamAck(msg)
+	case "app_stream_data":
+		e.onRemoteStreamData(msg)
+	case "app_stream_close":
+		e.onRemoteStreamClose(msg)
+
 	case "pong":
+		return
+
+	case "connection_status":
 		return
 
 	case "left":
@@ -1126,7 +1167,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		}
 		e.cancelP2PAvailTimeout(from)
 
-		// ★ Bug 2 修复：清理去重标记（允许下次重新上报）
 		e.p2pStatusReportedMu.Lock()
 		delete(e.p2pStatusReported, from)
 		e.p2pStatusReportedMu.Unlock()
@@ -1148,9 +1188,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		if e.p2pStreams != nil {
 			e.p2pStreams.dropPeer(from)
 		}
-
-	case "connection_status":
-		return
 	}
 }
 
@@ -1240,6 +1277,11 @@ func (e *Edge) peerExists(peerID string) bool {
 	return ok
 }
 
+// reportMetadata 上报 p2p_metadata。
+//
+// ★ 新增：上报 features = ["n2na", "n2nw"]，让服务端在 WS 中继时
+//   知道本端支持 N2NA（app_stream 二进制）和 N2NW（IPv4 二进制）。
+//   服务端按目标端 features 决定发二进制还是降级文本。
 func (e *Edge) reportMetadata() {
 	e.mu.Lock()
 	nm := e.natMeta
@@ -1268,6 +1310,7 @@ func (e *Edge) reportMetadata() {
 		"behavior":           nm.Behavior,
 		"p2pEndpoint":        nm.P2PEndpoint,
 		"multiExit":          nm.MultiExit,
+		"features":           []string{"n2na", "n2nw"},   // ★ 新增
 	}
 	if nm.PublicEndpoint != "" {
 		metaPayload["publicEndpoint"] = nm.PublicEndpoint
@@ -1282,7 +1325,7 @@ func (e *Edge) reportMetadata() {
 		metaPayload["lanEndpoints"] = lanEndpoints
 	}
 
-	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%q multiExit=%v assisted=%d lan=%d",
+	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%q multiExit=%v assisted=%d lan=%d features=[n2na,n2nw]",
 		nm.NATType, nm.PublicEndpoint, nm.MultiExit, len(nm.AllEndpoints), len(lanEndpoints))
 
 	if ws == nil {
@@ -1362,6 +1405,7 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string,
 			NATType:           natType,
 			AssistedEndpoints: assisted,
 			LanEndpoints:      sortedLAN,
+			// Features 由调用方在 registerPeer 之后直接设置
 		}
 	}
 	e.peersMu.Unlock()
@@ -1462,14 +1506,11 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 // reportP2PStatus 上报 P2P 状态。
 //
 // ★ Bug 2 修复：同一 peer 只上报一次（避免并行打洞导致重复）。
-//   - 首次调用：发消息 + 标记 reported
-//   - 后续调用：跳过（除非 left 后重新清理）
 func (e *Edge) reportP2PStatus(peerID string, status int) {
 	if e.ws == nil || peerID == "" {
 		return
 	}
 
-	// ★ 去重：同一 peer 只上报一次
 	e.p2pStatusReportedMu.Lock()
 	if e.p2pStatusReported[peerID] {
 		e.p2pStatusReportedMu.Unlock()
