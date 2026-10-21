@@ -34,6 +34,7 @@ type PeerInfo struct {
 	AssistedEndpoints []string
 	LanEndpoints      []string
 	Features          []string
+	registeredAt      int64 // ★ 新增：peer 首次注册时间，用于 lastLANRecvAt 兜底
 }
 
 type PeerSnapshot struct {
@@ -1266,17 +1267,21 @@ func (e *Edge) peerExists(peerID string) bool {
 	return ok
 }
 
-// ★ P0 修复：registerPeer 检测出口 IP 变化时无条件更新 UDPAddr
+// ============================================================
+// ★ P0 修复：registerPeer 处理三种 UDPAddr 切换场景
 //
-// 旧版问题：
-//   - peer 的 UDPAddr 初始是 LAN 地址（同 WiFi 场景）
-//   - 对端从 WiFi 切到移动数据，出口 IP 从 58.253.240.119 变成 120.230.253.3
-//   - registerPeer 收到新的 pubIP 更新了 PubIP，但 UDPAddr 没更新（因为 oldIsLAN=true）
-//   - UDPAddr 永远是旧 LAN → 写包到旧 LAN 是黑洞
-//   - 结果：sendICMPDirect / SendToPeer 都走黑洞 → 永远收不到对端 UDP
-//   - 面板显示 TURN-A，但对端显示 p2p-B（单向 P2P）
+// 场景 1（pubIpChanged）：对端从 WiFi 切到移动数据（或反之）
+//   - oldPubIP != "" && newPubIP != "" && oldPubIP != newPubIP
+//   - 无条件把 UDPAddr 切到新公网
 //
-// 修复：检测出口 IP 变化（oldPubIP != newPubIP），此时无条件把 UDPAddr 切到新公网地址。
+// 场景 2（pubIpFirstSet）：对端首次上报公网地址（重启后）
+//   - oldPubIP == "" && newPubIP != ""
+//   - 如果本机不在对端的 LAN 上（例如本机在移动数据），切到公网
+//   - 如果本机在对端的 LAN 上，保留 LAN（LAN 更快）
+//
+// 场景 3（正常更新）：无 IP 变化
+//   - 保留原有逻辑（oldIsLAN 判断）
+// ============================================================
 func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	var udpAddr *net.UDPAddr
 	if pubIP != "" && pubPort > 0 {
@@ -1292,9 +1297,39 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string,
 	if existed {
 		p := e.peers[pid]
 
-		// ★ P0 修复：出口 IP 变化检测必须在更新 PubIP 之前
+		// ★ P0 修复：三种场景检测必须在更新 PubIP 之前
 		oldPubIP := p.PubIP
 		pubIpChanged := oldPubIP != "" && pubIP != "" && oldPubIP != pubIP
+		pubIpFirstSet := oldPubIP == "" && pubIP != ""
+
+		// 场景 2：首次有公网，判断本机是否在 target 的 LAN 上
+		needSwitchToPublic := pubIpChanged
+		if pubIpFirstSet && udpAddr != nil {
+			selfOnLAN := false
+			for _, lan := range sortedLAN {
+				ra, err := net.ResolveUDPAddr("udp", lan)
+				if err != nil || ra == nil || ra.IP == nil {
+					continue
+				}
+				for _, pfx := range prefixes {
+					if pfx.Contains(ra.IP) {
+						selfOnLAN = true
+						break
+					}
+				}
+				if selfOnLAN {
+					break
+				}
+			}
+			if !selfOnLAN {
+				needSwitchToPublic = true
+				log.Printf("[P2P] %s 首次有公网 (pub=%s)，本机不在其 LAN，UDPAddr 切到公网",
+					pid, pubIP)
+			} else {
+				log.Printf("[P2P] %s 首次有公网 (pub=%s)，但本机在其 LAN 上，保留 LAN",
+					pid, pubIP)
+			}
+		}
 
 		if vip != "" {
 			p.VirtualIP = vip
@@ -1308,8 +1343,8 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string,
 
 		if udpAddr != nil {
 			oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
-			// ★ 出口 IP 变化时，无条件切到新公网地址（即使旧地址是 LAN）
-			if !oldIsLAN || pubIpChanged {
+			// ★ 场景 1/2 触发时，无条件切到新公网
+			if !oldIsLAN || needSwitchToPublic {
 				p.UDPAddr = udpAddr
 				if pubIpChanged {
 					log.Printf("[P2P] %s 出口 IP 变化 %s → %s，UDPAddr 切到新公网: %s",
@@ -1351,6 +1386,7 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string,
 			NATType:           natType,
 			AssistedEndpoints: assisted,
 			LanEndpoints:      sortedLAN,
+			registeredAt:      time.Now().UnixMilli(), // ★ 新增
 		}
 	}
 	e.peersMu.Unlock()
@@ -1401,6 +1437,7 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 			VirtualIP:    instr.TargetVirtualIp,
 			UDPAddr:      initialUDP,
 			LanEndpoints: instr.TargetLanEndpoints,
+			registeredAt: time.Now().UnixMilli(),
 		}
 	}
 }
@@ -1598,11 +1635,16 @@ func (e *Edge) tunReadLoop() {
 			continue
 		}
 
+		// ★ P1 修复：ICMP 日志用实际 relayMgr 状态，不硬编码 ConnP2P
 		if proto == 1 {
 			e.sendICMPDirect(target, buf[:n])
 			atomic.StoreInt64(&e.lastDataFrameAt, time.Now().UnixMilli())
 			if n >= 10 {
-				e.logTunForward(target.ClientID, dstIP, n, proto, true, ConnP2P)
+				actualState := ConnUnknown
+				if e.relayMgr != nil {
+					actualState = e.relayMgr.GetState(target.ClientID)
+				}
+				e.logTunForward(target.ClientID, dstIP, n, proto, true, actualState)
 			}
 			continue
 		}
@@ -1861,9 +1903,15 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 	} else if !oldIsLAN && newIsLAN {
 		shouldUpdate = true
 	} else if oldIsLAN && !newIsLAN {
-		if best.lastLANRecvAt > 0 && now-best.lastLANRecvAt > 30000 {
+		// ★ P0 修复：lastLANRecvAt 为 0 时用 registeredAt 兜底
+		lastLAN := best.lastLANRecvAt
+		if lastLAN == 0 {
+			lastLAN = best.registeredAt
+		}
+		if lastLAN > 0 && now-lastLAN > 30000 {
 			shouldUpdate = true
-			log.Printf("[P2P] %s (note) LAN 超过 30s 无流量，改用公网地址", best.ClientID)
+			log.Printf("[P2P] %s (note) LAN 无流量（lastLAN=%ds 前），改用公网地址",
+				best.ClientID, (now-lastLAN)/1000)
 		}
 	} else {
 		if best.UDPAddr.Port != addrPort {
@@ -2034,7 +2082,7 @@ func (e *Edge) reportMetadataThrottled() {
 	e.reportMetadata()
 }
 
-// ★ 本轮补齐：reportMetadata 上报 p2p_metadata
+// ★ 上报 p2p_metadata
 func (e *Edge) reportMetadata() {
 	e.mu.Lock()
 	nm := e.natMeta
@@ -2087,7 +2135,7 @@ func (e *Edge) reportMetadata() {
 	_ = ws.Send(map[string]interface{}{"type": "p2p_metadata", "payload": metaPayload})
 }
 
-// ★ 本轮补齐：jsonInt 把 JSON number 转 int
+// ★ jsonInt 把 JSON number 转 int
 func jsonInt(v interface{}) int {
 	if f, ok := v.(float64); ok {
 		return int(f)
