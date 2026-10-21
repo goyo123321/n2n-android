@@ -237,16 +237,6 @@ class N2nVpnService : VpnService() {
             return
         }
 
-        // ============================================================
-        // ★ Bug 6 修复：同时检查 isRunning 和 isStopping
-        // ============================================================
-        //
-        // 旧版：只检查 isRunning()。N2nController.stop() 会立即把 running 置
-        //       false，然后异步关 socket。这期间用户点"启动"，handleStart 看到
-        //       !isRunning 就直接往下走，新 Edge 与旧 Edge 短暂共存。
-        //
-        // 新版：同时检查 isStopping()，等旧 Edge 完全清理完再启动。
-        //
         if (N2nController.isRunning() || N2nController.isStopping()) {
             ktLog("handleStart: Controller running=${N2nController.isRunning()} stopping=${N2nController.isStopping()}，异步等待 500ms 后重试")
             if (N2nController.isRunning()) {
@@ -284,12 +274,21 @@ class N2nVpnService : VpnService() {
         }
         val preferredIp = intent.getStringExtra(EXTRA_PREFERRED_IP) ?: ""
         val roomId = intent.getStringExtra(EXTRA_ROOM_ID) ?: "default-room"
-        val clientId = intent.getStringExtra(EXTRA_CLIENT_ID) ?: ""
+
+        // ★ P2 修复：clientId 为空/缺失时兜底到持久化 ID
+        //
+        // 问题：若通过 SDK / 命令行 / adb shell am start 传入空 clientId，
+        //       FetchVIP 和 Start 两次调用会各自生成随机 ID，
+        //       导致 TUN 的 IP 和 Go 层 VIP 不一致 → 连接建立但数据不通。
+        // 修复：与 MainActivity.saveCurrentInput 的兜底逻辑保持一致。
+        val clientId = (intent.getStringExtra(EXTRA_CLIENT_ID)?.takeIf { it.isNotBlank() })
+            ?: Prefs.loadOrCreateClientId(this)
+
         val nodeName = intent.getStringExtra(EXTRA_NODE_NAME) ?: "Android"
         val connectToken = intent.getStringExtra(EXTRA_CONNECT_TOKEN) ?: ""
         val socks5Listen = intent.getStringExtra(EXTRA_SOCKS5_LISTEN) ?: ""
 
-        ktLog("参数读取完成 room=$roomId token=${if (connectToken.isEmpty()) "<empty>" else "***"} socks5=${if (socks5Listen.isEmpty()) "<disabled>" else socks5Listen}")
+        ktLog("参数读取完成 room=$roomId cid=$clientId token=${if (connectToken.isEmpty()) "<empty>" else "***"} socks5=${if (socks5Listen.isEmpty()) "<disabled>" else socks5Listen}")
 
         try {
             updateNotification("正在获取虚拟 IP...")
@@ -586,18 +585,8 @@ class N2nVpnService : VpnService() {
     }
 
     // ============================================================
-    // ★ WiFi 锁：Android 10+ 用 LOW_LATENCY 模式
+    // WiFi 锁：Android 10+ 用 LOW_LATENCY 模式
     // ============================================================
-    //
-    // 问题：
-    //   Android 10（API 29）起，WIFI_MODE_FULL_HIGH_PERF 被系统静默降级。
-    //   息屏后 WiFi 芯片进入 PS-Poll 省电模式，每 100ms 才唤醒一次，
-    //   导致下行包被 AP 缓存 100ms 才送达 → n2n ping 出现 200-500ms 尖峰。
-    //
-    // 修复：
-    //   Android 10+ 用 WIFI_MODE_FULL_LOW_LATENCY（视频通话/游戏级别，
-    //   息屏后仍保持低延迟）。API < 29 保持用 WIFI_MODE_FULL_HIGH_PERF。
-    //
     private fun acquireLocks() {
         // CPU 唤醒锁（保持 CPU 运行）
         try {
