@@ -95,14 +95,7 @@ func extractPortFromEndpoint(ep string) int {
 	return port
 }
 
-func lastIndexByte(s string, c byte) int {
-	for i := len(s) - 1; i >= 0; i-- {
-		if s[i] == c {
-			return i
-		}
-	}
-	return -1
-}
+// 注意：lastIndexByte 定义在 edge.go 里，本文件直接调用即可。
 
 func (e *Edge) startFailCountResetLoop() {
 	safeGo("fail-count-reset", func() {
@@ -233,7 +226,7 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		return nil
 	}
 
-	// ★ P0-1：去重 key 用 target@rung，允许同一 target 的多个 rung 并行
+	// ★ P0-1 打洞并行化：去重 key 用 target@rung，允许同一 target 的多个 rung 并行
 	activeKey := fmt.Sprintf("%s@%d", instr.TargetMac, instr.BehaviorIndex)
 	if natHoleActive[activeKey] {
 		natHoleActiveMu.Unlock()
@@ -456,6 +449,10 @@ func (e *Edge) resetFailCount(peerID string) {
 	natHoleActiveMu.Unlock()
 }
 
+// recordP2PSuccess 打洞成功时更新 peer 地址。
+//
+// ★ LAN 优先保护
+// ★ LAN→公网切换窗口 30s（旧版 5 分钟太激进）
 func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAddr) {
 	e.peersMu.Lock()
 	if p, ok := e.peers[instr.TargetMac]; ok {
@@ -558,4 +555,36 @@ func (e *Edge) resolveTarget(instr *NatHoleInstruction) *net.UDPAddr {
 		}
 	}
 	return parseSockAddr(sock)
+}
+
+func (e *Edge) hasTrafficFromTarget(peerID string, since int64) bool {
+	if peerID == "" {
+		return false
+	}
+	e.peersMu.RLock()
+	defer e.peersMu.RUnlock()
+	p := e.peers[peerID]
+	if p == nil || p.UDPAddr == nil {
+		return false
+	}
+	return p.lastRecvAt >= since
+}
+
+func (e *Edge) hasTrafficFromAny(ips []net.IP, since int64) bool {
+	if len(ips) == 0 {
+		return false
+	}
+	e.peersMu.RLock()
+	defer e.peersMu.RUnlock()
+	for _, p := range e.peers {
+		if p.UDPAddr == nil || p.lastRecvAt < since {
+			continue
+		}
+		for _, ip := range ips {
+			if p.UDPAddr.IP.Equal(ip) {
+				return true
+			}
+		}
+	}
+	return false
 }
