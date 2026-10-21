@@ -88,6 +88,9 @@ type Edge struct {
 
 	lastMetadataReportAt int64
 
+	// ★ P0-3：最近一次真实数据帧发送时间（用于自适应保活）
+	lastDataFrameAt int64
+
 	doneCh  chan struct{}
 	closeMu sync.Mutex
 	closed  bool
@@ -164,6 +167,7 @@ func buildSTUNBindingRequest() []byte {
 	return buf
 }
 
+// ★ P0-3 自适应保活：最近 10s 有真实数据帧 → 跳过 STUN
 func (e *Edge) startKeepalive() {
 	if e.udpConn == nil {
 		return
@@ -180,11 +184,16 @@ func (e *Edge) startKeepalive() {
 		return
 	}
 
-	log.Printf("[Keepalive] 启动，每 %v 刷新 %d 个 STUN 服务器（无条件，保 CGNAT 映射）",
+	log.Printf("[Keepalive] 启动，每 %v 刷新 %d 个 STUN 服务器（自适应：有数据时跳过）",
 		keepaliveInterval, len(addrs))
 
 	safeGo("keepalive", func() {
 		sendOnce := func() {
+			// ★ 自适应：10s 内有数据帧 → 跳过（真实数据天然刷新映射）
+			last := atomic.LoadInt64(&e.lastDataFrameAt)
+			if last > 0 && time.Now().UnixMilli()-last < 10000 {
+				return
+			}
 			for _, addr := range addrs {
 				probe := buildSTUNBindingRequest()
 				_, _ = e.udpConn.WriteTo(probe, addr)
@@ -209,7 +218,6 @@ func (e *Edge) startKeepalive() {
 
 // ============ P2P 通道保活 + 活性检测 ============
 
-// ★ 修复：15s → 10s，120000 → 30000
 const p2pKeepaliveInterval = 10 * time.Second
 const p2pIdleDeadMs = 30000
 
@@ -249,7 +257,6 @@ func (e *Edge) sendP2PKeepalive() {
 
 		if st == ConnP2P || st == ConnP2PAvailable {
 			idleMs := now - p.lastRecvAt
-			// ★ 120s → 30s
 			if p.lastRecvAt > 0 && idleMs > p2pIdleDeadMs {
 				deadPeers = append(deadPeers, id)
 				continue
@@ -261,7 +268,6 @@ func (e *Edge) sendP2PKeepalive() {
 	e.peersMu.RUnlock()
 
 	for _, id := range deadPeers {
-		// ★ 日志用常量，文案自动匹配（30s）
 		log.Printf("[P2P] %s %ds 无任何流量，判定 P2P 失效，强制降级",
 			id, p2pIdleDeadMs/1000)
 		e.relayMgr.ForceFallback(id, "no-traffic-30s")
@@ -508,12 +514,12 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 	ws.SetHandlers(
 		e.handleSignaling,
 		func(data []byte) {
-			// ★ 拦截 AppStream 二进制包 (N2NW)
+			// N2NW 二进制帧拦截
 			if len(data) >= 4 && string(data[:4]) == "N2NW" {
 				e.handleAppStreamBinary(data)
 				return
 			}
-			// 原有的裸 IPv4 包处理
+			// 裸 IPv4 包
 			e.onRemotePacket(data)
 		},
 	)
@@ -798,7 +804,6 @@ func (e *Edge) cancelFallbackTimer(peerID string) {
 	}
 }
 
-// ★ 修复：30s → 60s（给 TCP 更多验证时间）
 func (e *Edge) scheduleP2PAvailTimeout(peerID string) {
 	if e.relayMgr == nil || peerID == "" {
 		return
@@ -1007,6 +1012,18 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 					pi.TurnRelayAddr = relayAddr
 				}
 				e.peersMu.Unlock()
+			}
+
+			// ★ P0-2 预连接：立即发一次 PING 试探（不等打洞指令）
+			if e.p2pStreams != nil && e.relayMgr != nil {
+				if e.relayMgr.GetState(from) != ConnP2P {
+					targetID := from
+					safeGo("p2p-preconnect", func() {
+						time.Sleep(200 * time.Millisecond)
+						e.p2pStreams.sendP2PProbe(targetID)
+						log.Printf("[P2P] 预连接试探 → %s", targetID)
+					})
+				}
 			}
 		}
 
@@ -1293,7 +1310,6 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string,
 			p.LanEndpoints = sortedLAN
 		}
 	} else {
-		// ★ 新建 peer 时优先用 LAN 初始化 UDPAddr
 		var initialUDP *net.UDPAddr
 		if len(sortedLAN) > 0 {
 			for _, lan := range sortedLAN {
@@ -1502,8 +1518,8 @@ func (e *Edge) udpReadLoop() {
 
 // tunReadLoop 从 TUN 读出 IPv4 包，按 peer 状态选择 P2P / TURN / WS 中继发送。
 //
-// ★ 修复：ICMP 分支绕过状态机（LAN → UDPAddr → TURN → WS）。
-//         其他协议（TCP/UDP）走 relayMgr 状态机（已加连续失败计数）。
+// ★ ICMP 分支绕过状态机（LAN → UDPAddr → TURN → WS）。
+// ★ P0-3：发送数据后更新 lastDataFrameAt。
 func (e *Edge) tunReadLoop() {
 	buf := make([]byte, 65535)
 	for {
@@ -1548,7 +1564,7 @@ func (e *Edge) tunReadLoop() {
 			proto = int(buf[9])
 		}
 
-		// ★ 无目标：仍发裸 IPv4，服务端按 dstIP 查表
+		// 无目标：仍发裸 IPv4
 		if target == nil {
 			if proto == 17 && n < 200 {
 				if e.ws != nil {
@@ -1560,9 +1576,11 @@ func (e *Edge) tunReadLoop() {
 			continue
 		}
 
-		// ★★ ICMP 特殊处理：绕过状态机，优先 LAN
+		// ICMP 特殊处理：绕过状态机
 		if proto == 1 {
 			e.sendICMPDirect(target, buf[:n])
+			// ★ P0-3：ICMP 也算数据帧
+			atomic.StoreInt64(&e.lastDataFrameAt, time.Now().UnixMilli())
 			if n >= 10 {
 				e.logTunForward(target.ClientID, dstIP, n, proto, true, ConnP2P)
 			}
@@ -1588,6 +1606,9 @@ func (e *Edge) tunReadLoop() {
 					sent = e.relayMgr.SendToPeer(targetID, pktCopy, targetCopy)
 				}
 				e.logTunForward(targetID, dstIP, pktLen, proto, sent, ConnTURN)
+				if sent {
+					atomic.StoreInt64(&e.lastDataFrameAt, time.Now().UnixMilli())
+				}
 				if !sent && e.ws != nil {
 					frame := buildN2NWFrame(targetID, pktCopy)
 					_ = e.ws.SendBinary(frame)
@@ -1600,6 +1621,9 @@ func (e *Edge) tunReadLoop() {
 		if e.relayMgr != nil {
 			sent = e.relayMgr.SendToPeer(target.ClientID, buf[:n], target)
 		}
+		if sent {
+			atomic.StoreInt64(&e.lastDataFrameAt, time.Now().UnixMilli())
+		}
 		if n >= 10 {
 			e.logTunForward(target.ClientID, dstIP, n, proto, sent, state)
 		}
@@ -1611,21 +1635,13 @@ func (e *Edge) tunReadLoop() {
 }
 
 // sendICMPDirect 是 ICMP 专用的发送路径，绕过 relayMgr 状态机。
-//
 // 顺序：LAN → UDPAddr → TURN → WS
-// 效果：
-//   - LAN 通：稳定 6-10ms（不受 P2P/TURN 状态切换影响）
-//   - LAN 单向不通：60-90ms（公网 hairpin）
-//   - TURN 兜底：100-180ms（稳定，不跳）
-//   - WS 兜底：100-300ms（最后底线）
-//
-// ★ Android 特有：e.udpConn 是 net.PacketConn，用 WriteTo 而非 WriteToUDP。
 func (e *Edge) sendICMPDirect(target *PeerInfo, pkt []byte) {
 	if target == nil {
 		return
 	}
 
-	// 1. LAN 优先（核心修复）
+	// 1. LAN 优先
 	if len(target.LanEndpoints) > 0 && e.udpConn != nil {
 		for _, lan := range target.LanEndpoints {
 			ra, err := net.ResolveUDPAddr("udp", lan)
@@ -1638,7 +1654,7 @@ func (e *Edge) sendICMPDirect(target *PeerInfo, pkt []byte) {
 		}
 	}
 
-	// 2. UDPAddr（可能是 LAN，也可能是公网）
+	// 2. UDPAddr
 	if target.UDPAddr != nil && e.udpConn != nil {
 		if _, err := e.udpConn.WriteTo(pkt, target.UDPAddr); err == nil {
 			return
@@ -1655,7 +1671,7 @@ func (e *Edge) sendICMPDirect(target *PeerInfo, pkt []byte) {
 		}
 	}
 
-	// 4. WS 中继（最后兜底）
+	// 4. WS 中继
 	if e.ws != nil {
 		frame := buildN2NWFrame(target.ClientID, pkt)
 		_ = e.ws.SendBinary(frame)
@@ -1696,7 +1712,7 @@ func (e *Edge) onRemotePacket(data []byte) {
 	e.enqueueTUN(data)
 }
 
-// ============ peer 探测处理（score 制） ============
+// ============ peer 探测处理 ============
 
 func (e *Edge) notePeerProbe(addr *net.UDPAddr) {
 	e.notePeerCommon(addr, false, false, false)
