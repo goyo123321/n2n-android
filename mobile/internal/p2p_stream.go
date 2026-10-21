@@ -304,6 +304,13 @@ func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 	return out
 }
 
+// sendP2PFrame 发送一帧到对端的所有候选地址。
+//
+// ★ 修复 1：LAN 优先（窗口 30s）。
+// ★ 修复 2：控制帧全发（保 CGNAT 映射 + 探测 LAN 恢复）。
+// ★ 修复 3：TURN 模式下控制帧也尝试直连。
+//
+// ★ Android 特有：e.udpConn 是 net.PacketConn，用 WriteTo。
 func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	s.mu.Lock()
 	viaTURN := s.viaTURN
@@ -883,24 +890,16 @@ func (s *P2PStream) close(reason string) {
 	log.Printf("[P2P-STREAM] %d 关闭 (%s)", s.ID, reason)
 }
 
-// ============ N2NW 二进制帧（WS 中继数据面） ============
+// ============ N2NW / N2NA 二进制帧（WS 中继数据面） ============
 //
-// 与文本 app_stream_* 协议并存：
-//   - app_stream_*（base64 文本）→ 应用层 TCP 隧道
-//   - N2NW（二进制）             → IPv4 数据面
+// 两套二进制协议：
+//   - N2NW（flags=0）：IPv4 数据面，服务端按目标 peer 直接转发裸 IPv4 包
+//   - N2NA：app_stream 数据面，服务端按 streamId 转发 TCP 字节流
 //
-// 帧格式：
-//   magic(4B)     = "N2NW"
-//   flags(1B)     = 保留位，当前固定 0（payload = 裸 IPv4）
-//   peerIdLen(1B) = peerId 字节长度
-//   peerId(N)     = 客户端→服务端时填目标 clientId；
-//                   服务端→客户端时被重写为发送方 clientId
-//   payload       = 裸 IPv4 包
-//
-// Android 端：
-//   - 发送侧：buildN2NWFrame(targetID, ipv4Packet) 交给 ws.SendBinary
-//   - 接收侧：handleAppStreamBinary 从帧头读出 senderID → 更新 peer 活跃
-//             时间 → payload 送 TUN
+// handleAppStreamBinary 是 WS 二进制的统一入口：
+//   1. 先判 N2NA（app_stream 二进制）→ 交给 handleN2NAFrame
+//   2. 再判 N2NW（IPv4 数据面）→ 提取 senderID 后送 onRemotePacket
+//   3. 其他 → 丢弃
 
 const (
 	n2nwHdrMin  = 6
@@ -926,9 +925,17 @@ func buildN2NWFrame(targetID string, payload []byte) []byte {
 	return frame
 }
 
-// handleAppStreamBinary 处理服务端转发来的 N2NW 帧。
-// 帧头 peerId 是发送方 clientId（服务端重写后），payload 必须是 IPv4 包。
+// handleAppStreamBinary 处理服务端转发来的 WS 二进制帧。
+//
+// ★ 新增：先判 N2NA（app_stream 二进制），再判 N2NW（IPv4 数据面）。
 func (e *Edge) handleAppStreamBinary(data []byte) {
+	// ★ N2NA 分支（app_stream 二进制数据面）
+	if isN2NAFrame(data) {
+		e.handleN2NAFrame(data)
+		return
+	}
+
+	// N2NW 分支（IPv4 数据面，原有逻辑）
 	if len(data) < n2nwHdrMin {
 		return
 	}
