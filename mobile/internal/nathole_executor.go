@@ -95,6 +95,15 @@ func extractPortFromEndpoint(ep string) int {
 	return port
 }
 
+func lastIndexByte(s string, c byte) int {
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
+}
+
 func (e *Edge) startFailCountResetLoop() {
 	safeGo("fail-count-reset", func() {
 		ticker := time.NewTicker(5 * time.Minute)
@@ -156,7 +165,6 @@ func (e *Edge) chooseScanTiers(targetAddr *net.UDPAddr) (tiers []int, sameStun b
 	return buildTiers(hw), true, diff, hw
 }
 
-// collectScanTargets 收集本轮打洞的全部候选地址。
 func (e *Edge) collectScanTargets(instr *NatHoleInstruction) []*net.UDPAddr {
 	var raw []*net.UDPAddr
 
@@ -175,33 +183,28 @@ func (e *Edge) collectScanTargets(instr *NatHoleInstruction) []*net.UDPAddr {
 	log.Printf("[collectScanTargets] target=%s p.Lan=%v p.Assisted=%v instr.TargetLan=%v instr.TargetAssisted=%v TargetPubSocket=%q",
 		instr.TargetMac, pLan, pAssisted, instr.TargetLanEndpoints, instr.TargetAssistedEndpoints, instr.TargetPubSocket)
 
-	// 1. 本机 peer 记录里的 LAN 地址
 	for _, lan := range pLan {
 		if addr := parseSockAddr(lan); addr != nil {
 			raw = append(raw, addr)
 		}
 	}
 
-	// 2. 观测 raddr
 	if pUDPAddr != nil && pLastRecv > 0 {
 		raw = append(raw, &net.UDPAddr{IP: pUDPAddr.IP, Port: pUDPAddr.Port})
 	}
 
-	// 3. 服务端下发的 assisted
 	for _, ep := range instr.TargetAssistedEndpoints {
 		if addr := parseSockAddr(ep); addr != nil {
 			raw = append(raw, addr)
 		}
 	}
 
-	// 4. 服务端下发的 LAN
 	for _, ep := range instr.TargetLanEndpoints {
 		if addr := parseSockAddr(ep); addr != nil {
 			raw = append(raw, addr)
 		}
 	}
 
-	// 去重
 	seen := make(map[string]bool)
 	var out []*net.UDPAddr
 	for _, a := range raw {
@@ -229,16 +232,20 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		log.Printf("[NAT-HOLE] 跳过指令 target=%s（已连续失败 %d 次）", instr.TargetMac, fc)
 		return nil
 	}
-	if natHoleActive[instr.TargetMac] {
+
+	// ★ P0-1：去重 key 用 target@rung，允许同一 target 的多个 rung 并行
+	activeKey := fmt.Sprintf("%s@%d", instr.TargetMac, instr.BehaviorIndex)
+	if natHoleActive[activeKey] {
 		natHoleActiveMu.Unlock()
-		log.Printf("[NAT-HOLE] 跳过重复指令 target=%s（已在处理中）", instr.TargetMac)
+		log.Printf("[NAT-HOLE] 跳过重复指令 target=%s rung=%d（已在处理中）",
+			instr.TargetMac, instr.BehaviorIndex)
 		return nil
 	}
-	natHoleActive[instr.TargetMac] = true
+	natHoleActive[activeKey] = true
 	natHoleActiveMu.Unlock()
 	defer func() {
 		natHoleActiveMu.Lock()
-		delete(natHoleActive, instr.TargetMac)
+		delete(natHoleActive, activeKey)
 		natHoleActiveMu.Unlock()
 	}()
 
@@ -315,7 +322,6 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		log.Printf("[NAT-HOLE] 模式：不同 STUN IP，全端口扫描，分级 %v", tiers)
 	}
 
-	// 优先扫候选列表
 	if len(assistedTargets) > 0 {
 		log.Printf("[NAT-HOLE] 优先扫描 %d 个候选端点", len(assistedTargets))
 		for _, t := range assistedTargets {
@@ -450,15 +456,9 @@ func (e *Edge) resetFailCount(peerID string) {
 	natHoleActiveMu.Unlock()
 }
 
-// recordP2PSuccess 打洞成功时更新 peer 地址。
-//
-// ★ LAN 优先保护
-//
-// ★★ 补丁 2（本次修复）：LAN→公网切换窗口 300000（5 分钟） → 30000（30 秒）。
 func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAddr) {
 	e.peersMu.Lock()
 	if p, ok := e.peers[instr.TargetMac]; ok {
-		// ★ LAN 优先保护
 		newIsLAN := isPrivateIPv4(targetAddr.IP)
 		oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
 		now := time.Now().UnixMilli()
@@ -469,12 +469,10 @@ func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAd
 		} else if !oldIsLAN && newIsLAN {
 			shouldUpdate = true
 		} else if oldIsLAN && !newIsLAN {
-			// ★★ 补丁 2：5 分钟 → 30 秒
 			if p.lastLANRecvAt > 0 && now-p.lastLANRecvAt > 30000 {
 				shouldUpdate = true
 			}
 		} else {
-			// 同类型，端口变了才更新
 			if p.UDPAddr.Port != targetAddr.Port {
 				shouldUpdate = true
 			}
@@ -541,9 +539,6 @@ func parseSockAddr(s string) *net.UDPAddr {
 	return &net.UDPAddr{IP: ip, Port: port}
 }
 
-// resolveTarget 决定这次打洞往哪个地址发包。
-//
-// ★ 优先使用观测 raddr（已被证明可达）。
 func (e *Edge) resolveTarget(instr *NatHoleInstruction) *net.UDPAddr {
 	e.peersMu.RLock()
 	if p := e.peers[instr.TargetMac]; p != nil && p.UDPAddr != nil && p.lastRecvAt > 0 {
