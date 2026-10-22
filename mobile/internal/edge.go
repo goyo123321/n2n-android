@@ -219,13 +219,32 @@ func (e *Edge) startKeepalive() {
 }
 
 // ============ P2P 通道保活 + 活性检测 ============
+//
+// 三层保活（与 n2n-termux / README 对齐）：
+//
+//   1. UDP 保活（5 秒）      —— startKeepalive()，刷新 STUN 映射
+//   2. P2P 通道保活（15 秒） —— 本段 15 秒 ticker，仅非 P2P 状态
+//   3. 空闲保活（2 秒）      —— 本段 2 秒 ticker，P2P 状态
+//
+// ★ 为什么需要 2 秒空闲保活：
+//   Android 息屏后 WiFi 芯片会周期性进入 PS-Poll 深度省电模式，
+//   导致下行包被 AP 缓存 100ms+，ping 出现 200-500ms 尖峰。
+//   2 秒一次的 P2P probe 正好卡在 PS-Poll 唤醒周期内，强制 WiFi
+//   芯片保持活跃。与 n2n-termux 端完全一致。
+//
+// ★ 与 PC 端的差异：
+//   PC 桌面端无 WiFi 芯片省电问题，不需要 2 秒空闲保活，只保留 15s 循环。
+//   Android / Termux 都需要三层。
 
-const p2pKeepaliveInterval = 10 * time.Second
-const p2pIdleDeadMs = 30000
+const p2pKeepaliveInterval     = 15 * time.Second // 从 10s 改为 15s（对齐 README）
+const p2pIdleKeepaliveInterval = 2 * time.Second  // 新增
+const p2pIdleDeadMs            = 30000
 
 func (e *Edge) startP2PKeepalive() {
-	log.Printf("[P2P-Keepalive] 启动，每 %v 刷新 P2P 通道", p2pKeepaliveInterval)
+	log.Printf("[P2P-Keepalive] 启动：非 P2P 通道每 %v，P2P 通道每 %v（防 WiFi 省电）",
+		p2pKeepaliveInterval, p2pIdleKeepaliveInterval)
 
+	// 15 秒循环：只对非 P2P 状态发 probe
 	safeGo("p2p-keepalive", func() {
 		ticker := time.NewTicker(p2pKeepaliveInterval)
 		defer ticker.Stop()
@@ -239,17 +258,62 @@ func (e *Edge) startP2PKeepalive() {
 			}
 		}
 	})
+
+	// 2 秒循环：P2P 状态发 probe + 30s 无流量降级检测
+	safeGo("p2p-idle-keepalive", func() {
+		ticker := time.NewTicker(p2pIdleKeepaliveInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-e.doneCh:
+				log.Printf("[P2P-Idle-Keepalive] 已停止")
+				return
+			case <-ticker.C:
+				e.sendP2PIdleKeepalive()
+			}
+		}
+	})
 }
 
-// ★ P1 修复（本次）：降级后重置 lastRecvAt，避免日志刷屏
+// sendP2PKeepalive 是 15 秒循环：只对非 P2P 状态发 probe。
 //
-// 旧版问题：ForceFallback 在 ConnP2P 时直接 return，但日志已打，
-// 下一次 keepalive 又触发，造成 30 秒刷屏。
-//
-// 新版：
-//   1. 降级后重置 lastRecvAt，避免下一次 keepalive 立即重复触发
-//   2. relay_fallback.go 的 ForceFallback 允许 ConnP2P 在 no-traffic 场景降级
+// 目的：保持 TURN / WS 通道的 A→B 会话，并持续探测是否能恢复 P2P。
+// P2P 状态的保活由 sendP2PIdleKeepalive 每 2 秒负责。
 func (e *Edge) sendP2PKeepalive() {
+	if e.relayMgr == nil || e.p2pStreams == nil {
+		return
+	}
+
+	e.peersMu.RLock()
+	var nonP2PPeers []string
+	for id, p := range e.peers {
+		if p.UDPAddr == nil {
+			continue
+		}
+		st := e.relayMgr.GetState(id)
+		if st == ConnP2P || st == ConnP2PAvailable {
+			continue // P2P 状态由 2 秒 idle keepalive 负责
+		}
+		nonP2PPeers = append(nonP2PPeers, id)
+	}
+	e.peersMu.RUnlock()
+
+	for _, id := range nonP2PPeers {
+		e.p2pStreams.sendP2PProbe(id)
+	}
+}
+
+// sendP2PIdleKeepalive 是 2 秒循环：P2P 状态发 probe + 30s 无流量降级检测。
+//
+// ★ 为什么 2 秒：
+//   Android 息屏后 WiFi 芯片进入 PS-Poll 深度省电模式，下行包会被 AP
+//   缓存 100ms+。2 秒一次的 PING 正好卡在唤醒周期内，强制保持 WiFi 活跃。
+//
+// ★ 为什么在这里做降级检测：
+//   2 秒一次的检查让 30s 无流量场景最多 32s 就触发降级（旧版 10 秒
+//   循环最坏要 40s）。检测到后重置 lastRecvAt，避免下一次 tick 立即
+//   重复触发（旧版这里会刷屏）。
+func (e *Edge) sendP2PIdleKeepalive() {
 	if e.relayMgr == nil || e.p2pStreams == nil {
 		return
 	}
@@ -258,22 +322,20 @@ func (e *Edge) sendP2PKeepalive() {
 
 	e.peersMu.RLock()
 	var deadPeers []string
-	var alivePeers []string
+	var p2pPeers []string
 	for id, p := range e.peers {
 		if p.UDPAddr == nil {
 			continue
 		}
 		st := e.relayMgr.GetState(id)
-
-		if st == ConnP2P || st == ConnP2PAvailable {
-			idleMs := now - p.lastRecvAt
-			if p.lastRecvAt > 0 && idleMs > p2pIdleDeadMs {
-				deadPeers = append(deadPeers, id)
-				continue
-			}
+		if st != ConnP2P && st != ConnP2PAvailable {
+			continue
 		}
-
-		alivePeers = append(alivePeers, id)
+		if p.lastRecvAt > 0 && now-p.lastRecvAt > p2pIdleDeadMs {
+			deadPeers = append(deadPeers, id)
+			continue
+		}
+		p2pPeers = append(p2pPeers, id)
 	}
 	e.peersMu.RUnlock()
 
@@ -281,7 +343,7 @@ func (e *Edge) sendP2PKeepalive() {
 		log.Printf("[P2P] %s %ds 无任何流量，判定 P2P 失效，强制降级",
 			id, p2pIdleDeadMs/1000)
 		e.relayMgr.ForceFallback(id, "no-traffic-30s")
-		// ★ P1 修复：重置 lastRecvAt，避免下一次 keepalive 立即重复触发
+		// ★ P1 修复：重置 lastRecvAt，避免下一次 idle tick 立即重复触发
 		e.peersMu.Lock()
 		if p := e.peers[id]; p != nil {
 			p.lastRecvAt = time.Now().UnixMilli()
@@ -289,7 +351,7 @@ func (e *Edge) sendP2PKeepalive() {
 		e.peersMu.Unlock()
 	}
 
-	for _, id := range alivePeers {
+	for _, id := range p2pPeers {
 		e.p2pStreams.sendP2PProbe(id)
 	}
 }
