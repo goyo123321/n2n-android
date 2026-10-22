@@ -8,6 +8,16 @@ import (
 	"time"
 )
 
+// findPeerIDByAddr 按对端地址查 peerID。
+//
+// ★ P0 修复（本次）：加 IP 匹配 AssistedEndpoints
+//
+// 旧版问题：HardNAT 端口漂移时，B 的 PONG 从 112.96.52.208:任意端口 来，
+// 但 AssistedEndpoints 里只有 112.96.52.208:32519/52911/...（固定几个端口）。
+// 精确匹配全部失败 → 找不到 peer → lastRecvAt 不更新 → 30 秒后 ForceFallback。
+//
+// 新版：精确匹配全部失败后，用 IP 匹配 AssistedEndpoints（忽略端口）。
+// 只要 IP 匹配，就认定是该 peer 的包。
 func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 	if addr == nil {
 		return ""
@@ -15,11 +25,14 @@ func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 	e.peersMu.RLock()
 	defer e.peersMu.RUnlock()
 
+	// 1. 精确匹配 UDPAddr
 	for id, p := range e.peers {
 		if p.UDPAddr != nil && p.UDPAddr.IP.Equal(addr.IP) && p.UDPAddr.Port == addr.Port {
 			return id
 		}
 	}
+
+	// 2. 精确匹配 LanEndpoints
 	for id, p := range e.peers {
 		for _, lan := range p.LanEndpoints {
 			la, err := net.ResolveUDPAddr("udp", lan)
@@ -31,6 +44,8 @@ func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 			}
 		}
 	}
+
+	// 3. 精确匹配 AssistedEndpoints
 	for id, p := range e.peers {
 		for _, ass := range p.AssistedEndpoints {
 			aa, err := net.ResolveUDPAddr("udp", ass)
@@ -42,11 +57,28 @@ func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 			}
 		}
 	}
+
+	// ★ 新增 4：IP 匹配 AssistedEndpoints（HardNAT 端口漂移兜底）
+	// B 的 PONG 从 112.96.52.208:任意端口 来，只要 IP 匹配 AssistedEndpoints 就认
+	for id, p := range e.peers {
+		for _, ass := range p.AssistedEndpoints {
+			aa, err := net.ResolveUDPAddr("udp", ass)
+			if err != nil {
+				continue
+			}
+			if aa.IP.Equal(addr.IP) {
+				return id
+			}
+		}
+	}
+
+	// ★ 新增 5：IP 匹配 UDPAddr（原有兜底，移到后面避免干扰）
 	for id, p := range e.peers {
 		if p.UDPAddr != nil && p.UDPAddr.IP.Equal(addr.IP) {
 			return id
 		}
 	}
+
 	return ""
 }
 
@@ -69,26 +101,16 @@ func (e *Edge) peerAddrAndMode(peerID string) (*net.UDPAddr, bool) {
 //
 // ★ P0 修复：PING/PONG 状态机（与 PC / Termux 对齐）
 //
-// 旧 Android 行为：
-//   - 收到 PING → 回 PONG + 自己升 P2P
-//   - 后果：单向 P2P（A→B 通、B→A 断）时 B 误以为双向可达，
-//           向 A 发数据全部丢失，卡在 P2P 丢包，无法降级
-//
 // 新行为：
 //   - 收到 PING → 只更新 lastRecvAt（由调用方已完成），不升级、不回 PONG
 //   - 收到 PONG → 升级 P2P（证明双向可达）
 //   - 收到数据帧 → 升级 P2P（数据面已验证）
 //
-// ★ P1 修复（本次）：区分 PONG / 数据帧的 viaTURN 来源
+// ★ P1 修复：区分 PONG / 数据帧的 viaTURN 来源
 //
-//   旧版：无论 PONG 从 UDP 直连还是 TURN 到达，都 MarkP2P。
-//         跨网络场景下，PONG 只能通过 TURN 到达，但仍被标记成 P2P，
-//         导致面板显示假 p2p，实际数据走 TURN。
-//
-//   新版：
-//     - viaTURN=false 的 PONG → MarkP2P（真 P2P）
-//     - viaTURN=true  的 PONG → 保持 P2PAvailable（不标记 P2P），
-//                          让 60s 超时自然降级到 TURN
+//   - viaTURN=false 的 PONG → MarkP2P（真 P2P）
+//   - viaTURN=true  的 PONG → 保持 P2PAvailable（不标记 P2P），
+//                        让 60s 超时自然降级到 TURN
 func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) {
 	if e.p2pStreams == nil {
 		return
@@ -102,7 +124,6 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 		return
 	}
 
-	// 更新 UDPAddr（LAN 优先）
 	if !viaTURN {
 		e.peersMu.Lock()
 		if p := e.peers[peerID]; p != nil {
@@ -156,10 +177,6 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 					log.Printf("[P2P] 收到 PONG（UDP 直连）→ P2P 直连（双向通道已验证）")
 					e.relayMgr.MarkP2P(peerID)
 				} else {
-					// ★ P1 修复：通过 TURN 收到的 PONG → 不标记 P2P
-					//   原因：PONG 走 TURN 说明对端到本端可能单向不通，
-					//         本端写 LAN 地址是黑洞，只有 TURN 能到达。
-					//   行为：保持 P2PAvailable，60s 超时后自然降级到 TURN。
 					log.Printf("[TURN] 通过 TURN 收到 PONG → 保持 P2PAvailable（不标记 P2P，等待直连 PONG）")
 				}
 			}
