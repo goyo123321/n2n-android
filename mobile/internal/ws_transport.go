@@ -181,6 +181,10 @@ func NewWSTransport(signalingURL, roomId, clientId, connectToken, preferredIP st
 		stopCh:   make(chan struct{}),
 	}
 
+	// ★ P1 修复：heartbeat 只在这里启动一次。
+	//   tryReconnect 不再启动 heartbeat（否则重连 N 次后泄漏 N 个 goroutine）。
+	//   heartbeat 内部通过 ws.conn 读取当前连接，断线时 Send 返回 nil/error
+	//   都继续循环（不再 return 退出），重连后自动恢复心跳。
 	safeGo("ws-readLoop", func() { ws.readLoop(conn) })
 	safeGo("ws-heartbeat", func() { ws.heartbeat(20 * time.Second) })
 	return ws, nil
@@ -203,10 +207,6 @@ func maskToken(u string) string {
 //   1. 每次 ReadMessage 前设置 wsReadTimeout 读超时
 //   2. 识别 net.Error.Timeout() → 视为"下行僵死"
 //   3. 收到 server_ping → 立即回 server_pong，不路由给上层
-//
-// 旧版：
-//   - 无读超时 → 僵死时永远阻塞
-//   - 不处理 server_ping → 服务端每 30 秒心跳没人回
 func (ws *WSTransport) readLoop(conn *websocket.Conn) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -226,7 +226,6 @@ func (ws *WSTransport) readLoop(conn *websocket.Conn) {
 
 		msgType, data, err := conn.ReadMessage()
 		if err != nil {
-			// 先判 stopping：主动 Close 时静默退出
 			ws.reconnectMu.Lock()
 			stopping := ws.stopping
 			ws.reconnectMu.Unlock()
@@ -265,6 +264,11 @@ func (ws *WSTransport) readLoop(conn *websocket.Conn) {
 }
 
 // tryReconnect 无限重试，指数退避封顶 5 分钟。
+//
+// ★ P1 修复（本轮）：重连成功后只重启 readLoop，
+//   **不再启动 heartbeat**——heartbeat 在 NewWSTransport 中已启动一次，
+//   通过 ws.conn 读最新连接，不随重连重启。修复旧版重连 N 次后
+//   N 个 heartbeat goroutine 并存的泄漏问题。
 func (ws *WSTransport) tryReconnect() {
 	ws.reconnectMu.Lock()
 	if ws.stopping || ws.reconnecting {
@@ -326,13 +330,19 @@ func (ws *WSTransport) tryReconnect() {
 		ws.conn = conn
 		ws.mu.Unlock()
 		log.Printf("[WS] ✅ 重连成功（第 %d 次尝试）", attempt)
+
+		// ★ P1 修复：只重启 readLoop，不再启动 heartbeat
 		safeGo("ws-readLoop", func() { ws.readLoop(conn) })
-		safeGo("ws-heartbeat", func() { ws.heartbeat(20 * time.Second) })
 		ws.routeText(map[string]interface{}{"type": "_reconnected"})
 		return
 	}
 }
 
+// heartbeat 每 20 秒发一次 ping。
+//
+// ★ P1 修复（本轮）：Send 失败（连接断开）时 **continue** 而非 return。
+//   旧版只要一次 Send 失败就永久停掉心跳，直到进程重启。改为 continue 后
+//   断线期间静默跳过（Send 内部 conn==nil 时返回 nil），重连后自动恢复。
 func (ws *WSTransport) heartbeat(interval time.Duration) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -351,7 +361,10 @@ func (ws *WSTransport) heartbeat(interval time.Duration) {
 			"type": "ping",
 			"ts":   time.Now().Unix(),
 		}); err != nil {
-			return
+			// ★ P1 修复：continue 而非 return
+			// 断线期间 Send 会返回 nil（conn==nil 时静默），真正的错误（如
+			// 写超时）也继续循环，重连后自动恢复。
+			continue
 		}
 	}
 }
@@ -369,7 +382,7 @@ func (ws *WSTransport) Send(msg map[string]interface{}) error {
 	conn := ws.conn
 	ws.mu.Unlock()
 	if conn == nil {
-		return fmt.Errorf("WS 未连接")
+		return nil
 	}
 	return conn.WriteMessage(websocket.TextMessage, data)
 }
