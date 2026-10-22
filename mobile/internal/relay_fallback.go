@@ -133,15 +133,28 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.cancelFallbackTimer(peerId)
 }
 
+// ★ P1 修复（本次）：ForceFallback 允许 ConnP2P 在 no-traffic 场景降级
+//
+// 旧版：ConnP2P 时直接 return，但日志已打，下一次 keepalive 又触发，
+// 造成 30 秒刷屏（你日志里的反复 "30s 无任何流量，判定 P2P 失效，强制降级"）。
+//
+// 新版：如果 reason 是 "no-traffic-30s" 或 "p2p-avail-timeout"，
+// 允许从 ConnP2P 降级到 TURN/WS。
 func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
-	if rm.states[peerId] == ConnP2P {
-		return
-	}
+	// 已经是 TURN/WS → 不需要再降级
 	if rm.states[peerId] == ConnTURN || rm.states[peerId] == ConnRelay {
 		return
+	}
+
+	// ★ P1 修复：ConnP2P 允许在 no-traffic 场景降级
+	if rm.states[peerId] == ConnP2P {
+		if reason != "no-traffic-30s" && reason != "p2p-avail-timeout" {
+			return
+		}
+		log.Printf("[连接] %s 从 P2P 降级 (force: %s)", peerId, reason)
 	}
 
 	if rm.turnClient != nil && rm.turnClient.IsReady() {
@@ -267,17 +280,7 @@ func (rm *RelayManager) SendViaRelay(data []byte) error {
 
 // SendToPeer 按当前状态发送数据。
 //
-// ★ P0 修复（本次）：ConnP2P 分支加 selfIsOnTargetLAN 判断
-//
-// 旧版问题：
-//   - 跨网络场景下，target.LanEndpoints 是旧 LAN 地址（对端已切走），
-//     直接 WriteTo 返回 nil，被误判为成功，实际是黑洞。
-//   - UDPAddr 如果是"本机不可达的私网"，同样会写黑洞。
-//
-// 新版逻辑：
-//   - LAN 优先：只有本机也在 target 的 LAN 上才走
-//   - UDPAddr：只有不是"本机不可达的私网"时，才写
-//   - 全失败 → 走 TURN / WS 兜底
+// ★ P0 修复：ConnP2P 分支加 selfIsOnTargetLAN 判断
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
 	state := rm.GetState(peerId)
 
@@ -294,10 +297,8 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 
 		sent := false
 
-		// ★ P0 修复：判断本机是否在 target 的 LAN 上
 		selfOnLAN := rm.edge.selfIsOnTargetLAN(target)
 
-		// LAN 优先：只有本机也在该 LAN 上，且 target.UDPAddr 不是私网时才走
 		if selfOnLAN && target.UDPAddr != nil &&
 			!isPrivateIPv4(target.UDPAddr.IP) &&
 			len(target.LanEndpoints) > 0 {
@@ -313,11 +314,9 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 			}
 		}
 
-		// UDPAddr：只有不是"本机不可达的私网"时，才写
 		if !sent && target.UDPAddr != nil {
 			skip := false
 			if isPrivateIPv4(target.UDPAddr.IP) && !selfOnLAN {
-				// 私网 + 本机不在该 LAN → 黑洞，跳过
 				skip = true
 				log.Printf("[P2P] %s UDPAddr=%s 是私网且本机不在该 LAN，跳过（避免黑洞）",
 					peerId, target.UDPAddr)
@@ -338,7 +337,6 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 			return true
 		}
 
-		// 累积失败计数，连续 5 次才降级
 		rm.mu.Lock()
 		rm.failCounts[peerId]++
 		fc := rm.failCounts[peerId]
