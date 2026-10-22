@@ -34,7 +34,7 @@ type PeerInfo struct {
 	AssistedEndpoints []string
 	LanEndpoints      []string
 	Features          []string
-	registeredAt      int64 // ★ 新增：peer 首次注册时间，用于 lastLANRecvAt 兜底
+	registeredAt      int64 // ★ peer 首次注册时间，用于 lastLANRecvAt 兜底
 }
 
 type PeerSnapshot struct {
@@ -241,6 +241,14 @@ func (e *Edge) startP2PKeepalive() {
 	})
 }
 
+// ★ P1 修复（本次）：降级后重置 lastRecvAt，避免日志刷屏
+//
+// 旧版问题：ForceFallback 在 ConnP2P 时直接 return，但日志已打，
+// 下一次 keepalive 又触发，造成 30 秒刷屏。
+//
+// 新版：
+//   1. 降级后重置 lastRecvAt，避免下一次 keepalive 立即重复触发
+//   2. relay_fallback.go 的 ForceFallback 允许 ConnP2P 在 no-traffic 场景降级
 func (e *Edge) sendP2PKeepalive() {
 	if e.relayMgr == nil || e.p2pStreams == nil {
 		return
@@ -273,6 +281,12 @@ func (e *Edge) sendP2PKeepalive() {
 		log.Printf("[P2P] %s %ds 无任何流量，判定 P2P 失效，强制降级",
 			id, p2pIdleDeadMs/1000)
 		e.relayMgr.ForceFallback(id, "no-traffic-30s")
+		// ★ P1 修复：重置 lastRecvAt，避免下一次 keepalive 立即重复触发
+		e.peersMu.Lock()
+		if p := e.peers[id]; p != nil {
+			p.lastRecvAt = time.Now().UnixMilli()
+		}
+		e.peersMu.Unlock()
 	}
 
 	for _, id := range alivePeers {
@@ -1269,18 +1283,6 @@ func (e *Edge) peerExists(peerID string) bool {
 
 // ============================================================
 // ★ P0 修复：registerPeer 处理三种 UDPAddr 切换场景
-//
-// 场景 1（pubIpChanged）：对端从 WiFi 切到移动数据（或反之）
-//   - oldPubIP != "" && newPubIP != "" && oldPubIP != newPubIP
-//   - 无条件把 UDPAddr 切到新公网
-//
-// 场景 2（pubIpFirstSet）：对端首次上报公网地址（重启后）
-//   - oldPubIP == "" && newPubIP != ""
-//   - 如果本机不在对端的 LAN 上（例如本机在移动数据），切到公网
-//   - 如果本机在对端的 LAN 上，保留 LAN（LAN 更快）
-//
-// 场景 3（正常更新）：无 IP 变化
-//   - 保留原有逻辑（oldIsLAN 判断）
 // ============================================================
 func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	var udpAddr *net.UDPAddr
@@ -1386,7 +1388,7 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string,
 			NATType:           natType,
 			AssistedEndpoints: assisted,
 			LanEndpoints:      sortedLAN,
-			registeredAt:      time.Now().UnixMilli(), // ★ 新增
+			registeredAt:      time.Now().UnixMilli(),
 		}
 	}
 	e.peersMu.Unlock()
@@ -1635,7 +1637,6 @@ func (e *Edge) tunReadLoop() {
 			continue
 		}
 
-		// ★ P1 修复：ICMP 日志用实际 relayMgr 状态，不硬编码 ConnP2P
 		if proto == 1 {
 			e.sendICMPDirect(target, buf[:n])
 			atomic.StoreInt64(&e.lastDataFrameAt, time.Now().UnixMilli())
@@ -1765,7 +1766,7 @@ func (e *Edge) sendICMPDirect(target *PeerInfo, pkt []byte) {
 		}
 	}
 
-	// 4. WS 兜底（ICMP 走 WS 中继兜底，牺牲延迟换可靠）
+	// 4. WS 兜底
 	if e.ws != nil {
 		frame := buildN2NWFrame(target.ClientID, pkt)
 		_ = e.ws.SendBinary(frame)
@@ -1903,7 +1904,6 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 	} else if !oldIsLAN && newIsLAN {
 		shouldUpdate = true
 	} else if oldIsLAN && !newIsLAN {
-		// ★ P0 修复：lastLANRecvAt 为 0 时用 registeredAt 兜底
 		lastLAN := best.lastLANRecvAt
 		if lastLAN == 0 {
 			lastLAN = best.registeredAt
@@ -2082,7 +2082,6 @@ func (e *Edge) reportMetadataThrottled() {
 	e.reportMetadata()
 }
 
-// ★ 上报 p2p_metadata
 func (e *Edge) reportMetadata() {
 	e.mu.Lock()
 	nm := e.natMeta
@@ -2135,7 +2134,6 @@ func (e *Edge) reportMetadata() {
 	_ = ws.Send(map[string]interface{}{"type": "p2p_metadata", "payload": metaPayload})
 }
 
-// ★ jsonInt 把 JSON number 转 int
 func jsonInt(v interface{}) int {
 	if f, ok := v.(float64); ok {
 		return int(f)
