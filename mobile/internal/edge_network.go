@@ -9,6 +9,9 @@ package internal
 //
 // 用 ConnectivityManager.NetworkCallback 毫秒级感知，立即清状态 + 通知
 // 服务端重新协调。
+//
+// ★ LAN 保留：LanEndpoints 不清空，2s 保活会重新探测。LAN 路径不依赖
+//   UDP 源 IP（走 L2 桥接），网络切换后可能仍然可达。
 
 import (
 	"log"
@@ -20,8 +23,8 @@ import (
 //
 // 分六步：
 //  1. 清空打洞失败计数
-//  2. 重置 relayMgr 的 P2P 状态（保留 TURN/WS）
-//  3. 清空 peer 的 UDPAddr（等对端上报新的公网地址）
+//  2. 重置 relayMgr 的 P2P/LAN 状态（保留 TURN/WS）
+//  3. 清空 peer 的 UDPAddr（LanEndpoints 保留）
 //  4. 取消所有 pending timer
 //  5. 立即上报 metadata（绕过 30s 节流）
 //  6. 通知服务端重新协调
@@ -40,12 +43,12 @@ func (e *Edge) OnNetworkChanged(networkType string) {
 	}
 	natHoleActiveMu.Unlock()
 
-	// 2. 重置 relayMgr 的 P2P 状态（保留 TURN/WS）
+	// 2. 重置 relayMgr 的 P2P/LAN 状态（保留 TURN/WS）
 	if e.relayMgr != nil {
 		e.relayMgr.ResetP2PStates("network-changed")
 	}
 
-	// 3. 清空所有 peer 的 UDPAddr
+	// 3. 清空所有 peer 的 UDPAddr（LanEndpoints 保留，2s 保活会重新探测）
 	e.peersMu.Lock()
 	count := 0
 	for _, p := range e.peers {
@@ -55,9 +58,11 @@ func (e *Edge) OnNetworkChanged(networkType string) {
 		p.UDPAddr = nil
 		p.lastLANRecvAt = 0
 		p.lastRecvAt = 0
+		// ★ LanEndpoints 不清空 —— LAN 路径不依赖 UDP 源 IP，
+		//   网络切换后（如 WiFi 切移动网络）同 WiFi peer 可能仍可达
 	}
 	e.peersMu.Unlock()
-	log.Printf("[Network] 清空 %d 个 peer 的 UDPAddr", count)
+	log.Printf("[Network] 清空 %d 个 peer 的 UDPAddr（保留 LanEndpoints 重新探测）", count)
 
 	// 4. 取消所有 pending timer
 	e.fallbackTimersMu.Lock()
