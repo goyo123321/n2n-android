@@ -21,9 +21,6 @@ type Config struct {
 	PreferredPort int
 
 	// ★ 新增：SOCKS5 监听地址（留空 = 不启用）
-	//
-	// 与 VpnService 并行：VpnService 走 TUN，SOCKS5 走 loopback。
-	// 默认 "127.0.0.1:1080"，用户可在 UI 上改。
 	Socks5Listen string
 }
 
@@ -50,7 +47,6 @@ func SetTimezoneOffset(seconds int) {
 	internal.SetTimezoneOffset(seconds)
 }
 
-// SetLogFilePath 由 Kotlin 侧传入 filesDir 下的日志文件绝对路径。
 func SetLogFilePath(path string) {
 	internal.SetLogFilePath(path)
 }
@@ -114,7 +110,7 @@ func (c *Client) FetchVirtualIP(cfg *Config) (result string) {
 		ClientID: cfg.ClientID, NodeName: cfg.NodeName,
 		ConnectToken: cfg.ConnectToken, PreferredIP: cfg.PreferredIP,
 		PreferredPort: cfg.PreferredPort,
-		Socks5Listen:  cfg.Socks5Listen,   // ★ 新增
+		Socks5Listen:  cfg.Socks5Listen,
 	}
 	return internal.FetchVirtualIP(icfg)
 }
@@ -150,7 +146,7 @@ func (c *Client) Start(cfg *Config) (errMsg string) {
 		ClientID: cfg.ClientID, NodeName: cfg.NodeName,
 		ConnectToken: cfg.ConnectToken, PreferredIP: cfg.PreferredIP,
 		PreferredPort: cfg.PreferredPort,
-		Socks5Listen:  cfg.Socks5Listen,   // ★ 新增
+		Socks5Listen:  cfg.Socks5Listen,
 	}
 
 	edge, err := internal.Start(icfg, tunFd, udpFd, stunFd)
@@ -260,6 +256,18 @@ func (c *Client) GetPeersJSON() string {
 		return "[]"
 	}
 	return edge.GetPeersJSON()
+}
+
+// NotifyNetworkChanged 由 Kotlin 侧 ConnectivityManager.NetworkCallback 调用。
+//
+// WiFi ↔ Cellular 切换时立即清 P2P 状态，避免旧 UDP 路径持续丢包。
+func (c *Client) NotifyNetworkChanged(networkType string) {
+	c.mu.Lock()
+	edge := c.edge
+	c.mu.Unlock()
+	if edge != nil {
+		edge.OnNetworkChanged(networkType)
+	}
 }
 
 func GetLogs() string {
