@@ -30,7 +30,7 @@ type PeerInfo struct {
 	lastRecvAt        int64
 	lastLANRecvAt     int64
 	lastPublicRecvAt  int64
-	lastP2PRecvAt     int64   // ★ P2P 直连真实数据帧时间（viaTURN=false 且 isRealData=true）
+	lastP2PRecvAt     int64 // ★ P2P 直连真实数据帧时间（viaTURN=false 且 isRealData=true）
 	loggedReady       bool
 	hasRealData       bool
 	AssistedEndpoints []string
@@ -55,6 +55,13 @@ type Edge struct {
 	virtualIP   string
 	virtualCIDR string
 	roomId      string
+
+	// ★ 新增：网络变化去抖 / 合并延迟（见 edge_network.go）
+	lastNetworkChangedAt int64
+	lastNetworkType      string
+	pendingNetChangeMu   sync.Mutex
+	pendingNetChange     string
+	pendingNetChangeT    *time.Timer
 
 	serverSeenIP string
 
@@ -223,11 +230,11 @@ func (e *Edge) startKeepalive() {
 
 // ============ P2P 通道保活 + 活性检测 ============
 
-const p2pKeepaliveInterval     = 15 * time.Second
+const p2pKeepaliveInterval = 15 * time.Second
 const p2pIdleKeepaliveInterval = 2 * time.Second
-const p2pIdleDeadMs            = 30000
-const lanIdleDeadMs            = 60000
-const lanProbeIntervalMs       = 30000   // ★ LAN 每 30s 发一次 probe（保活 + 探测）
+const p2pIdleDeadMs = 30000
+const lanIdleDeadMs = 60000
+const lanProbeIntervalMs = 30000 // ★ LAN 每 30s 发一次 probe（保活 + 探测）
 
 func (e *Edge) startP2PKeepalive() {
 	log.Printf("[P2P-Keepalive] 启动：非 P2P 通道每 %v，P2P 通道每 %v（防 WiFi 省电）",
@@ -734,6 +741,15 @@ func (e *Edge) Stop() {
 	close(e.doneCh)
 	e.closeMu.Unlock()
 
+	// ★ 清理 pending network change timer
+	e.pendingNetChangeMu.Lock()
+	if e.pendingNetChangeT != nil {
+		e.pendingNetChangeT.Stop()
+		e.pendingNetChangeT = nil
+	}
+	e.pendingNetChange = ""
+	e.pendingNetChangeMu.Unlock()
+
 	e.fallbackTimersMu.Lock()
 	for _, t := range e.fallbackTimers {
 		t.Stop()
@@ -1008,6 +1024,18 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 
 		e.reportMetadata()
 		atomic.StoreInt64(&e.lastMetadataReportAt, time.Now().UnixMilli())
+
+		// ★ 补发 network_changed
+		//   场景：切换瞬间 WS 重连，network_changed 发送时 conn==nil 被静默丢弃，
+		//        服务端 punchState 残留旧的 P2P 成功记录。
+		//        补发后服务端立即 clearPairStateFor，不用等 connection_status 周期。
+		if e.ws != nil {
+			_ = e.ws.Send(map[string]interface{}{
+				"type":   "network_changed",
+				"reason": "ws-reconnected",
+			})
+			log.Printf("[Network] WS 重连，补发 network_changed (reason=ws-reconnected)")
+		}
 		return
 	}
 
@@ -1254,6 +1282,20 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		reason, _ := msg["reason"].(string)
 		log.Printf("[Network] %s 网络变化 (%s)，重置与其相关的状态", from, reason)
 
+		// ★ ws-reconnected 不代表对端换网络
+		//   对端只是 WS 重连（可能是 Worker 滚动更新），P2P/LAN 可能还活着，
+		//   只刷 lastRecvAt，不清 P2P 状态。真正的网络切换需要重新打洞，
+		//   但 ws-reconnected 不该触发。
+		if reason == "ws-reconnected" {
+			e.peersMu.Lock()
+			if p := e.peers[from]; p != nil {
+				p.lastRecvAt = time.Now().UnixMilli()
+			}
+			e.peersMu.Unlock()
+			log.Printf("[Network] %s ws-reconnected，保留 P2P/LAN 状态", from)
+			return
+		}
+
 		if e.relayMgr != nil {
 			e.relayMgr.ClearPeer(from)
 		}
@@ -1440,10 +1482,6 @@ func (e *Edge) peerExists(peerID string) bool {
 //   1. 清空本地 LanEndpoints
 //   2. 如果当前 UDPAddr 是私网，切回公网 UDPAddr
 //   3. 如果当前状态是 ConnLAN，立即 ForceFallback("lan-endpoints-cleared")
-//
-// 旧版只清空 LanEndpoints，UDPAddr 还是上次从 LAN 包学到的私网地址
-// → SendToPeer 检查私网 + !selfOnLAN → 跳过 UDP → 走 WS 兜底
-// → 58 秒黑洞
 func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	var udpAddr *net.UDPAddr
 	if pubIP != "" && pubPort > 0 {
@@ -2280,14 +2318,6 @@ func (e *Edge) hasTrafficFromAny(ips []net.IP, since int64) bool {
 //
 // ★ 修复：PublicEndpoint 从空设置时（换网络后首次），立即上报，
 //   绕过 reportMetadataThrottled 的 30 秒节流。
-//
-// 场景：A 换网络 → OnNetworkChanged 清空 PublicEndpoint
-//   → STUN 首次响应到达 → addAssistedEndpoint
-//   → 旧版：reportMetadataThrottled 30 秒节流 → 30 秒后才上报新地址
-//   → 服务端 30 秒内看不到 A 的 pubSocket → 不生成打洞指令
-//   → 30 秒内 A 和 B 都是 Unknown → WS 兜底
-//
-// 修复：wasEmpty 时立即上报 → 服务端 T+5s 就知道 A 的新地址。
 func (e *Edge) addAssistedEndpoint(ip string, port int) {
 	if ip == "" || port <= 0 {
 		return
