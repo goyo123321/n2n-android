@@ -18,8 +18,6 @@ const (
 	ConnRelay        ConnType = "relay"
 )
 
-// safeGo 定义在 edge.go 里。
-
 type RelayManager struct {
 	mu         sync.RWMutex
 	ws         *WSTransport
@@ -28,9 +26,8 @@ type RelayManager struct {
 	states     map[string]ConnType
 	failCounts map[string]int
 
-	// ★ 新增：peer-via-ws 震荡保护
-	//   5 秒内累计 ≥3 个 WS 帧才降级到 P2PAvailable
-	//   避免 B 的 LAN probe 和 TURN 失败兜底 WS 导致 A 震荡
+	// peer-via-ws 震荡保护：5 秒内累计 ≥5 个 WS 帧才降级
+	// 且要求 5 秒内没有 P2P 真实数据（lastP2PRecvAt 保护）
 	wsFrameCounts map[string]int
 	wsFirstAt     map[string]int64
 }
@@ -47,7 +44,10 @@ func NewRelayManager(ws *WSTransport, turnClient *TURNClient, edge *Edge) *Relay
 	}
 }
 
-// MarkP2PAvailable 标记打洞握手成功（等待数据帧验证）。
+// ============================================================
+// Mark 系列（状态升级）
+// ============================================================
+
 func (rm *RelayManager) MarkP2PAvailable(peerID string) {
 	rm.mu.Lock()
 	cur := rm.states[peerID]
@@ -87,7 +87,6 @@ func (rm *RelayManager) MarkP2P(peerId string) {
 	}
 }
 
-// MarkLAN 标记 LAN 直连已验证。
 func (rm *RelayManager) MarkLAN(peerId string) {
 	rm.mu.Lock()
 	prev := rm.states[peerId]
@@ -225,68 +224,104 @@ func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 }
 
 // ============================================================
-// ★ 新增：RecordWSFrame
+// RecordWSFrame：WS 帧降级保护
 // ============================================================
 //
 // peer-via-ws 震荡保护：
-//   5 秒内累计 ≥3 个 WS 帧才降级到 P2PAvailable
+//   1. 5 秒内累计 ≥5 个 WS 帧才降级（旧版 3 帧）
+//   2. 5 秒内有 P2P 真实数据（lastP2PRecvAt）→ 忽略 WS 帧，不降级
+//   3. 降级目标直接是 TURN/Relay（旧版降级到 P2PAvailable，数据面不变，无意义）
 //
-// 场景：B 的 TURN 失败走 WS 兜底发数据 → A 收到 WS 帧降级 TURN
-//   但 B 的 sendP2PIdleKeepalive 每 2s 发 LAN probe → A 收到 Punch 升 LAN
-//   → 反复震荡
-//
-// 修复：5 秒内 ≥3 帧才降级，避免单个 WS 帧就触发
+// 场景：网络抖动时对端 LAN probe + TURN 失败兜底 WS 会同时来，
+// 历史 WS 帧在 5s 窗口累积，若不保护会让刚恢复的 P2P 被反复打断。
 func (rm *RelayManager) RecordWSFrame(peerID string) {
 	if peerID == "" {
 		return
+	}
+
+	// P2P 数据保护（进锁前做，避免长持锁）
+	if rm.edge != nil {
+		rm.edge.peersMu.RLock()
+		var lastP2P int64
+		if p := rm.edge.peers[peerID]; p != nil {
+			lastP2P = p.lastP2PRecvAt
+		}
+		rm.edge.peersMu.RUnlock()
+
+		if lastP2P > 0 && time.Now().UnixMilli()-lastP2P < 5000 {
+			// 5 秒内有 P2P 真实数据，忽略 WS 帧
+			return
+		}
 	}
 
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
 	now := time.Now().UnixMilli()
-	first, ok := rm.wsFirstAt[peerID]
-	if !ok || now-first > 5000 {
+	if first, ok := rm.wsFirstAt[peerID]; !ok || now-first > 5000 {
 		rm.wsFirstAt[peerID] = now
 		rm.wsFrameCounts[peerID] = 0
 	}
 	rm.wsFrameCounts[peerID]++
 
-	if rm.wsFrameCounts[peerID] < 3 {
-		log.Printf("[连接] %s WS 帧计数 %d/3（%.1fs 窗口）",
-			peerID, rm.wsFrameCounts[peerID], float64(now-first)/1000.0)
+	if rm.wsFrameCounts[peerID] < 5 {
+		log.Printf("[连接] %s WS 帧计数 %d/5（5s 窗口）",
+			peerID, rm.wsFrameCounts[peerID])
 		return
 	}
 
-	// ≥3 帧：降级
 	rm.wsFrameCounts[peerID] = 0
 	rm.wsFirstAt[peerID] = 0
 
 	cur := rm.states[peerID]
-	if cur == ConnLAN || cur == ConnP2P || cur == ConnP2PAvailable {
-		// 降级到 ConnP2PAvailable 而不是直接 TURN
-		// 让客户端继续尝试 P2P，60s 超时后才真正降级
-		rm.states[peerID] = ConnP2PAvailable
-		log.Printf("[连接] %s %s → P2PAvailable（peer-via-ws ×3）", peerID, cur)
-		if rm.edge != nil {
-			rm.edge.cancelFallbackTimer(peerID)
-			rm.edge.reportP2PStatus(peerID, 2)
-			rm.edge.scheduleP2PAvailTimeout(peerID)
-		}
+	if cur != ConnLAN && cur != ConnP2P && cur != ConnP2PAvailable {
+		return
+	}
+
+	// 直接降级 TURN/Relay（不再降级到 P2PAvailable）
+	if rm.turnClient != nil && rm.turnClient.IsReady() {
+		rm.states[peerID] = ConnTURN
+		log.Printf("[连接] %s %s → TURN（peer-via-ws ×5）", peerID, cur)
+	} else {
+		rm.states[peerID] = ConnRelay
+		log.Printf("[连接] %s %s → WS 中继（peer-via-ws ×5，TURN 未就绪）", peerID, cur)
+	}
+
+	if rm.edge != nil {
+		rm.edge.cancelFallbackTimer(peerID)
+		rm.edge.cancelP2PAvailTimeout(peerID)
+		rm.edge.reportP2PStatus(peerID, 0)
 	}
 }
 
 // ============================================================
-// ★ 修复：TURN 不可用时直接走 WS
+// ForceReportNow：立即上报 connection_status
 // ============================================================
 //
-// 场景：TURN over TCP 连接断开（broken pipe）后：
-//   - turnClient.IsReady() 可能仍返回 true（懒检测）
-//   - 或 TurnRelayAddr 仍在但实际不可达
-//   → SendToPeer(ConnTURN) 反复发送失败
-//   → 5 次后降级 WS
-//
-// 修复：每次发送前检查 turnClient.IsReady()，不可用直接走 WS
+// 由 OnNetworkChanged 末尾调用——切换后服务端应立刻看到 Unknown，
+// 触发 punchState 退役，避免 shouldRetireSuccess 等 10s 周期。
+// 注意：conns 为空也要发（ClearAll 后服务端需要 {} 才能清）。
+func (rm *RelayManager) ForceReportNow() {
+	if rm.ws == nil {
+		return
+	}
+	rm.mu.RLock()
+	conns := make(map[string]string, len(rm.states))
+	for id, t := range rm.states {
+		conns[id] = string(t)
+	}
+	rm.mu.RUnlock()
+
+	_ = rm.ws.Send(map[string]interface{}{
+		"type":    "connection_status",
+		"payload": map[string]interface{}{"connections": conns},
+	})
+	log.Printf("[连接] 立即上报 connection_status (%d peers)", len(conns))
+}
+
+// ============================================================
+// SendToPeer：按当前状态发送数据
+// ============================================================
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
 	state := rm.GetState(peerId)
 
@@ -423,9 +458,6 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 		return rm.ws.SendBinary(buildN2NWFrame(peerId, data)) == nil
 
 	case ConnTURN:
-		// ★ 修复：每次发送前检查 TURN 是否真的就绪
-		//   TURN over TCP 断开后 IsReady() 可能仍返回 true
-		//   → 直接走 WS 兜底，避免反复尝试失败的 TURN
 		if rm.turnClient == nil || !rm.turnClient.IsReady() {
 			log.Printf("[TURN] %s TURN 未就绪（可能已断开），直接走 WS 兜底", peerId)
 			rm.mu.Lock()
@@ -488,6 +520,7 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 	return false
 }
 
+// Report 周期上报 connection_status（10s 周期，兜底）。
 func (rm *RelayManager) Report(interval time.Duration) {
 	if rm.edge == nil {
 		return
@@ -528,7 +561,7 @@ func (rm *RelayManager) ClearPeer(peerID string) {
 	rm.mu.Lock()
 	delete(rm.states, peerID)
 	delete(rm.failCounts, peerID)
-	delete(rm.wsFrameCounts, peerID)   // ★ 清理震荡保护状态
+	delete(rm.wsFrameCounts, peerID)
 	delete(rm.wsFirstAt, peerID)
 
 	conns := make(map[string]string)
@@ -550,7 +583,7 @@ func (rm *RelayManager) ClearAll() {
 	rm.mu.Lock()
 	rm.states = make(map[string]ConnType)
 	rm.failCounts = make(map[string]int)
-	rm.wsFrameCounts = make(map[string]int)   // ★ 清理震荡保护状态
+	rm.wsFrameCounts = make(map[string]int)
 	rm.wsFirstAt = make(map[string]int64)
 	rm.mu.Unlock()
 
@@ -670,7 +703,8 @@ func (rm *RelayManager) ResetP2PStates(reason string) {
 			log.Printf("[连接] %s %s → Unknown（%s）", peerID, state, reason)
 		}
 	}
-	// 清空震荡保护状态
+	// 清 failCounts（旧计数残留会误触发降级）
+	rm.failCounts = make(map[string]int)
 	rm.wsFrameCounts = make(map[string]int)
 	rm.wsFirstAt = make(map[string]int64)
 }
