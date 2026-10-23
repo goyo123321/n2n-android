@@ -305,12 +305,6 @@ func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 }
 
 // sendP2PFrame 发送一帧到对端的所有候选地址。
-//
-// ★ 修复 1：LAN 优先（窗口 30s）。
-// ★ 修复 2：控制帧全发（保 CGNAT 映射 + 探测 LAN 恢复）。
-// ★ 修复 3：TURN 模式下控制帧也尝试直连。
-//
-// ★ Android 特有：e.udpConn 是 net.PacketConn，用 WriteTo。
 func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	s.mu.Lock()
 	viaTURN := s.viaTURN
@@ -891,23 +885,13 @@ func (s *P2PStream) close(reason string) {
 }
 
 // ============ N2NW / N2NA 二进制帧（WS 中继数据面） ============
-//
-// 两套二进制协议：
-//   - N2NW（flags=0）：IPv4 数据面，服务端按目标 peer 直接转发裸 IPv4 包
-//   - N2NA：app_stream 数据面，服务端按 streamId 转发 TCP 字节流
-//
-// handleAppStreamBinary 是 WS 二进制的统一入口：
-//   1. 先判 N2NA（app_stream 二进制）→ 交给 handleN2NAFrame
-//   2. 再判 N2NW（IPv4 数据面）→ 提取 senderID 后送 TUN
-//   3. 其他 → 丢弃
 
 const (
 	n2nwHdrMin  = 6
 	n2nwPeerMax = 255
 )
 
-// buildN2NWFrame 构造 N2NW 帧。targetID 是目标 peer 的 clientId，
-// 服务端会把它重写为发送方 ID 后再转发给对端。
+// buildN2NWFrame 构造 N2NW 帧。
 func buildN2NWFrame(targetID string, payload []byte) []byte {
 	idBytes := []byte(targetID)
 	if len(idBytes) > n2nwPeerMax {
@@ -918,7 +902,7 @@ func buildN2NWFrame(targetID string, payload []byte) []byte {
 	frame[1] = '2'
 	frame[2] = 'N'
 	frame[3] = 'W'
-	frame[4] = 0 // flags
+	frame[4] = 0
 	frame[5] = byte(len(idBytes))
 	copy(frame[n2nwHdrMin:], idBytes)
 	copy(frame[n2nwHdrMin+len(idBytes):], payload)
@@ -927,15 +911,20 @@ func buildN2NWFrame(targetID string, payload []byte) []byte {
 
 // handleAppStreamBinary 处理服务端转发来的 WS 二进制帧。
 //
-// ★ 先判 N2NA（app_stream 二进制），再判 N2NW（IPv4 数据面）。
+// ★ 新增：N2NW 分支收到数据但当前状态是 LAN/P2P/P2PAvailable
+//   → 对端已降级到 WS，本机跟进 ForceFallback("peer-via-ws")。
+//
+//   旧版只更新 lastRecvAt，不检查状态 → 单向 P2P 但对端走 WS 时，
+//   本机停在 ConnP2P 继续往对端公网地址发数据全丢，30s 后才被
+//   sendP2PIdleKeepalive 降级。
 func (e *Edge) handleAppStreamBinary(data []byte) {
-	// ★ N2NA 分支（app_stream 二进制数据面）
+	// N2NA 分支（app_stream 二进制数据面）
 	if isN2NAFrame(data) {
 		e.handleN2NAFrame(data)
 		return
 	}
 
-	// N2NW 分支（IPv4 数据面，原有逻辑）
+	// N2NW 分支（IPv4 数据面）
 	if len(data) < n2nwHdrMin {
 		return
 	}
@@ -955,24 +944,28 @@ func (e *Edge) handleAppStreamBinary(data []byte) {
 	senderID := string(data[n2nwHdrMin : n2nwHdrMin+peerLen])
 	payload := data[n2nwHdrMin+peerLen:]
 	if len(payload) < 20 || payload[0]>>4 != 4 {
-		// 当前 flags=0 只承诺 IPv4 payload；未来扩展走 flags
 		log.Printf("[WS-BIN] %s → 非 IPv4 payload (len=%d flags=%d)",
 			senderID, len(payload), flags)
 		return
 	}
 
 	// 更新发送方 peer 的活跃时间
-	//
-	// 用途：
-	//   - P2P 空闲检测（sendP2PKeepalive 里的 30s p2pIdleDeadMs）   ← P3 修复：120s → 30s
-	//   - MarkFallback 的 10 秒保护（relay_fallback.go）              ← P3 修复：3 秒 → 10 秒
-	//   - 面板 lastSeen / idleFor
 	now := time.Now().UnixMilli()
 	e.peersMu.Lock()
 	if p, ok := e.peers[senderID]; ok {
 		p.lastRecvAt = now
 	}
 	e.peersMu.Unlock()
+
+	// ★ 新增：WS 收到数据但当前状态是 LAN/P2P/P2PAvailable → 对端已降级
+	if e.relayMgr != nil {
+		st := e.relayMgr.GetState(senderID)
+		if st == ConnLAN || st == ConnP2P || st == ConnP2PAvailable {
+			log.Printf("[WS-BIN] %s 通过 WS 收到数据帧（当前 %s）→ 对端已降级，本机跟进",
+				senderID, st)
+			e.relayMgr.ForceFallback(senderID, "peer-via-ws")
+		}
+	}
 
 	// 送 TUN（onRemotePacket 内部校验 dstIP == 本机 VIP）
 	e.onRemotePacket(payload)
