@@ -38,8 +38,6 @@ type AppStream struct {
 	CreatedAt time.Time
 
 	// ★ 新增：对端是否支持 N2NA 二进制数据面
-	//   - openLocalStream / onRemoteStreamOpen 里根据对端 features 设置
-	//   - pumpLocalToRemote 据此决定发二进制还是文本
 	PeerSupportsN2NA bool
 
 	ackCh   chan bool
@@ -77,9 +75,13 @@ func NewAppStreamManager() *AppStreamManager {
 	}
 }
 
+// allocID 分配 streamId。
+//
+// ★ 加时间戳：客户端崩溃重启后 seq 重置，旧 streamId 可能
+//   在对端还存活，导致新数据被写入旧流。加时间戳后每个 ID 全局唯一。
 func (m *AppStreamManager) allocID(prefix string) string {
 	n := m.seq.Add(1)
-	return fmt.Sprintf("%s-%d", prefix, n)
+	return fmt.Sprintf("%s-%d-%d", prefix, time.Now().UnixMilli(), n)
 }
 
 func (m *AppStreamManager) add(s *AppStream) {
@@ -116,7 +118,6 @@ func (m *AppStreamManager) closeAll() {
 
 // ============ 对端 features 查询辅助 ============
 
-// peerSupportsN2NA 判断 peer 是否上报了 n2na feature
 func (e *Edge) peerSupportsN2NA(peerID string) bool {
 	if peerID == "" {
 		return false
@@ -137,9 +138,6 @@ func (e *Edge) peerSupportsN2NA(peerID string) bool {
 
 // ============ Edge 端方法 ============
 
-// findPeerByVIP 按虚拟 IP 查 peerID。
-//
-// Android 端当前不通过 SOCKS5 触发应用层流，此方法保留给未来扩展。
 func (e *Edge) findPeerByVIP(vip string) (string, bool) {
 	e.peersMu.RLock()
 	defer e.peersMu.RUnlock()
@@ -156,7 +154,6 @@ func (e *Edge) openLocalStream(peerID string, targetPort int, conn net.Conn) (*A
 		return nil, fmt.Errorf("stream manager not initialized")
 	}
 
-	// ★ 新增：检查对端是否支持 N2NA
 	supportsBinary := e.peerSupportsN2NA(peerID)
 
 	streamID := e.streamMgr.allocID(e.clientId)
@@ -184,12 +181,6 @@ func (e *Edge) openLocalStream(peerID string, targetPort int, conn net.Conn) (*A
 	return s, nil
 }
 
-// pumpLocalToRemote 本地 → 远端的数据泵。
-//
-// ★ 新增：根据 s.PeerSupportsN2NA 决定二进制还是文本。
-//   - 二进制：N2NA 帧（省 ~27% 带宽）
-//   - 文本：app_stream_data JSON + base64（旧协议，完全兼容）
-//   - 二进制发送失败时回退文本
 func (e *Edge) pumpLocalToRemote(s *AppStream) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -205,11 +196,9 @@ func (e *Edge) pumpLocalToRemote(s *AppStream) {
 		n, err := s.LocalConn.Read(buf)
 		if n > 0 {
 			if s.PeerSupportsN2NA {
-				// ★ 二进制路径
 				frame := buildN2NAFrame(s.PeerID, s.ID, buf[:n])
 				if frame != nil {
 					if sendErr := e.ws.SendBinary(frame); sendErr != nil {
-						// 兜底：回退文本
 						dataB64 := base64.StdEncoding.EncodeToString(buf[:n])
 						_ = e.ws.Send(map[string]interface{}{
 							"type":     "app_stream_data",
@@ -219,7 +208,6 @@ func (e *Edge) pumpLocalToRemote(s *AppStream) {
 						})
 					}
 				} else {
-					// 编码失败（ID 过长等），回退文本
 					dataB64 := base64.StdEncoding.EncodeToString(buf[:n])
 					_ = e.ws.Send(map[string]interface{}{
 						"type":     "app_stream_data",
@@ -229,7 +217,6 @@ func (e *Edge) pumpLocalToRemote(s *AppStream) {
 					})
 				}
 			} else {
-				// 文本路径（旧协议，兼容旧对端）
 				dataB64 := base64.StdEncoding.EncodeToString(buf[:n])
 				_ = e.ws.Send(map[string]interface{}{
 					"type":     "app_stream_data",
@@ -275,12 +262,6 @@ func (e *Edge) closeStream(s *AppStream, reason string) {
 
 // ============ 远端消息处理 ============
 
-// onRemoteStreamOpen 处理对端发起的应用层隧道。
-//
-// 本端作为"接收方"：dial 到 127.0.0.1:targetPort，成功回 open_ack=true，
-// 然后开始 pump。
-//
-// ★ 新增：检查对端 features，决定回发数据时用 N2NA 还是文本。
 func (e *Edge) onRemoteStreamOpen(msg map[string]interface{}) {
 	from, _ := msg["from"].(string)
 	streamID, _ := msg["streamId"].(string)
@@ -295,7 +276,6 @@ func (e *Edge) onRemoteStreamOpen(msg map[string]interface{}) {
 		return
 	}
 
-	// ★ 新增：检查对端是否支持 N2NA
 	supportsBinary := e.peerSupportsN2NA(from)
 
 	log.Printf("[STREAM] 收到 open %s from %s targetPort=%d (peerN2NA=%v)",
@@ -347,9 +327,6 @@ func (e *Edge) onRemoteStreamAck(msg map[string]interface{}) {
 	s.signalAck(ok)
 }
 
-// onRemoteStreamData 处理文本 app_stream_data（旧协议）
-//
-// N2NA 二进制路径由 handleN2NAFrame 处理，不经过这里。
 func (e *Edge) onRemoteStreamData(msg map[string]interface{}) {
 	if e.streamMgr == nil {
 		return
@@ -396,25 +373,6 @@ func (e *Edge) onRemoteStreamClose(msg map[string]interface{}) {
 }
 
 // ============ N2NA 二进制帧 ============
-//
-// 帧格式（客户端 ↔ 服务端）：
-//
-//   offset  len  字段
-//   0       4    "N2NA"           magic
-//   4       1    flags            保留，当前 0
-//   5       1    peerIdLen        peerId 字节长度（1-255）
-//   6       N    peerId           发送时填目标 clientId；服务端重写为发送方
-//   6+N     1    streamIdLen      streamId 字节长度（1-255）
-//   7+N     M    streamId         app_stream 的 streamId
-//   7+N+M   ...  rawTCPData       TCP 原始字节
-//
-// 与 N2NW 的差异：
-//   - N2NW（IPv4 数据面）：无状态，服务端按目标 peer 直接转发裸 IPv4 包
-//   - N2NA（app_stream 数据面）：有 streamId，服务端不解析、原样转发
-//
-// 服务端 features 协商：
-//   - 目标 features 含 "n2na" → 二进制转发
-//   - 目标不含 → 解码转 app_stream_data 文本（旧客户端兼容）
 
 const (
 	n2naHdrMin    = 7
@@ -422,10 +380,6 @@ const (
 	n2naStreamMax = 255
 )
 
-// buildN2NAFrame 构造 N2NA 帧。targetID 是目标 peer 的 clientId，
-// 服务端会把它重写为发送方 ID 后再转发给对端。
-//
-// 编码失败（ID 过长等）返回 nil，调用方应回退文本路径。
 func buildN2NAFrame(targetID, streamID string, payload []byte) []byte {
 	peerBytes := []byte(targetID)
 	streamBytes := []byte(streamID)
@@ -441,7 +395,7 @@ func buildN2NAFrame(targetID, streamID string, payload []byte) []byte {
 	frame[1] = '2'
 	frame[2] = 'N'
 	frame[3] = 'A'
-	frame[4] = 0 // flags
+	frame[4] = 0
 	frame[5] = byte(len(peerBytes))
 	copy(frame[6:], peerBytes)
 	frame[6+len(peerBytes)] = byte(len(streamBytes))
@@ -450,16 +404,11 @@ func buildN2NAFrame(targetID, streamID string, payload []byte) []byte {
 	return frame
 }
 
-// isN2NAFrame 快速判断是否是 N2NA 帧
 func isN2NAFrame(data []byte) bool {
 	return len(data) >= n2naHdrMin &&
 		data[0] == 'N' && data[1] == '2' && data[2] == 'N' && data[3] == 'A'
 }
 
-// handleN2NAFrame 处理服务端转发来的 N2NA 帧（binary app_stream_data）。
-//
-// 帧头 peerId 是发送方 clientId（服务端重写后），payload 是 TCP 原始字节。
-// 不校验对端 features —— 收到 N2NA 说明对端已经确认我们支持（服务端协商）。
 func (e *Edge) handleN2NAFrame(data []byte) {
 	if len(data) < n2naHdrMin {
 		return
@@ -488,7 +437,6 @@ func (e *Edge) handleN2NAFrame(data []byte) {
 	streamID := string(data[7+peerLen : 7+peerLen+streamIdLen])
 	payload := data[7+peerLen+streamIdLen:]
 
-	// 更新发送方 peer 的活跃时间
 	now := time.Now().UnixMilli()
 	e.peersMu.Lock()
 	if p, ok := e.peers[senderID]; ok {
