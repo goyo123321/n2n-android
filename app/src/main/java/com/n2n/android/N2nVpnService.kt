@@ -21,6 +21,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.n2n.mobile.Client
@@ -30,6 +31,8 @@ import java.io.File
 import java.io.PrintWriter
 import java.io.StringWriter
 import java.net.DatagramSocket
+import java.net.Inet4Address
+import java.net.Inet6Address
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -44,6 +47,9 @@ class N2nVpnService : VpnService() {
 
         private const val DEFAULT_VIRTUAL_NETWORK = "10.64.0.0/24"
         private const val TUN_MTU = 1400
+
+        // ★ 新增：网络回调去抖窗口（与 Go 层 edge_network.go 的 1.5s 对齐）
+        private const val NETWORK_DEBOUNCE_MS = 1500L
 
         const val ACTION_START = "com.n2n.android.START"
         const val ACTION_STOP = "com.n2n.android.STOP"
@@ -75,17 +81,27 @@ class N2nVpnService : VpnService() {
     private var protectedStunSocket: DatagramSocket? = null
 
     // ============================================================
-    // 网络变化监听
+    // 网络变化监听（去抖 + IPv4 优先 + 忽略 IPv6 link-local）
     // ============================================================
     //
     // 两级检测：
     //   1. onAvailable：网络类型变化（WiFi ↔ Cellular ↔ Ethernet）
     //   2. onLinkPropertiesChanged：网关变化（WiFi1 → WiFi2，同类型）
     //
-    // ★ onLinkPropertiesChanged 跳过 TRANSPORT_VPN（避免 tun0 自身触发自己）。
+    // ★ 关键修复：
+    //   Android 同一 WiFi 有 IPv4 + IPv6 link-local (fe80::1) 双默认路由，
+    //   onLinkPropertiesChanged 会在两者间反复触发 → 4 秒 6 次 → 状态机
+    //   和数据面反复被打断。
+    //
+    //   本版本：
+    //   - pickGateway() 优先 IPv4，没有才用 IPv6 非 link-local
+    //   - 与「上次通知出去的 gateway」比较，相同直接跳过
+    //   - 1.5 秒去抖窗口（与 Go 层 edge_network.go 合并延迟对齐）
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     @Volatile private var lastNetworkType = ""
-    @Volatile private var lastGateway = ""
+    @Volatile private var lastNotifiedGateway = ""
+    @Volatile private var lastNetworkTypeNotifyAt = 0L
+    @Volatile private var lastGatewayNotifyAt = 0L
 
     private val tzReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -200,23 +216,36 @@ class N2nVpnService : VpnService() {
         try {
             val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
             val cb = object : ConnectivityManager.NetworkCallback() {
+
                 override fun onAvailable(network: Network) {
                     try {
                         val caps = cm.getNetworkCapabilities(network) ?: return
+                        // VPN 自身跳过，避免 tun0 触发循环
+                        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return
+
                         val type = when {
                             caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
                             caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
                             caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
-                            caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "vpn"
                             else -> "unknown"
                         }
                         val prev = lastNetworkType
                         if (type == prev) return
                         lastNetworkType = type
+
                         if (prev.isEmpty()) {
                             ktLog("[Network] 初始网络: $type")
                             return
                         }
+
+                        // ★ 去抖：1.5 秒内不重复通知
+                        val now = SystemClock.elapsedRealtime()
+                        if (now - lastNetworkTypeNotifyAt < NETWORK_DEBOUNCE_MS) {
+                            ktLog("[Network] 类型 $prev → $type 与上次 < 1.5s，去抖跳过")
+                            return
+                        }
+                        lastNetworkTypeNotifyAt = now
+
                         ktLog("[Network] 类型变化: $prev → $type，通知 Go 层")
                         N2nController.notifyNetworkChanged(type)
                     } catch (t: Throwable) {
@@ -224,29 +253,36 @@ class N2nVpnService : VpnService() {
                     }
                 }
 
-                // ★ 网关变化检测（WiFi1 → WiFi2 同类型时 onAvailable 不触发）
-                //
-                // ★ 跳过 TRANSPORT_VPN：VPN 自身接口（tun0）变化时不应触发，
-                //   避免「通知 Go 层 → Go 层重连/重建 → 再次触发」的循环。
                 override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
                     try {
                         val caps = cm.getNetworkCapabilities(network)
-                        if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) {
-                            return
-                        }
+                        if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) return
 
-                        val gateway = lp.routes
-                            .firstOrNull { it.isDefaultRoute }
-                            ?.gateway
-                            ?.hostAddress
-                            ?: return
-                        val prev = lastGateway
-                        if (gateway == prev) return
-                        lastGateway = gateway
-                        if (prev.isEmpty()) {
+                        // ★ pickGateway 优先 IPv4，忽略 IPv6 link-local
+                        val gateway = pickGateway(lp) ?: return
+
+                        // ★ 与「上次通知出去的 gateway」比，相同直接跳过
+                        //   旧版用 lastGateway 会导致 A→B→A 的 B 也被通知
+                        if (gateway == lastNotifiedGateway) return
+
+                        // 首次
+                        if (lastNotifiedGateway.isEmpty()) {
+                            lastNotifiedGateway = gateway
                             ktLog("[Network] 初始网关: $gateway")
                             return
                         }
+
+                        // ★ 去抖：1.5 秒内不重复通知
+                        val now = SystemClock.elapsedRealtime()
+                        if (now - lastGatewayNotifyAt < NETWORK_DEBOUNCE_MS) {
+                            ktLog("[Network] 网关 $lastNotifiedGateway → $gateway 与上次 < 1.5s，去抖跳过")
+                            return
+                        }
+
+                        val prev = lastNotifiedGateway
+                        lastNotifiedGateway = gateway
+                        lastGatewayNotifyAt = now
+
                         ktLog("[Network] 网关变化: $prev → $gateway，通知 Go 层")
                         N2nController.notifyNetworkChanged("gateway:$gateway")
                     } catch (t: Throwable) {
@@ -268,6 +304,30 @@ class N2nVpnService : VpnService() {
         } catch (t: Throwable) {
             ktLog("[Network] 注册 NetworkCallback 失败: ${t.message}")
         }
+    }
+
+    // pickGateway 优先取 IPv4 默认网关；没有 IPv4 再取 IPv6 非 link-local。
+    //
+    // 为什么不直接用 firstOrNull{isDefaultRoute}：
+    //   Android 同一 WiFi 有 IPv4 + IPv6 link-local (fe80::1) 双默认路由，
+    //   onLinkPropertiesChanged 会在两者间反复触发 → 4 秒 6 次 → 数据面被打断。
+    //
+    // 为什么 IPv6 要排除 link-local：
+    //   fe80:: 只在本地链路有效，WiFi1 和 WiFi2 的 fe80::1 完全可能相同，
+    //   它的变化不能作为「网络切换」的信号。
+    //
+    // 为什么还要接受 IPv6 非 link-local：
+    //   部分 IPv6-only 环境（NAT64、企业网）没有 IPv4 默认网关，
+    //   此时 IPv6 global/ULA 是唯一信号，不能漏。
+    private fun pickGateway(lp: LinkProperties): String? {
+        val routes = lp.routes.filter { it.isDefaultRoute && it.gateway != null }
+        routes.firstOrNull { it.gateway is Inet4Address }
+            ?.gateway?.hostAddress?.let { return it }
+        routes.firstOrNull {
+            val gw = it.gateway
+            gw is Inet6Address && !gw.isLinkLocalAddress
+        }?.gateway?.hostAddress?.let { return it }
+        return null
     }
 
     private fun unregisterNetworkCallback() {
