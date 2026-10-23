@@ -5,10 +5,6 @@ package internal
 // ⚠️ 本文件只包含 TURNLite 协议实现。
 //    TURNClient / TURNServerInfo / TURNResponse / NewTURNClient / redactToken
 //    等定义在 turn_client.go，不要复制到这里。
-//
-// 依赖：
-//   - stunMessage / stunAttr / buildSTUNMsg / parseSTUNMsg / xorEncodePeer
-//     全部在本文件内定义，供 turn_lite_tcp.go 复用。
 
 import (
 	"crypto/hmac"
@@ -93,6 +89,8 @@ type TURNLite struct {
 	permMu      sync.Mutex
 
 	onMessage func([]byte, net.Addr)
+	// ★ 新增：Refresh 连续失败主动关闭时通知 TURNClient 立即重建
+	onClosed func()
 
 	pendingMu sync.Mutex
 	pending   map[[12]byte]chan *stunMessage
@@ -426,9 +424,6 @@ func (t *TURNLite) extractAllocateResult(resp *stunMessage) error {
 	return nil
 }
 
-// ensurePermission 确保本端可以向 peer 发送数据。
-//
-// ★ 加 port 参数（旧版传 0 会被 coturn 静默丢弃）。
 func (t *TURNLite) ensurePermission(ip net.IP, port int) error {
 	key := ip.String()
 	t.permMu.Lock()
@@ -490,7 +485,6 @@ func (t *TURNLite) SendTo(data []byte, peerAddr *net.UDPAddr) error {
 	if len(data) == 0 {
 		return nil
 	}
-	// ★ 传真实端口
 	if err := t.ensurePermission(peerAddr.IP, peerAddr.Port); err != nil {
 		return err
 	}
@@ -620,6 +614,10 @@ func (t *TURNLite) handleIncoming(data []byte) {
 	}
 }
 
+// refreshLoop TURN Refresh 循环。
+//
+// ★ 修复：Refresh 连续失败 3 次时，主动触发 onClosed 回调，
+//   让 TURNClient 立即重建，不等 30s StartReconnectLoop。
 func (t *TURNLite) refreshLoop() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -651,7 +649,13 @@ func (t *TURNLite) refreshLoop() {
 				log.Printf("[TURN-Lite] Refresh 失败 (%d/3): %v", consecutiveFails, err)
 				if consecutiveFails >= 3 {
 					log.Printf("[TURN-Lite] Refresh 连续失败 %d 次，关闭等待重建", consecutiveFails)
-					go t.Close()
+					// ★ 修复：主动触发 onClosed，让 TURNClient 立即重建
+					go func() {
+						t.Close()
+						if t.onClosed != nil {
+							t.onClosed()
+						}
+					}()
 					return
 				}
 				continue
@@ -683,7 +687,12 @@ func (t *TURNLite) refreshLoop() {
 
 			case 437:
 				log.Printf("[TURN-Lite] Refresh 被拒 437 (Allocation Mismatch)，关闭等待重建")
-				go t.Close()
+				go func() {
+					t.Close()
+					if t.onClosed != nil {
+						t.onClosed()
+					}
+				}()
 				return
 
 			default:
