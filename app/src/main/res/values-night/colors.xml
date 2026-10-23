@@ -12,11 +12,14 @@
     <color name="brand_danger">#DC2626</color>
     <color name="brand_warn">#F59E0B</color>
 
-    <!-- ★ 深色模式专属：badge 配色（浅色模式下这三个背景色在深底上会刺眼） -->
     <color name="badge_p2p_bg">#064E3B</color>
     <color name="badge_p2p_fg">#6EE7B7</color>
     <color name="badge_turn_bg">#1E3A8A</color>
     <color name="badge_turn_fg">#93C5FD</color>
     <color name="badge_ws_bg">#78350F</color>
     <color name="badge_ws_fg">#FCD34D</color>
+
+    <!-- ★ LAN 直连徽章（深色模式） -->
+    <color name="badge_lan_bg">#064E3B</color>
+    <color name="badge_lan_fg">#34D399</color>
 </resources>
