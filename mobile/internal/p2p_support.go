@@ -9,17 +9,6 @@ import (
 )
 
 // findPeerIDByAddr 按对端地址查 peerID。
-//
-// 匹配顺序：
-//   1. 精确匹配 UDPAddr（IP + Port）
-//   2. 精确匹配 LanEndpoints
-//   3. 精确匹配 AssistedEndpoints
-//   4. IP 匹配 AssistedEndpoints（HardNAT 端口漂移兜底，★ 要求唯一命中）
-//   5. IP 匹配 UDPAddr（★ 要求唯一命中）
-//
-// ★ 修复：assisted / udp 的 IP 级兜底必须唯一命中才返回。
-//   旧版 map 遍历顺序随机 → 多 peer 同 CGNAT 出口（同 IP 不同端口）
-//   时可能返回错误 peer → 状态机串包。
 func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 	if addr == nil {
 		return ""
@@ -27,14 +16,12 @@ func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 	e.peersMu.RLock()
 	defer e.peersMu.RUnlock()
 
-	// 1. 精确匹配 UDPAddr
 	for id, p := range e.peers {
 		if p.UDPAddr != nil && p.UDPAddr.IP.Equal(addr.IP) && p.UDPAddr.Port == addr.Port {
 			return id
 		}
 	}
 
-	// 2. 精确匹配 LanEndpoints
 	for id, p := range e.peers {
 		for _, lan := range p.LanEndpoints {
 			la, err := net.ResolveUDPAddr("udp", lan)
@@ -47,7 +34,6 @@ func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 		}
 	}
 
-	// 3. 精确匹配 AssistedEndpoints
 	for id, p := range e.peers {
 		for _, ass := range p.AssistedEndpoints {
 			aa, err := net.ResolveUDPAddr("udp", ass)
@@ -60,7 +46,7 @@ func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 		}
 	}
 
-	// 4. IP 匹配 AssistedEndpoints（唯一命中才返回）
+	// Assisted IP 匹配（唯一命中才返回）
 	var assistMatch string
 	var assistCount int
 	for id, p := range e.peers {
@@ -82,7 +68,7 @@ func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 		return assistMatch
 	}
 
-	// 5. IP 匹配 UDPAddr（唯一命中才返回）
+	// UDPAddr IP 匹配（唯一命中才返回）
 	var udpMatch string
 	var udpCount int
 	for id, p := range e.peers {
@@ -117,11 +103,7 @@ func (e *Edge) peerAddrAndMode(peerID string) (*net.UDPAddr, bool) {
 
 // handleP2PFrame 收到 N2NS 帧时的入口。
 //
-// 状态机判定（区分 LAN / 公网 / TURN 来源）：
-//   - viaTURN=false 且源 IP 是私网 → MarkLAN
-//   - viaTURN=false 且源 IP 是公网 → MarkP2P
-//   - viaTURN=true 且当前 ConnLAN/ConnP2P → 对端已降级，本机跟进 ForceFallback("peer-via-turn")
-//   - viaTURN=true 且非 LAN/P2P → 保持当前状态
+// ★ 修复：更新 lastPublicRecvAt（公网包）
 func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) {
 	if e.p2pStreams == nil {
 		return
@@ -152,7 +134,6 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 				shouldUpdate = true
 				p.lastLANRecvAt = now
 			} else if oldIsLAN && !newIsLAN {
-				// ★ registeredAt 兜底：lastLANRecvAt == 0 时从注册时间起算
 				lastLAN := p.lastLANRecvAt
 				if lastLAN == 0 {
 					lastLAN = p.registeredAt
@@ -162,7 +143,7 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 					log.Printf("[P2P] %s LAN 地址超过 30s 无流量，改用公网地址", peerID)
 				}
 			} else if oldIsLAN && newIsLAN {
-				if p.UDPAddr.Port != peerAddr.Port {
+				if p.UDPAddr.IP.Equal(peerAddr.IP) && p.UDPAddr.Port != peerAddr.Port {
 					shouldUpdate = true
 				}
 				p.lastLANRecvAt = now
@@ -176,18 +157,21 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 				p.UDPAddr = &net.UDPAddr{IP: peerAddr.IP, Port: peerAddr.Port}
 			}
 			p.lastRecvAt = now
+			// ★ 修复：公网包更新 lastPublicRecvAt
+			if !newIsLAN {
+				p.lastPublicRecvAt = now
+			}
 		}
 		e.peersMu.Unlock()
 	}
 
-	// ★ 状态机判定（区分 LAN / 公网 / TURN 来源）
 	if e.relayMgr != nil {
 		cur := e.relayMgr.GetState(peerID)
 		fromLAN := !viaTURN && isPrivateIPv4(peerAddr.IP)
 
 		switch f.Type {
 		case p2pTypePING:
-			// 静默：只更新 lastRecvAt（上方已完成）
+			// 静默：只更新 lastRecvAt
 
 		case p2pTypePONG:
 			if viaTURN && (cur == ConnLAN || cur == ConnP2P) {
