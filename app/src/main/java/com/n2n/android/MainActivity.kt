@@ -628,12 +628,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ============================================================
-    // ★ 修复：refreshPeers 先比较 code 序列，不一致就全量重建
+    // refreshPeers：先比较 code 序列，不一致就全量重建
     // ============================================================
     //
-    // 旧版用 existing == peers.length() 做增量更新依据，peer 顺序变化时
-    // （peer 被清理后重连，registeredAt 变新）会错位。
-    // 新版先比较每个位置的 code 序列，一致才增量更新。
+    // ★ 编译错误修复：不用 `?: run { break }`（inline lambda 里的
+    //   break/continue 是实验特性），改用显式 if (x == null) 判断。
+    // ★ 逻辑修复：先比较 code 序列，peer 顺序变化时全量重建，
+    //   避免增量更新错位（peer 被清理后重连 registeredAt 变新）。
     private fun refreshPeers() {
         if (isFinishing || isDestroyed || !::binding.isInitialized) return
         try {
@@ -667,7 +668,8 @@ class MainActivity : AppCompatActivity() {
             var codesMatch = (existing == peers.length())
             if (codesMatch) {
                 for (i in 0 until peers.length()) {
-                    val p = peers.optJSONObject(i) ?: run {
+                    val p = peers.optJSONObject(i)
+                    if (p == null) {
                         codesMatch = false
                         break
                     }
@@ -681,10 +683,12 @@ class MainActivity : AppCompatActivity() {
             }
 
             if (codesMatch && existing > 0) {
-                // 序列一致，增量更新（只更新变化的字段）
+                // 序列一致，增量更新
                 for (i in 0 until peers.length()) {
-                    val p = peers.optJSONObject(i) ?: continue
-                    val row = binding.peersContainer.getChildAt(i) ?: continue
+                    val p = peers.optJSONObject(i)
+                    if (p == null) continue
+                    val row = binding.peersContainer.getChildAt(i)
+                    if (row == null) continue
 
                     val tvVip = row.findViewById<android.widget.TextView>(R.id.tvPeerVip)
                     val tvMeta = row.findViewById<android.widget.TextView>(R.id.tvPeerMeta)
@@ -700,7 +704,8 @@ class MainActivity : AppCompatActivity() {
             // 序列不一致或首次渲染 → 全量重建
             binding.peersContainer.removeAllViews()
             for (i in 0 until peers.length()) {
-                val p = peers.optJSONObject(i) ?: continue
+                val p = peers.optJSONObject(i)
+                if (p == null) continue
                 val item = ItemPeerBinding.inflate(inflater, binding.peersContainer, false)
                 item.tvPeerCode.text = p.optString("code", "?")
                 item.tvPeerVip.text = p.optString("vip", "--")
