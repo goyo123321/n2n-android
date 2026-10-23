@@ -19,4 +19,8 @@
     <color name="badge_turn_fg">#1D4ED8</color>
     <color name="badge_ws_bg">#FEF3C7</color>
     <color name="badge_ws_fg">#B45309</color>
+
+    <!-- ★ LAN 直连徽章 -->
+    <color name="badge_lan_bg">#D1FAE5</color>
+    <color name="badge_lan_fg">#047857</color>
 </resources>
