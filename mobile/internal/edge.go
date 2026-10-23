@@ -29,7 +29,8 @@ type PeerInfo struct {
 	UDPAddr           *net.UDPAddr
 	lastRecvAt        int64
 	lastLANRecvAt     int64
-	lastPublicRecvAt  int64   // 最近收到公网包的时间（LAN 包不更新）
+	lastPublicRecvAt  int64
+	lastP2PRecvAt     int64   // ★ P2P 直连真实数据帧时间（viaTURN=false 且 isRealData=true）
 	loggedReady       bool
 	hasRealData       bool
 	AssistedEndpoints []string
@@ -288,7 +289,7 @@ func (e *Edge) sendP2PKeepalive() {
 // sendP2PIdleKeepalive P2P 状态发 probe + 无流量降级检测。
 //
 // ★ LAN 状态：每 30s 发一次 P2P probe（保活 + 探测），60s 无流量降级到 P2P。
-// ★ P2P 状态：30s 无流量降级到 TURN/WS。
+// ★ P2P 状态：30s 无 **P2P 真实数据** 降级到 TURN/WS（用 lastP2PRecvAt，不用 lastRecvAt）。
 // ★ P2PAvailable：交给 60s 超时处理。
 func (e *Edge) sendP2PIdleKeepalive() {
 	if e.relayMgr == nil || e.p2pStreams == nil {
@@ -323,7 +324,12 @@ func (e *Edge) sendP2PIdleKeepalive() {
 			continue
 		}
 
-		if st == ConnP2P && p.lastRecvAt > 0 && now-p.lastRecvAt > p2pIdleDeadMs {
+		if st == ConnP2P && p.lastP2PRecvAt > 0 && now-p.lastP2PRecvAt > p2pIdleDeadMs {
+			// ★ 修复：只检查 P2P 收包时间，不检查总 lastRecvAt
+			//   否则对端通过 TURN 发的包也会刷新 lastRecvAt，
+			//   单向 P2P 丢包（B→A 丢，A→B 走 TURN）永远不会被发现
+			log.Printf("[P2P] %s P2P 真实数据 %ds 未更新（lastRecvAt 可能被 TURN 包刷新），判定 P2P 失效",
+				id, (now-p.lastP2PRecvAt)/1000)
 			deadPeers = append(deadPeers, id)
 			continue
 		}
@@ -343,14 +349,14 @@ func (e *Edge) sendP2PIdleKeepalive() {
 		e.relayMgr.DemoteLANToP2P(id, "no-traffic-60s")
 	}
 
-	// P2P 30s 无流量 → TURN/WS
+	// P2P 30s 无 P2P 真实数据 → TURN/WS
 	for _, id := range deadPeers {
-		log.Printf("[P2P] %s %ds 无任何流量，判定 P2P 失效，强制降级",
+		log.Printf("[P2P] %s %ds 无 P2P 真实数据，判定 P2P 失效，强制降级",
 			id, p2pIdleDeadMs/1000)
 		e.relayMgr.ForceFallback(id, "no-traffic-30s")
 		e.peersMu.Lock()
 		if p := e.peers[id]; p != nil {
-			p.lastRecvAt = time.Now().UnixMilli()
+			p.lastP2PRecvAt = time.Now().UnixMilli()
 		}
 		e.peersMu.Unlock()
 	}
@@ -1257,6 +1263,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			p.UDPAddr = nil
 			p.lastLANRecvAt = 0
 			p.lastPublicRecvAt = 0
+			p.lastP2PRecvAt = 0
 			p.PubIP = ""
 			p.PubPort = 0
 			p.TurnRelayAddr = ""
@@ -1615,6 +1622,7 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	}
 
 	if res.State == PunchStateSucceeded {
+		// 打洞命中 LAN 时，recordP2PSuccess 已 MarkLAN，此处跳过
 		curState := e.relayMgr.GetState(instr.TargetMac)
 		if curState != ConnLAN {
 			e.relayMgr.MarkP2PAvailable(instr.TargetMac)
@@ -1962,7 +1970,10 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 
 // notePeerCommon 统一处理所有来源的 UDP 包。
 //
-// ★ 修复：Unknown 状态收到 TURN 真实数据帧时 MarkFallback（面板不再显示 --）。
+// ★ 修复：
+//   - isRealData && !viaTURN → 更新 lastP2PRecvAt（P2P 真实数据时间）
+//   - viaTURN && cur == ConnUnknown → MarkFallback（面板不再显示 --）
+//   - viaTURN && cur == ConnLAN/ConnP2P → ForceFallback("peer-via-turn")
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
 	now := time.Now().UnixMilli()
 
@@ -2065,6 +2076,11 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 	if !newIsLAN {
 		best.lastPublicRecvAt = now
 	}
+	if isRealData && !viaTURN {
+		// ★ 新增：只有 P2P 直连的真实数据才刷新
+		//   对端通过 TURN 发的包（viaTURN=true）不算 P2P，不刷新
+		best.lastP2PRecvAt = now
+	}
 	if isRealData {
 		best.hasRealData = true
 	}
@@ -2086,7 +2102,6 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 				e.relayMgr.ForceFallback(clientID, "peer-via-turn")
 			} else if cur == ConnUnknown {
 				// ★ 修复：Unknown 状态收到 TURN 真实数据 → 对端可达，标记为 ConnTURN
-				//   否则面板显示 "--"，状态机永远空
 				log.Printf("[TURN] 从 %s (%s) 收到真实数据帧（Unknown → TURN）",
 					clientID, ip)
 				e.relayMgr.MarkFallback(clientID)
