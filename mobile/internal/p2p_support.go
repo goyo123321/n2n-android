@@ -10,14 +10,16 @@ import (
 
 // findPeerIDByAddr 按对端地址查 peerID。
 //
-// ★ P0 修复（本次）：加 IP 匹配 AssistedEndpoints
+// 匹配顺序：
+//   1. 精确匹配 UDPAddr（IP + Port）
+//   2. 精确匹配 LanEndpoints
+//   3. 精确匹配 AssistedEndpoints
+//   4. IP 匹配 AssistedEndpoints（HardNAT 端口漂移兜底，★ 要求唯一命中）
+//   5. IP 匹配 UDPAddr（★ 要求唯一命中）
 //
-// 旧版问题：HardNAT 端口漂移时，B 的 PONG 从 112.96.52.208:任意端口 来，
-// 但 AssistedEndpoints 里只有 112.96.52.208:32519/52911/...（固定几个端口）。
-// 精确匹配全部失败 → 找不到 peer → lastRecvAt 不更新 → 30 秒后 ForceFallback。
-//
-// 新版：精确匹配全部失败后，用 IP 匹配 AssistedEndpoints（忽略端口）。
-// 只要 IP 匹配，就认定是该 peer 的包。
+// ★ 修复（本轮）：assisted / udp 的 IP 级兜底必须唯一命中才返回。
+//   旧版 map 遍历顺序随机 → 多 peer 同 CGNAT 出口（同 IP 不同端口）
+//   时可能返回错误 peer → 状态机串包。
 func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 	if addr == nil {
 		return ""
@@ -58,8 +60,9 @@ func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 		}
 	}
 
-	// ★ 新增 4：IP 匹配 AssistedEndpoints（HardNAT 端口漂移兜底）
-	// B 的 PONG 从 112.96.52.208:任意端口 来，只要 IP 匹配 AssistedEndpoints 就认
+	// 4. IP 匹配 AssistedEndpoints（唯一命中才返回）
+	var assistMatch string
+	var assistCount int
 	for id, p := range e.peers {
 		for _, ass := range p.AssistedEndpoints {
 			aa, err := net.ResolveUDPAddr("udp", ass)
@@ -67,16 +70,31 @@ func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 				continue
 			}
 			if aa.IP.Equal(addr.IP) {
-				return id
+				if assistMatch != id {
+					assistMatch = id
+					assistCount++
+				}
+				break
 			}
 		}
 	}
+	if assistCount == 1 {
+		return assistMatch
+	}
 
-	// ★ 新增 5：IP 匹配 UDPAddr（原有兜底，移到后面避免干扰）
+	// 5. IP 匹配 UDPAddr（唯一命中才返回）
+	var udpMatch string
+	var udpCount int
 	for id, p := range e.peers {
 		if p.UDPAddr != nil && p.UDPAddr.IP.Equal(addr.IP) {
-			return id
+			if udpMatch != id {
+				udpMatch = id
+				udpCount++
+			}
 		}
+	}
+	if udpCount == 1 {
+		return udpMatch
 	}
 
 	return ""
@@ -99,18 +117,10 @@ func (e *Edge) peerAddrAndMode(peerID string) (*net.UDPAddr, bool) {
 
 // handleP2PFrame 收到 N2NS 帧时的入口。
 //
-// ★ P0 修复：PING/PONG 状态机（与 PC / Termux 对齐）
-//
-// 新行为：
-//   - 收到 PING → 只更新 lastRecvAt（由调用方已完成），不升级、不回 PONG
-//   - 收到 PONG → 升级 P2P（证明双向可达）
-//   - 收到数据帧 → 升级 P2P（数据面已验证）
-//
-// ★ P1 修复：区分 PONG / 数据帧的 viaTURN 来源
-//
-//   - viaTURN=false 的 PONG → MarkP2P（真 P2P）
-//   - viaTURN=true  的 PONG → 保持 P2PAvailable（不标记 P2P），
-//                        让 60s 超时自然降级到 TURN
+// 状态机判定：
+//   - viaTURN=false 的 PONG / 数据帧 → MarkP2P
+//   - viaTURN=true 且当前 ConnP2P → 对端已降级，本机跟进 ForceFallback("peer-via-turn")
+//   - viaTURN=true 且非 P2P → 保持当前状态
 func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) {
 	if e.p2pStreams == nil {
 		return
@@ -141,7 +151,12 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 				shouldUpdate = true
 				p.lastLANRecvAt = now
 			} else if oldIsLAN && !newIsLAN {
-				if p.lastLANRecvAt > 0 && now-p.lastLANRecvAt > 30000 {
+				// ★ registeredAt 兜底：lastLANRecvAt == 0 时从注册时间起算
+				lastLAN := p.lastLANRecvAt
+				if lastLAN == 0 {
+					lastLAN = p.registeredAt
+				}
+				if lastLAN > 0 && now-lastLAN > 30000 {
 					shouldUpdate = true
 					log.Printf("[P2P] %s LAN 地址超过 30s 无流量，改用公网地址", peerID)
 				}
@@ -164,33 +179,36 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 		e.peersMu.Unlock()
 	}
 
-	// ★ P0 + P1 修复：区分 viaTURN 来源
+	// 状态机判定
 	if e.relayMgr != nil {
+		cur := e.relayMgr.GetState(peerID)
+
 		switch f.Type {
 		case p2pTypePING:
 			// 静默：只更新 lastRecvAt（上方已完成）
-			// PONG 由 p2pStreams.handleFrame 统一回复
 
 		case p2pTypePONG:
-			if e.relayMgr.GetState(peerID) != ConnP2P {
-				if !viaTURN {
-					log.Printf("[P2P] 收到 PONG（UDP 直连）→ P2P 直连（双向通道已验证）")
-					e.relayMgr.MarkP2P(peerID)
-				} else {
-					log.Printf("[TURN] 通过 TURN 收到 PONG → 保持 P2PAvailable（不标记 P2P，等待直连 PONG）")
-				}
+			if viaTURN && cur == ConnP2P {
+				log.Printf("[P2P] %s 通过 TURN 收到 PONG → 对端已降级，本机跟进", peerID)
+				e.relayMgr.ForceFallback(peerID, "peer-via-turn")
+			} else if !viaTURN && cur != ConnP2P {
+				log.Printf("[P2P] 收到 PONG（UDP 直连）→ P2P 直连（双向通道已验证）")
+				e.relayMgr.MarkP2P(peerID)
+			} else if viaTURN && cur != ConnP2P {
+				log.Printf("[TURN] 通过 TURN 收到 PONG → 保持 P2PAvailable（不标记 P2P，等待直连 PONG）")
 			}
 
 		default:
-			if e.relayMgr.GetState(peerID) != ConnP2P {
-				if !viaTURN {
-					log.Printf("[P2P] 收到数据帧（stream=%d type=%d）→ P2P 直连",
-						f.StreamID, f.Type)
-					e.relayMgr.MarkP2P(peerID)
-				} else {
-					log.Printf("[TURN] 通过 TURN 收到数据帧（stream=%d type=%d）→ 保持当前状态",
-						f.StreamID, f.Type)
-				}
+			if viaTURN && cur == ConnP2P {
+				log.Printf("[P2P] %s 通过 TURN 收到数据帧 → 对端已降级，本机跟进", peerID)
+				e.relayMgr.ForceFallback(peerID, "peer-via-turn")
+			} else if !viaTURN && cur != ConnP2P {
+				log.Printf("[P2P] 收到数据帧（stream=%d type=%d）→ P2P 直连",
+					f.StreamID, f.Type)
+				e.relayMgr.MarkP2P(peerID)
+			} else if viaTURN && cur != ConnP2P {
+				log.Printf("[TURN] 通过 TURN 收到数据帧（stream=%d type=%d）→ 保持当前状态",
+					f.StreamID, f.Type)
 			}
 		}
 	}
