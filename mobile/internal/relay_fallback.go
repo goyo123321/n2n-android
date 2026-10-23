@@ -40,8 +40,7 @@ func NewRelayManager(ws *WSTransport, turnClient *TURNClient, edge *Edge) *Relay
 }
 
 // MarkP2PAvailable 标记打洞握手成功（等待数据帧验证）。
-//
-// ★ 上报 p2pStatus=2（state=1 InProgress），服务端刷新 in-flight 窗口。
+// 上报 p2pStatus=2（state=1 InProgress），服务端刷新 in-flight 窗口。
 func (rm *RelayManager) MarkP2PAvailable(peerID string) {
 	rm.mu.Lock()
 	cur := rm.states[peerID]
@@ -114,7 +113,7 @@ func (rm *RelayManager) DemoteLANToP2P(peerId, reason string) {
 }
 
 // MarkFallback 从 Unknown 状态降级到 TURN/WS。
-// ★ 删除了旧的 10s 保护（误伤新 peer）。
+// ★ 删除旧的 10s 保护（误伤新 peer）。
 func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.mu.Lock()
 
@@ -160,7 +159,7 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 }
 
 // ForceFallback 强制降级。
-// ★ 白名单覆盖：peer-via-turn / peer-via-ws / no-traffic-30s / p2p-avail-timeout / network-changed
+// ★ 白名单覆盖：peer-via-turn / peer-via-ws / no-traffic-30s / p2p-avail-timeout / network-changed / lan-endpoints-cleared
 func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
@@ -173,7 +172,8 @@ func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 		if reason != "peer-via-turn" &&
 			reason != "peer-via-ws" &&
 			reason != "no-traffic-30s" &&
-			reason != "network-changed" {
+			reason != "network-changed" &&
+			reason != "lan-endpoints-cleared" {
 			return
 		}
 		log.Printf("[连接] %s 从 LAN 降级 (force: %s)", peerId, reason)
@@ -200,7 +200,7 @@ func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	rm.cancelFallbackTimer(peerId)
 	if rm.edge != nil {
 		rm.edge.cancelP2PAvailTimeout(peerId)
-		rm.edge.reportP2PStatus(peerId, 0)   // ★ state=2，服务端清 anySucceeded
+		rm.edge.reportP2PStatus(peerId, 0)
 	}
 }
 
@@ -321,10 +321,9 @@ func (rm *RelayManager) SendViaRelay(data []byte) error {
 
 // SendToPeer 按当前状态发送数据。
 //
-// ★ ConnLAN 分支：LAN 发送失败后降级到 ConnP2PAvailable（不是 ConnP2P），
-//   并 cancelFallbackTimer + scheduleP2PAvailTimeout。
-//   原因：ConnP2P 会让客户端跳过 nat_hole_instruction；
-//        ConnP2PAvailable 会接受指令并继续验证，60s 超时降级。
+// ★ ConnLAN 分支：LanEndpoints 为空时立即降级（joined lan=0 会清空）；
+//   LAN 发送失败降级到 ConnP2PAvailable（不是 ConnP2P）。
+// ★ ConnTURN 分支：连续失败 3 次清空 relay 地址，等对端重新上报。
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
 	state := rm.GetState(peerId)
 
@@ -333,6 +332,28 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 		if target == nil || rm.edge == nil || rm.edge.udpConn == nil {
 			rm.MarkFallback(peerId)
 			return false
+		}
+
+		// ★ 修复：LanEndpoints 为空说明对端 LAN 已消失（joined lan=0 时会被清空）
+		//
+		// 场景：joined 到达时清空 LanEndpoints，但状态仍是 ConnLAN
+		//   → 立即降级到 ConnP2PAvailable，尝试公网 UDPAddr
+		// 旧版：for 循环空转 → sent=false → 5 次后才降级
+		if len(target.LanEndpoints) == 0 && (target.UDPAddr == nil || isPrivateIPv4(target.UDPAddr.IP)) {
+			log.Printf("[连接] %s LanEndpoints 为空，且 UDPAddr 无公网地址，降级", peerId)
+			rm.mu.Lock()
+			wasLAN := rm.states[peerId] == ConnLAN
+			if wasLAN {
+				rm.states[peerId] = ConnP2PAvailable
+			}
+			rm.mu.Unlock()
+
+			if wasLAN && rm.edge != nil {
+				rm.edge.cancelFallbackTimer(peerId)
+				rm.edge.reportP2PStatus(peerId, 2)
+				rm.edge.scheduleP2PAvailTimeout(peerId)
+			}
+			return rm.ws.SendBinary(buildN2NWFrame(peerId, data)) == nil
 		}
 
 		sent := false
@@ -355,7 +376,7 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 			return true
 		}
 
-		// LAN 失败 → ConnP2PAvailable（不是 ConnP2P）
+		// LAN 失败 → ConnP2PAvailable
 		rm.mu.Lock()
 		wasLAN := rm.states[peerId] == ConnLAN
 		if wasLAN {
@@ -366,7 +387,6 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 		if wasLAN {
 			log.Printf("[连接] %s LAN 发送失败，降级到 P2PAvailable（等待验证）", peerId)
 			if rm.edge != nil {
-				// ★ 取消旧 8s timer（虽然已过，但防御性取消）
 				rm.edge.cancelFallbackTimer(peerId)
 				rm.edge.reportP2PStatus(peerId, 2)
 				rm.edge.scheduleP2PAvailTimeout(peerId)
@@ -450,9 +470,38 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 			relayAddr, err := net.ResolveUDPAddr("udp", target.TurnRelayAddr)
 			if err == nil {
 				if sendErr := rm.turnClient.Send(data, relayAddr); sendErr == nil {
+					// 成功，清空失败计数
+					rm.mu.Lock()
+					delete(rm.failCounts, peerId)
+					rm.mu.Unlock()
 					return true
 				} else {
 					log.Printf("[TURN] 发送到 %s 失败（临时）: %v", peerId, sendErr)
+					// ★ 修复：连续失败 3 次清空 relay 地址，等对端重新上报
+					//
+					// 场景：对端 TURN relay 重新分配（旧 relay 失效），
+					//   本端用旧地址发 → 全丢，等对端 turn_relay_info 广播才更新。
+					// 修复：3 次失败后主动清空 relay 地址，走 WS 兜底，
+					//   对端下次 turn_relay_info 或 joined 时更新新地址。
+					rm.mu.Lock()
+					rm.failCounts[peerId]++
+					fc := rm.failCounts[peerId]
+					rm.mu.Unlock()
+					if fc >= 3 {
+						log.Printf("[TURN] %s 连续失败 %d 次，清空 relay 地址等重新上报", peerId, fc)
+						rm.mu.Lock()
+						delete(rm.failCounts, peerId)
+						rm.mu.Unlock()
+						if rm.edge != nil {
+							rm.edge.peersMu.Lock()
+							if p := rm.edge.peers[peerId]; p != nil {
+								oldRelay := p.TurnRelayAddr
+								p.TurnRelayAddr = ""
+								log.Printf("[TURN] 清空 %s 的旧 relay 地址 %q", peerId, oldRelay)
+							}
+							rm.edge.peersMu.Unlock()
+						}
+					}
 					if rm.ws != nil {
 						_ = rm.ws.SendBinary(buildN2NWFrame(peerId, data))
 					}
