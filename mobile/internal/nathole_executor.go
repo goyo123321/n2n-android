@@ -103,8 +103,8 @@ func extractPortFromEndpoint(ep string) int {
 //   - sortLANByAffinity     → lan.go
 //   - localPrefixes         → lan.go
 //   - safeGo                → edge.go
-//   - hasTrafficFromTarget  → edge.go  ★ 本次修复：本文件不再重复定义
-//   - hasTrafficFromAny     → edge.go  ★ 本次修复：本文件不再重复定义
+//   - hasTrafficFromTarget  → edge.go
+//   - hasTrafficFromAny     → edge.go
 //   - buildN2NWFrame        → p2p_stream.go
 
 func (e *Edge) startFailCountResetLoop() {
@@ -236,7 +236,7 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		return nil
 	}
 
-	// ★ P0-1 打洞并行化：去重 key 用 target@rung，允许同一 target 的多个 rung 并行
+	// 去重 key 用 target@rung，允许同一 target 的多个 rung 并行
 	activeKey := fmt.Sprintf("%s@%d", instr.TargetMac, instr.BehaviorIndex)
 	if natHoleActive[activeKey] {
 		natHoleActiveMu.Unlock()
@@ -459,6 +459,10 @@ func (e *Edge) resetFailCount(peerID string) {
 	natHoleActiveMu.Unlock()
 }
 
+// recordP2PSuccess 记录打洞成功时的 peer 地址。
+//
+// ★ registeredAt 兜底：lastLANRecvAt == 0 时从注册时间起算，
+//   避免初始 LAN peer 永不移交到公网。
 func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAddr) {
 	e.peersMu.Lock()
 	if p, ok := e.peers[instr.TargetMac]; ok {
@@ -472,7 +476,12 @@ func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAd
 		} else if !oldIsLAN && newIsLAN {
 			shouldUpdate = true
 		} else if oldIsLAN && !newIsLAN {
-			if p.lastLANRecvAt > 0 && now-p.lastLANRecvAt > 30000 {
+			// ★ registeredAt 兜底
+			lastLAN := p.lastLANRecvAt
+			if lastLAN == 0 {
+				lastLAN = p.registeredAt
+			}
+			if lastLAN > 0 && now-lastLAN > 30000 {
 				shouldUpdate = true
 			}
 		} else {
@@ -484,17 +493,17 @@ func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAd
 		if newIsLAN {
 			p.lastLANRecvAt = now
 		}
-
 		if shouldUpdate {
 			p.UDPAddr = targetAddr
 		}
 		p.lastRecvAt = now
 	} else {
 		e.peers[instr.TargetMac] = &PeerInfo{
-			ClientID:   instr.TargetMac,
-			VirtualIP:  instr.TargetVirtualIp,
-			UDPAddr:    targetAddr,
-			lastRecvAt: time.Now().UnixMilli(),
+			ClientID:     instr.TargetMac,
+			VirtualIP:    instr.TargetVirtualIp,
+			UDPAddr:      targetAddr,
+			lastRecvAt:   time.Now().UnixMilli(),
+			registeredAt: time.Now().UnixMilli(), // ★ 新增
 		}
 	}
 	e.peersMu.Unlock()
