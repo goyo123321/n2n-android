@@ -10,6 +10,8 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.VpnService
@@ -41,8 +43,6 @@ class N2nVpnService : VpnService() {
         private const val NOTIF_ID = 1001
 
         private const val DEFAULT_VIRTUAL_NETWORK = "10.64.0.0/24"
-
-        // MTU 与 PC 端对齐
         private const val TUN_MTU = 1400
 
         const val ACTION_START = "com.n2n.android.START"
@@ -75,16 +75,20 @@ class N2nVpnService : VpnService() {
     private var protectedStunSocket: DatagramSocket? = null
 
     // ============================================================
-    // ★ 新增：网络变化监听
+    // 网络变化监听
     // ============================================================
     //
-    // WiFi ↔ Cellular 切换时，UDP socket 源 IP 变化，旧 P2P 路径必然失效。
-    // STUN 探测周期 5 秒太慢，中间 5-35 秒客户端继续往旧路径发包全丢。
+    // 两级检测：
+    //   1. onAvailable：网络类型变化（WiFi ↔ Cellular ↔ Ethernet）
+    //   2. onLinkPropertiesChanged：网关变化（WiFi1 → WiFi2，同类型）
     //
-    // 用 ConnectivityManager.NetworkCallback 毫秒级感知，立即通知 Go 层
-    // 清 P2P 状态 + 通知服务端重新协调。
+    // ★ onLinkPropertiesChanged 解决「WiFi1 → WiFi2 同类型不触发」问题：
+    //   onAvailable 只在「网络可用」时触发，WiFi 间切换类型都是 "wifi"，
+    //   旧版 type == prev 直接 return → OnNetworkChanged 永不调用。
+    //   网关变化能准确反映「换到了不同的 WiFi 网络」。
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     @Volatile private var lastNetworkType = ""
+    @Volatile private var lastGateway = ""     // ★ 新增
 
     private val tzReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -186,21 +190,20 @@ class N2nVpnService : VpnService() {
             )
         } catch (_: Throwable) {}
 
-        // ★ 新增：注册网络变化回调
         registerNetworkCallback()
 
         ktLog("onCreate: 进程启动/Service 创建")
     }
 
     // ============================================================
-    // ★ 新增：网络变化回调注册/注销
+    // 网络变化回调注册/注销
     // ============================================================
 
     private fun registerNetworkCallback() {
         try {
             val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
             val cb = object : ConnectivityManager.NetworkCallback() {
-                override fun onAvailable(network: android.net.Network) {
+                override fun onAvailable(network: Network) {
                     try {
                         val caps = cm.getNetworkCapabilities(network) ?: return
                         val type = when {
@@ -217,16 +220,41 @@ class N2nVpnService : VpnService() {
                             ktLog("[Network] 初始网络: $type")
                             return
                         }
-                        ktLog("[Network] 变化: $prev → $type，通知 Go 层清 P2P 状态")
+                        ktLog("[Network] 类型变化: $prev → $type，通知 Go 层")
                         N2nController.notifyNetworkChanged(type)
                     } catch (t: Throwable) {
                         Log.w(TAG, "NetworkCallback.onAvailable failed", t)
                     }
                 }
 
-                override fun onLost(network: android.net.Network) {
+                // ★ 新增：网关变化检测
+                //
+                // WiFi1 → WiFi2 同类型时 onAvailable 不触发，但网关会变化：
+                //   192.168.1.1 → 192.168.2.1
+                // 用网关变化来检测「换到了不同的 WiFi 网络」。
+                override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
+                    try {
+                        val gateway = lp.routes
+                            .firstOrNull { it.isDefaultRoute }
+                            ?.gateway
+                            ?.hostAddress
+                            ?: return
+                        val prev = lastGateway
+                        if (gateway == prev) return
+                        lastGateway = gateway
+                        if (prev.isEmpty()) {
+                            ktLog("[Network] 初始网关: $gateway")
+                            return
+                        }
+                        ktLog("[Network] 网关变化: $prev → $gateway，通知 Go 层")
+                        N2nController.notifyNetworkChanged("gateway:$gateway")
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "NetworkCallback.onLinkPropertiesChanged failed", t)
+                    }
+                }
+
+                override fun onLost(network: Network) {
                     // 紧随 onAvailable 触发，不必单独处理
-                    // 真正的「无网络」由后续 onAvailable 的 type 变化覆盖
                 }
             }
             cm.registerNetworkCallback(
@@ -354,11 +382,6 @@ class N2nVpnService : VpnService() {
         val preferredIp = intent.getStringExtra(EXTRA_PREFERRED_IP) ?: ""
         val roomId = intent.getStringExtra(EXTRA_ROOM_ID) ?: "default-room"
 
-        // ★ clientId 为空/缺失时兜底到持久化 ID
-        //
-        // 问题：若通过 SDK / 命令行 / adb shell am start 传入空 clientId，
-        //       FetchVIP 和 Start 两次调用会各自生成随机 ID，
-        //       导致 TUN 的 IP 和 Go 层 VIP 不一致 → 连接建立但数据不通。
         val clientId = (intent.getStringExtra(EXTRA_CLIENT_ID)?.takeIf { it.isNotBlank() })
             ?: Prefs.loadOrCreateClientId(this)
 
@@ -662,11 +685,7 @@ class N2nVpnService : VpnService() {
         }.apply { name = "n2n-stop" }.start()
     }
 
-    // ============================================================
-    // WiFi 锁：Android 10+ 用 LOW_LATENCY 模式
-    // ============================================================
     private fun acquireLocks() {
-        // CPU 唤醒锁（保持 CPU 运行）
         try {
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
             wakeLock = pm.newWakeLock(
@@ -680,12 +699,10 @@ class N2nVpnService : VpnService() {
             ktLog("acquire WakeLock 失败: ${t.message}")
         }
 
-        // WiFi 锁（防止 WiFi 芯片进入 PS-Poll 省电模式）
         try {
             val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
 
             val lockMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                // ★ Android 10+：LOW_LATENCY 专为低延迟设计，息屏后仍保活
                 WifiManager.WIFI_MODE_FULL_LOW_LATENCY
             } else {
                 @Suppress("DEPRECATION")
@@ -826,7 +843,6 @@ class N2nVpnService : VpnService() {
 
         try { unregisterReceiver(tzReceiver) } catch (_: Throwable) {}
 
-        // ★ 新增：注销网络回调
         unregisterNetworkCallback()
 
         try { handler.removeCallbacksAndMessages(null) } catch (_: Throwable) {}
