@@ -7,7 +7,10 @@ package internal
 // 用途：不想让所有 App 流量走 VPN 时，可以关掉 VPN 的某些应用，
 // 只让需要的 App 通过 127.0.0.1:1080 访问组网内的服务。
 //
-// 与 PC / Termux 端的实现完全一致。
+// ★ 修复：拆成 Listen() / Serve() 两步。
+//   Listen() 同步监听，失败返回 error（供 internal.Start 判断端口冲突）。
+//   Serve() 阻塞 Accept 循环，前提是 Listen() 已成功。
+//   旧版 Serve() 里静默 return，上层不知道端口冲突，用户看到"启动成功"但 SOCKS5 没起来。
 
 import (
 	"encoding/binary"
@@ -49,17 +52,25 @@ func NewSocks5Server(edge *Edge, listen string) *Socks5Server {
 	}
 }
 
-func (s *Socks5Server) Serve() {
+// Listen 同步监听。失败返回 error。
+func (s *Socks5Server) Listen() error {
 	ln, err := net.Listen("tcp", s.listen)
 	if err != nil {
-		log.Printf("[SOCKS5] 监听 %s 失败: %v", s.listen, err)
-		return
+		return fmt.Errorf("SOCKS5 监听 %s 失败: %w", s.listen, err)
 	}
 	s.ln = ln
 	log.Printf("[SOCKS5] 监听 %s（用 curl --socks5 或 ALL_PROXY 访问虚拟 IP）", s.listen)
+	return nil
+}
 
+// Serve 阻塞 Accept 循环，前提是 Listen() 已成功。
+func (s *Socks5Server) Serve() {
+	if s.ln == nil {
+		log.Printf("[SOCKS5] Serve 调用时 ln 为 nil（Listen 未调用？），退出")
+		return
+	}
 	for {
-		conn, err := ln.Accept()
+		conn, err := s.ln.Accept()
 		if err != nil {
 			select {
 			case <-s.stopCh:
@@ -170,10 +181,11 @@ func (s *Socks5Server) handleConn(conn net.Conn) {
 		return
 	}
 
-	// 优先走 P2P / P2PAvailable / TURN
+	// 优先走 P2P / LAN / P2PAvailable / TURN
 	useP2P := s.edge.p2pStreams != nil &&
 		s.edge.relayMgr != nil &&
 		(s.edge.relayMgr.IsP2P(peerID) ||
+			s.edge.relayMgr.IsLAN(peerID) ||
 			s.edge.relayMgr.IsP2PAvailable(peerID) ||
 			s.edge.relayMgr.IsTURN(peerID))
 
@@ -191,7 +203,6 @@ func (s *Socks5Server) handleConn(conn net.Conn) {
 		log.Printf("[SOCKS5] P2P 建流失败(%v)，回落 WS 中继", err)
 	}
 
-	// 回落 WS 中继
 	stream, err := s.edge.openLocalStream(peerID, int(dstPort), conn)
 	if err != nil {
 		log.Printf("[SOCKS5] 打开 stream 失败: %v", err)
