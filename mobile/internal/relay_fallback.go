@@ -226,21 +226,52 @@ func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	}
 }
 
+// ClearPeer 删除 peer 的本地状态。
+//
+// ★ 修复：锁外立即上报 connection_status（即使 conns 为空也要发），
+//   让服务端立即清空该 peer 的 connections。
+//   场景：peer_network_changed / left 时，客户端状态清空，
+//   旧版要等 10s Report ticker 才同步，面板 10 秒内显示过时状态。
 func (rm *RelayManager) ClearPeer(peerID string) {
 	if peerID == "" {
 		return
 	}
+
 	rm.mu.Lock()
-	defer rm.mu.Unlock()
 	delete(rm.states, peerID)
 	delete(rm.failCounts, peerID)
+
+	conns := make(map[string]string)
+	for id, t := range rm.states {
+		conns[id] = string(t)
+	}
+	rm.mu.Unlock()
+
+	// ★ 锁外上报（即使 conns 为空也发，让服务端清空）
+	if rm.ws != nil {
+		_ = rm.ws.Send(map[string]interface{}{
+			"type":    "connection_status",
+			"payload": map[string]interface{}{"connections": conns},
+		})
+	}
 }
 
+// ClearAll 清空所有本地状态。
+//
+// ★ 修复：锁外立即上报空 connection_status。
 func (rm *RelayManager) ClearAll() {
 	rm.mu.Lock()
-	defer rm.mu.Unlock()
 	rm.states = make(map[string]ConnType)
 	rm.failCounts = make(map[string]int)
+	rm.mu.Unlock()
+
+	// ★ 锁外上报空 map（让服务端清空）
+	if rm.ws != nil {
+		_ = rm.ws.Send(map[string]interface{}{
+			"type":    "connection_status",
+			"payload": map[string]interface{}{"connections": map[string]string{}},
+		})
+	}
 }
 
 func (rm *RelayManager) cancelFallbackTimer(peerID string) {
