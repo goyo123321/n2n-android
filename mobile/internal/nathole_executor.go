@@ -331,7 +331,6 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		case <-time.After(300 * time.Millisecond):
 		}
 
-		// ★ 优先判 LAN 命中
 		if e.hasTrafficFromTargetLAN(instr.TargetMac, startAt) {
 			res.State = PunchStateSucceeded
 			res.Attempts = attempts
@@ -405,7 +404,6 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 				}
 			}
 
-			// ★ LAN 或公网命中都算成功
 			if e.hasTrafficFromTargetLAN(instr.TargetMac, startAt) ||
 				e.hasTrafficFromTargetPublic(instr.TargetMac, startAt) {
 				success = true
@@ -470,6 +468,10 @@ func (e *Edge) resetFailCount(peerID string) {
 }
 
 // recordP2PSuccess 记录打洞成功时的 peer 地址。
+//
+// ★ 修复：LAN 命中时从任何非 LAN / 非 P2P 状态升级到 ConnLAN。
+//   旧版只从 ConnUnknown 升级，从 TURN/Relay/P2PAvailable 命中 LAN 时会短暂
+//   经过 P2PAvailable（60s 空闲才降级）。
 func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAddr) {
 	e.peersMu.Lock()
 	if p, ok := e.peers[instr.TargetMac]; ok {
@@ -518,10 +520,15 @@ func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAd
 	e.peersMu.Unlock()
 
 	// 打洞命中 LAN 地址 → 直接 MarkLAN
+	//
+	// ★ 修复：从 ConnUnknown / ConnTURN / ConnRelay / ConnP2PAvailable 命中 LAN 时，
+	//   都升级到 ConnLAN。只有已经是 ConnLAN / ConnP2P 时才跳过（保留更优状态）。
+	//   旧版只从 ConnUnknown 升级，从 TURN 命中 LAN 时会短暂经过 P2PAvailable。
 	if isPrivateIPv4(targetAddr.IP) && e.relayMgr != nil {
 		curState := e.relayMgr.GetState(instr.TargetMac)
-		if curState == ConnUnknown {
-			log.Printf("[LAN] 打洞命中 LAN 地址 %s → LAN 直连", targetAddr)
+		if curState != ConnLAN && curState != ConnP2P {
+			log.Printf("[LAN] 打洞命中 LAN 地址 %s → LAN 直连（prev=%s）",
+				targetAddr, curState)
 			e.relayMgr.MarkLAN(instr.TargetMac)
 		}
 	}
