@@ -11,20 +11,19 @@ import (
 // OnNetworkChanged 网络切换时的状态清理。
 //
 // 触发点：
-//   - Kotlin NetworkCallback.onAvailable（网络类型变化 WiFi ↔ Cellular）
+//   - Kotlin NetworkCallback.onAvailable（网络类型变化）
 //   - Kotlin NetworkCallback.onLinkPropertiesChanged（网关变化 WiFi1 → WiFi2）
 //
 // 分六步：
 //  1. 清空打洞失败计数
 //  2. 重置 relayMgr 的 P2P/LAN 状态（保留 TURN/WS）
-//  3. 清空 peer 的 UDPAddr 和 LanEndpoints（旧 LAN 地址不可达）
+//  3. 清空 peer 的 UDPAddr / LanEndpoints / lastPublicRecvAt
 //  4. 取消所有 pending timer
 //  5. 立即上报 metadata（绕过 30s 节流）
 //  6. 通知服务端重新协调
 func (e *Edge) OnNetworkChanged(networkType string) {
 	log.Printf("[Network] 检测到网络变化: %s，重置 P2P 状态", networkType)
 
-	// 1. 清空打洞失败计数
 	natHoleActiveMu.Lock()
 	failCount := len(failCounts)
 	if failCount > 0 {
@@ -36,19 +35,11 @@ func (e *Edge) OnNetworkChanged(networkType string) {
 	}
 	natHoleActiveMu.Unlock()
 
-	// 2. 重置 relayMgr 的 P2P/LAN 状态（保留 TURN/WS）
 	if e.relayMgr != nil {
 		e.relayMgr.ResetP2PStates("network-changed")
 	}
 
-	// 3. 清空所有 peer 的 UDPAddr 和 LanEndpoints
-	//
-	// ★ 关键：LanEndpoints 也要清空
-	//   场景：WiFi1 → WiFi2（不同网段），对端的 LAN 地址（192.168.1.20）
-	//   在新网络下不可达。不清空的话，SendToPeer 会先尝试旧 LAN 地址：
-	//   - WriteTo 可能返回 nil（内核接受），但包实际丢了
-	//   - 不会立即失败降级，延迟更高
-	//   清空后，等下次 joined 或 nat_hole_instruction 重新补充。
+	// ★ 清空 UDPAddr / LanEndpoints / lastPublicRecvAt
 	e.peersMu.Lock()
 	count := 0
 	for _, p := range e.peers {
@@ -58,12 +49,12 @@ func (e *Edge) OnNetworkChanged(networkType string) {
 		p.UDPAddr = nil
 		p.lastLANRecvAt = 0
 		p.lastRecvAt = 0
-		p.LanEndpoints = nil   // ★ 新增：清空旧 LAN 地址
+		p.lastPublicRecvAt = 0
+		p.LanEndpoints = nil
 	}
 	e.peersMu.Unlock()
-	log.Printf("[Network] 清空 %d 个 peer 的 UDPAddr 和 LanEndpoints", count)
+	log.Printf("[Network] 清空 %d 个 peer 的 UDPAddr / LanEndpoints", count)
 
-	// 4. 取消所有 pending timer
 	e.fallbackTimersMu.Lock()
 	for _, t := range e.fallbackTimers {
 		t.Stop()
@@ -78,11 +69,9 @@ func (e *Edge) OnNetworkChanged(networkType string) {
 	e.p2pAvailTimers = make(map[string]*time.Timer)
 	e.p2pAvailTimersMu.Unlock()
 
-	// 5. 重置 metadata 上报节流，立即上报
 	atomic.StoreInt64(&e.lastMetadataReportAt, 0)
 	e.reportMetadata()
 
-	// 6. 通知服务端重新协调
 	if e.ws != nil {
 		_ = e.ws.Send(map[string]interface{}{
 			"type":   "network_changed",
