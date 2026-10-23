@@ -170,10 +170,43 @@ func (tc *TURNClient) FetchAndSetup(ctx context.Context) (err error) {
 	return tc.setupAllocation(ctx)
 }
 
+// RebuildAllocation 网络变化后重建 TURN allocation。
+//
+// 场景：客户端换网络（WiFi → Cellular），旧 allocation 基于旧 NAT 映射，
+// 在 TURN 服务器侧失效。但 UDP socket 本身没关，SendTo 返回 nil（假成功），
+// 数据丢失。旧版靠 Refresh 失败 3 次（最长 3 分钟）才触发 onClosed → 重建，
+// 这 3 分钟内所有 TURN 流量全丢且不降级。
+//
+// 修复：主动关闭旧 allocation + 立即重建。重建期间 IsReady()=false，
+// SendToPeer 的 ConnTURN 分支会检测到并走 WS 兜底。
+//
+// 注意：保留 tc.server（TURN 凭证 24 小时内有效），避免重复调
+//       /api/turn-credentials 消耗 Worker 配额。只有完全没有 server 时才
+//       走 FetchAndSetup 重新拉凭证。
+func (tc *TURNClient) RebuildAllocation(ctx context.Context) error {
+	tc.mu.Lock()
+	if tc.lite != nil {
+		tc.lite.Close()
+		tc.lite = nil
+	}
+	if tc.tcpAlloc != nil {
+		tc.tcpAlloc.Close()
+		tc.tcpAlloc = nil
+	}
+	tc.relayAddr = nil
+	serverCached := tc.server
+	tc.mu.Unlock()
+
+	if serverCached == nil {
+		return tc.FetchAndSetup(ctx)
+	}
+	return tc.setupAllocation(ctx)
+}
+
 // setupAllocation 建立 TURN Allocation。
 //
-// ★ 修复：注册 lite.onClosed 回调，Refresh 连续失败时立即触发重建，
-//   不等 30s StartReconnectLoop。
+// 修复：注册 lite.onClosed 回调，Refresh 连续失败时立即触发重建，
+// 不等 30s StartReconnectLoop。
 func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 	tc.mu.RLock()
 	srv := tc.server
@@ -195,7 +228,6 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 	log.Printf("[TURN] 尝试 UDP transport: %s", turnAddr)
 	lite := NewTURNLiteWithTCP(turnAddr, srv.Username, srv.Password, false)
 	lite.onMessage = tc.wrapOnMessage()
-	// ★ 修复：Refresh 连续失败立即重建
 	lite.onClosed = tc.makeOnClosed()
 	if err := lite.Allocate(); err != nil {
 		log.Printf("[TURN] UDP transport 失败: %v，尝试 TCP transport", err)
@@ -238,8 +270,8 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 
 // makeOnClosed 构造 TURNLite.onClosed 回调。
 //
-// ★ 修复：Refresh 连续失败时，TURNLite 会调 onClosed()。
-//   本回调立即触发重建，不等 StartReconnectLoop 的 30s 轮询。
+// 修复：Refresh 连续失败时，TURNLite 会调 onClosed()。
+// 本回调立即触发重建，不等 StartReconnectLoop 的 30s 轮询。
 func (tc *TURNClient) makeOnClosed() func() {
 	return func() {
 		log.Printf("[TURN] TURNLite 主动关闭（Refresh 失败），立即触发重建")
@@ -250,10 +282,8 @@ func (tc *TURNClient) makeOnClosed() func() {
 				}
 			}()
 
-			// 短暂延迟，避免 TURNLite.Close() 的 stopCh 竞态
 			time.Sleep(500 * time.Millisecond)
 
-			// 检查是否还在运行（可能被 Stop() 关掉了）
 			select {
 			case <-tc.stopCh:
 				return
