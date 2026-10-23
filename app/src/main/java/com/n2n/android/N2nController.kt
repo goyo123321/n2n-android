@@ -175,13 +175,13 @@ object N2nController {
     }
 
     // ============================================================
-    // ★ 新增：网络变化通知（由 N2nVpnService.NetworkCallback 调用）
+    // ★ 网络变化通知（由 N2nVpnService.NetworkCallback 调用）
     // ============================================================
     //
-    // WiFi ↔ Cellular 切换时立即清 Go 层 P2P 状态，避免旧 UDP 路径持续丢包。
+    // WiFi ↔ Cellular 切换 / WiFi1 → WiFi2 切换时立即清 Go 层 P2P 状态。
     // Go 层会：
-    //   1. 重置 relayMgr 的 P2P 状态（保留 TURN/WS）
-    //   2. 清空所有 peer 的 UDPAddr
+    //   1. 重置 relayMgr 的 P2P/LAN 状态（保留 TURN/WS）
+    //   2. 清空所有 peer 的 UDPAddr / LanEndpoints
     //   3. 立即上报 p2p_metadata（绕过 30s 节流）
     //   4. 通知服务端 clearPairStateFor + 广播 peer_network_changed
     fun notifyNetworkChanged(type: String) {
