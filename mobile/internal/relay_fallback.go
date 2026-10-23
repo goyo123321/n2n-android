@@ -72,9 +72,16 @@ func (rm *RelayManager) MarkP2P(peerId string) {
 
 	if rm.edge != nil {
 		rm.edge.cancelP2PAvailTimeout(peerId)
+		// ★ 主动上报，让服务端 punchState 记录成功，停止每 15s 重发指令
+		rm.edge.reportP2PStatus(peerId, 3)
 	}
 }
 
+// MarkFallback 从 Unknown 状态降级到 TURN/WS。
+//
+// ★ 已删除旧版 10s 保护：该保护误伤新 peer（lastRecvAt = registerPeer 时间，
+//   scheduleFallbackTimer 8s 触发时 idleMs≈8000 < 10000 → 被拦 → 永远卡
+//   ConnUnknown → 面板显示 --）。8s 是明确设计，不应被拦截。
 func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.mu.Lock()
 
@@ -90,24 +97,6 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 		return
 	}
 	rm.mu.Unlock()
-
-	if rm.edge != nil {
-		rm.edge.peersMu.RLock()
-		p, ok := rm.edge.peers[peerId]
-		var lastRecv int64 = 0
-		if ok {
-			lastRecv = p.lastRecvAt
-		}
-		rm.edge.peersMu.RUnlock()
-
-		if lastRecv > 0 {
-			idleMs := time.Now().UnixMilli() - lastRecv
-			if idleMs < 10000 {
-				log.Printf("[连接] %s 最近 %dms 收到过 UDP 包，跳过降级", peerId, idleMs)
-				return
-			}
-		}
-	}
 
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
@@ -133,25 +122,21 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.cancelFallbackTimer(peerId)
 }
 
-// ★ P1 修复（本次）：ForceFallback 允许 ConnP2P 在 no-traffic 场景降级
+// ForceFallback 强制降级（服务端指令 / P2P 失效）。
 //
-// 旧版：ConnP2P 时直接 return，但日志已打，下一次 keepalive 又触发，
-// 造成 30 秒刷屏（你日志里的反复 "30s 无任何流量，判定 P2P 失效，强制降级"）。
-//
-// 新版：如果 reason 是 "no-traffic-30s" 或 "p2p-avail-timeout"，
-// 允许从 ConnP2P 降级到 TURN/WS。
+// ★ 白名单加 "peer-via-turn"：对端通过 TURN 发帧说明已降级，本机必须跟进。
 func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
-	// 已经是 TURN/WS → 不需要再降级
 	if rm.states[peerId] == ConnTURN || rm.states[peerId] == ConnRelay {
 		return
 	}
 
-	// ★ P1 修复：ConnP2P 允许在 no-traffic 场景降级
 	if rm.states[peerId] == ConnP2P {
-		if reason != "no-traffic-30s" && reason != "p2p-avail-timeout" {
+		if reason != "no-traffic-30s" &&
+			reason != "p2p-avail-timeout" &&
+			reason != "peer-via-turn" {
 			return
 		}
 		log.Printf("[连接] %s 从 P2P 降级 (force: %s)", peerId, reason)
@@ -168,6 +153,7 @@ func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	rm.cancelFallbackTimer(peerId)
 	if rm.edge != nil {
 		rm.edge.cancelP2PAvailTimeout(peerId)
+		rm.edge.reportP2PStatus(peerId, 0) // ★ 降级后上报
 	}
 }
 
@@ -280,7 +266,8 @@ func (rm *RelayManager) SendViaRelay(data []byte) error {
 
 // SendToPeer 按当前状态发送数据。
 //
-// ★ P0 修复：ConnP2P 分支加 selfIsOnTargetLAN 判断
+// ★ 统一：TCP / UDP / ICMP 都走这里（edge.go:tunReadLoop 已删 sendICMPDirect）。
+//   LAN 优先判定只看 selfOnLAN（与旧 sendICMPDirect 对齐）。
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
 	state := rm.GetState(peerId)
 
@@ -295,13 +282,11 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 			return false
 		}
 
+		selfOnLAN := rm.edge.selfIsOnTargetLAN(target)
 		sent := false
 
-		selfOnLAN := rm.edge.selfIsOnTargetLAN(target)
-
-		if selfOnLAN && target.UDPAddr != nil &&
-			!isPrivateIPv4(target.UDPAddr.IP) &&
-			len(target.LanEndpoints) > 0 {
+		// 1. LAN 优先（只看 selfOnLAN，不要求 target.UDPAddr 是公网）
+		if selfOnLAN && len(target.LanEndpoints) > 0 {
 			for _, lan := range target.LanEndpoints {
 				ra, err := net.ResolveUDPAddr("udp", lan)
 				if err != nil || ra == nil || ra.IP == nil {
@@ -314,6 +299,7 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 			}
 		}
 
+		// 2. UDPAddr（跳过本机不可达的私网）
 		if !sent && target.UDPAddr != nil {
 			skip := false
 			if isPrivateIPv4(target.UDPAddr.IP) && !selfOnLAN {
@@ -412,4 +398,19 @@ func (rm *RelayManager) Report(interval time.Duration) {
 			}
 		}
 	})
+}
+
+// ResetP2PStates 重置所有 P2P 状态，保留 TURN/WS。
+//
+// 网络切换（WiFi ↔ Cellular）后：P2P 的 UDP 路径必然失效，
+// 但 TURN 走中继、WS 走 TCP 信令，源 IP 变化不影响，必须保留。
+func (rm *RelayManager) ResetP2PStates(reason string) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	for peerID, state := range rm.states {
+		if state == ConnP2P || state == ConnP2PAvailable {
+			rm.states[peerID] = ConnUnknown
+			log.Printf("[连接] %s %s → Unknown（%s）", peerID, state, reason)
+		}
+	}
 }
