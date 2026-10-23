@@ -5,6 +5,11 @@ package internal
 // ⚠️ 本文件只包含 TURNLite 协议实现。
 //    TURNClient / TURNServerInfo / TURNResponse / NewTURNClient / redactToken
 //    等定义在 turn_client.go，不要复制到这里。
+//
+// 依赖：
+//   - stunMessage / stunAttr / buildSTUNMsg / parseSTUNMsg / xorEncodePeer
+//     全部在本文件内定义，供 turn_lite_tcp.go 复用。
+//   - wrapTCPFrame 在本文件末尾定义，供 turn_lite_tcp.go 复用。
 
 import (
 	"crypto/hmac"
@@ -89,7 +94,7 @@ type TURNLite struct {
 	permMu      sync.Mutex
 
 	onMessage func([]byte, net.Addr)
-	// ★ 新增：Refresh 连续失败主动关闭时通知 TURNClient 立即重建
+	// ★ Refresh 连续失败主动关闭时通知 TURNClient 立即重建
 	onClosed func()
 
 	pendingMu sync.Mutex
@@ -268,6 +273,11 @@ func randTxID() [12]byte {
 	return t
 }
 
+// sendRequest 发送 STUN 请求。
+//
+// ★ 修复：TCP transport 需要 STUN over TCP 分帧头（wrapTCPFrame）。
+//   旧版直接 conn.Write(msg) → coturn 严格模式丢弃 Send indication
+//   / Refresh / CreatePermission → TURN over TCP 后续消息全部无效。
 func (t *TURNLite) sendRequest(msgType uint16, attrs []stunAttr, withAuth bool) (*stunMessage, error) {
 	txid := randTxID()
 
@@ -284,6 +294,14 @@ func (t *TURNLite) sendRequest(msgType uint16, attrs []stunAttr, withAuth bool) 
 		msg = t.sign(msg)
 	}
 
+	// ★ 修复：TCP transport 需要 STUN over TCP 分帧头
+	var wire []byte
+	if t.useTCP {
+		wire = wrapTCPFrame(msg)
+	} else {
+		wire = msg
+	}
+
 	ch := make(chan *stunMessage, 1)
 	t.pendingMu.Lock()
 	t.pending[txid] = ch
@@ -294,7 +312,7 @@ func (t *TURNLite) sendRequest(msgType uint16, attrs []stunAttr, withAuth bool) 
 		t.pendingMu.Unlock()
 	}()
 
-	if _, err := t.conn.Write(msg); err != nil {
+	if _, err := t.conn.Write(wire); err != nil {
 		if isNetworkUnreachable(err) {
 			log.Printf("[TURN-Lite] socket 失效（网络变化），关闭等待重建")
 			go t.Close()
@@ -478,6 +496,11 @@ func (t *TURNLite) ensurePermission(ip net.IP, port int) error {
 	return nil
 }
 
+// SendTo 发送数据到对端。
+//
+// ★ 修复：TCP transport 需要 STUN over TCP 分帧头（wrapTCPFrame）。
+//   旧版直接 conn.Write(msg) → coturn 严格模式丢弃 Send indication
+//   → TURN over TCP 的 B→A 数据全部无效。
 func (t *TURNLite) SendTo(data []byte, peerAddr *net.UDPAddr) error {
 	if t.conn == nil {
 		return fmt.Errorf("TURN 未就绪")
@@ -493,12 +516,21 @@ func (t *TURNLite) SendTo(data []byte, peerAddr *net.UDPAddr) error {
 		{typ: attrXorPeerAddress, value: peerData},
 		{typ: attrData, value: data},
 	})
+
+	// ★ 修复：TCP transport 需要 STUN over TCP 分帧头
+	var wire []byte
+	if t.useTCP {
+		wire = wrapTCPFrame(msg)
+	} else {
+		wire = msg
+	}
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.stopped {
 		return fmt.Errorf("已关闭")
 	}
-	_, err := t.conn.Write(msg)
+	_, err := t.conn.Write(wire)
 	return err
 }
 
@@ -616,7 +648,7 @@ func (t *TURNLite) handleIncoming(data []byte) {
 
 // refreshLoop TURN Refresh 循环。
 //
-// ★ 修复：Refresh 连续失败 3 次时，主动触发 onClosed 回调，
+// ★ Refresh 连续失败 3 次时，主动触发 onClosed 回调，
 //   让 TURNClient 立即重建，不等 30s StartReconnectLoop。
 func (t *TURNLite) refreshLoop() {
 	defer func() {
@@ -649,7 +681,6 @@ func (t *TURNLite) refreshLoop() {
 				log.Printf("[TURN-Lite] Refresh 失败 (%d/3): %v", consecutiveFails, err)
 				if consecutiveFails >= 3 {
 					log.Printf("[TURN-Lite] Refresh 连续失败 %d 次，关闭等待重建", consecutiveFails)
-					// ★ 修复：主动触发 onClosed，让 TURNClient 立即重建
 					go func() {
 						t.Close()
 						if t.onClosed != nil {
@@ -732,4 +763,24 @@ func parseErrorCode(data []byte) int {
 		return 0
 	}
 	return int(data[2]&0x07)*100 + int(data[3])
+}
+
+// wrapTCPFrame STUN over TCP 分帧（RFC 5766 §7.2.2）
+//
+// 格式：首字节 0b01（0x01）+ 2 字节长度（不含 padding）+ padding（4 字节对齐）
+//
+// ★ 修复：TURNLite 的 TCP transport 之前直接 conn.Write(msg)，
+//   缺分帧头 → coturn 严格模式下丢弃 Send indication / Refresh / CreatePermission
+//   → TURN over TCP 后续消息全部无效。
+//
+// 供 turn_lite_tcp.go 的 TURNTCPAllocation 复用。
+func wrapTCPFrame(msg []byte) []byte {
+	length := len(msg)
+	pad := (4 - length%4) & 3
+	total := 4 + length + pad
+	out := make([]byte, total)
+	out[0] = 0x01 // 0b01 << 6
+	binary.BigEndian.PutUint16(out[2:4], uint16(length))
+	copy(out[4:], msg)
+	return out
 }
