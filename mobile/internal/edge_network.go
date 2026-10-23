@@ -8,32 +8,57 @@ import (
 	"time"
 )
 
-// OnNetworkChanged 网络切换时的状态清理。
+// networkChangeMergeDelay 1.5 秒合并窗口。
 //
-// 触发点：
-//   - Kotlin NetworkCallback.onAvailable（网络类型变化）
-//   - Kotlin NetworkCallback.onLinkPropertiesChanged（网关变化 WiFi1 → WiFi2）
-//
-// 分七步：
-//  1. ★ 清空旧 natMeta（网络变了，旧地址/端口必然失效）
-//  2. 清空打洞失败计数
-//  3. 重置 relayMgr 的 P2P/LAN/TURN 状态（保留 WS）
-//  4. 清空 peer 的 UDPAddr / LanEndpoints / lastP2PRecvAt / TurnRelayAddr
-//  5. 取消所有 pending timer
-//  6. 立即上报 metadata（此时 PublicEndpoint 为空，不会报旧地址）
-//  7. 通知服务端重新协调
-func (e *Edge) OnNetworkChanged(networkType string) {
-	log.Printf("[Network] 检测到网络变化: %s，重置 P2P 状态", networkType)
+// Kotlin 侧已经做了 IPv6 link-local 忽略 + 1.5s 去抖，这里是双保险：
+// 即使 Kotlin 侧漏掉（比如 onAvailable 触发），也不会连续执行七步清理。
+const networkChangeMergeDelay = 1500 * time.Millisecond
 
-	// ★ 修复 1：清空旧 natMeta（网络变了，旧地址/端口必然失效）
-	//
-	// 场景：A 从运营商 X WiFi 换到运营商 Y WiFi。
-	//   旧版：natMeta.PublicEndpoint 还是运营商 X 的地址 → reportMetadata
-	//        上报旧地址 → 服务端存旧地址 → B 打洞到旧地址失败
-	//        → 5~30 秒黑洞
-	//   新版：清空 PublicEndpoint → STUN 首次响应时（oldIP == ""）
-	//        通过 maybeResetOwnFailCounts 立即更新 + addAssistedEndpoint
-	//        的 wasEmpty 分支立即上报
+// OnNetworkChanged 网络切换入口。
+//
+// 改造要点：
+//   - 旧版每次调用立即执行七步清理，Kotlin 侧 IPv4/IPv6 交替触发时
+//     4 秒 6 次，状态机和数据面反复被打断。
+//   - 新版 1.5 秒合并，只执行最后一次。
+//     - 4 秒 6 次 → 4 秒 1 次
+//     - 真实切换不丢（最后一次一定是最终网络状态）
+//     - 代价：真实切换晚 1.5 秒执行（切换期间走 WS 兜底，可接受）
+func (e *Edge) OnNetworkChanged(networkType string) {
+	e.pendingNetChangeMu.Lock()
+	e.pendingNetChange = networkType
+	if e.pendingNetChangeT != nil {
+		e.pendingNetChangeT.Stop()
+	}
+	e.pendingNetChangeT = time.AfterFunc(networkChangeMergeDelay, func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[Network] pending apply panic: %v", r)
+			}
+		}()
+		e.pendingNetChangeMu.Lock()
+		t := e.pendingNetChange
+		e.pendingNetChange = ""
+		e.pendingNetChangeT = nil
+		e.pendingNetChangeMu.Unlock()
+		if t != "" {
+			e.applyNetworkChanged(t)
+		}
+	})
+	e.pendingNetChangeMu.Unlock()
+
+	log.Printf("[Network] %s 已排队（1.5s 内合并）", networkType)
+}
+
+// applyNetworkChanged 实际执行七步清理 + 立即上报 + STUN 重探。
+func (e *Edge) applyNetworkChanged(networkType string) {
+	log.Printf("[Network] 执行网络变化处理: %s", networkType)
+
+	e.mu.Lock()
+	e.lastNetworkChangedAt = time.Now().UnixMilli()
+	e.lastNetworkType = networkType
+	e.mu.Unlock()
+
+	// 1. 清空旧 natMeta
 	e.mu.Lock()
 	if e.natMeta != nil {
 		oldEndpoint := e.natMeta.PublicEndpoint
@@ -45,11 +70,13 @@ func (e *Edge) OnNetworkChanged(networkType string) {
 		e.natMeta.MultiExit = false
 		e.natMeta.PortsDifference = 0
 		e.natMeta.RegularPortsChange = false
-		log.Printf("[Network] 清空旧 natMeta.PublicEndpoint=%q", oldEndpoint)
+		if oldEndpoint != "" {
+			log.Printf("[Network] 清空旧 natMeta.PublicEndpoint=%q", oldEndpoint)
+		}
 	}
 	e.mu.Unlock()
 
-	// 2. 清空打洞失败计数
+	// 2. 清打洞失败计数
 	natHoleActiveMu.Lock()
 	failCount := len(failCounts)
 	if failCount > 0 {
@@ -61,24 +88,12 @@ func (e *Edge) OnNetworkChanged(networkType string) {
 	}
 	natHoleActiveMu.Unlock()
 
-	// 3. 重置 relayMgr 的 P2P/LAN/TURN 状态（保留 WS）
+	// 3. 重置 relayMgr（LAN/P2P/P2PAvailable/TURN → Unknown，清 failCounts）
 	if e.relayMgr != nil {
 		e.relayMgr.ResetP2PStates("network-changed")
 	}
 
-	// 4. 清空所有 peer 的 UDPAddr / LanEndpoints / lastP2PRecvAt / TurnRelayAddr
-	//
-	// ★ 关键：LanEndpoints 也要清空
-	//   场景：WiFi1 → WiFi2（不同网段），对端的 LAN 地址（192.168.1.20）
-	//   在新网络下不可达。不清空的话，SendToPeer 会先尝试旧 LAN 地址：
-	//   - WriteTo 可能返回 nil（内核接受），但包实际丢了
-	//   - 不会立即失败降级，延迟更高
-	//   清空后，等下次 joined 或 nat_hole_instruction 重新补充。
-	//
-	// ★ TurnRelayAddr 也清空：
-	//   本端换网络后自己的 TURN allocation 失效，对端 relay 地址也失效，
-	//   但保留对端 relay 地址（用于跨网络后重连）没意义，因为新旧网络
-	//   的 UDP 源 IP 变化后，旧 TURN allocation 全失效。
+	// 4. 清所有 peer
 	e.peersMu.Lock()
 	count := 0
 	for _, p := range e.peers {
@@ -111,13 +126,11 @@ func (e *Edge) OnNetworkChanged(networkType string) {
 	e.p2pAvailTimers = make(map[string]*time.Timer)
 	e.p2pAvailTimersMu.Unlock()
 
-	// 6. 重置 metadata 上报节流，立即上报
-	//   此时 PublicEndpoint 已被清空，上报的是「空地址」
-	//   服务端收到后 peer.pubSocket = ""，等待下次 STUN 上报新地址
+	// 6. 立即上报 metadata（空地址）
 	atomic.StoreInt64(&e.lastMetadataReportAt, 0)
 	e.reportMetadata()
 
-	// 7. 通知服务端重新协调
+	// 7. 通知服务端
 	if e.ws != nil {
 		_ = e.ws.Send(map[string]interface{}{
 			"type":   "network_changed",
@@ -125,4 +138,33 @@ func (e *Edge) OnNetworkChanged(networkType string) {
 		})
 		log.Printf("[Network] 已通知服务端重新协调")
 	}
+
+	// 8. 立即上报 connection_status
+	//
+	// 旧版靠 RelayManager.Report(10s) 周期，切换后 10 秒内服务端看到的
+	// 还是旧的 connections（比如全 p2p），runCoordination 认为"P2P 正常"
+	// 跳过打洞。立即上报后服务端立刻看到 Unknown，触发 punchState 退役。
+	if e.relayMgr != nil {
+		e.relayMgr.ForceReportNow()
+	}
+
+	// 9. 触发 STUN 重探
+	//
+	// 旧版 natType 只在 Start() 时探一次，切换后永远 "unknown"，
+	// 面板显示未知，classifyNat 把 EasyNAT 也当 HardNAT 扫描（更慢）。
+	safeGo("nat-reprobe", func() {
+		time.Sleep(500 * time.Millisecond)
+		if e.udpConn == nil {
+			return
+		}
+		meta := probeNAT(e.udpPort, nil)
+		if meta == nil {
+			return
+		}
+		e.mu.Lock()
+		e.natMeta = meta
+		e.mu.Unlock()
+		log.Printf("[NAT] 重探测完成: %s pub=%s", meta.NATType, meta.PublicEndpoint)
+		e.reportMetadata()
+	})
 }
