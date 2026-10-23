@@ -1264,6 +1264,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			p.lastLANRecvAt = 0
 			p.lastPublicRecvAt = 0
 			p.lastP2PRecvAt = 0
+			p.lastRecvAt = 0
 			p.PubIP = ""
 			p.PubPort = 0
 			p.TurnRelayAddr = ""
@@ -1351,6 +1352,17 @@ func (e *Edge) maybeResetFailCountForPeer(peerID, newPubIP string, newPubPort in
 	}
 }
 
+// maybeResetOwnFailCounts 本机出口 IP 变化时重置失败计数。
+//
+// ★ 修复：oldIP == "" 时不 return，而是更新 PublicEndpoint。
+//
+// 场景：A 换网络 → OnNetworkChanged 清空 natMeta.PublicEndpoint
+//   → 首次 STUN 响应到达 → oldIP = "" → 旧版直接 return
+//   → PublicEndpoint 永远为空 → reportMetadata 上报空地址
+//   → 服务端 peer.pubSocket = "" → 不生成打洞指令 → 永远卡在 Unknown
+//
+// 修复：oldIP == "" 时不 return，直接更新 PublicEndpoint，
+//   等 addAssistedEndpoint 的 wasEmpty 分支立即上报。
 func (e *Edge) maybeResetOwnFailCounts(newEndpoint string) {
 	if newEndpoint == "" {
 		return
@@ -1370,7 +1382,8 @@ func (e *Edge) maybeResetOwnFailCounts(newEndpoint string) {
 
 	oldIP := extractIPFromEndpoint(oldEndpoint)
 
-	if oldIP == "" || oldIP == newIP {
+	// ★ 修复：只有相同 IP 才 return；oldIP == ""（换网络后首次）继续更新
+	if oldIP == newIP {
 		return
 	}
 
@@ -1381,15 +1394,21 @@ func (e *Edge) maybeResetOwnFailCounts(newEndpoint string) {
 	}
 	e.mu.Unlock()
 
-	natHoleActiveMu.Lock()
-	count := len(failCounts)
-	if count > 0 {
-		failCounts = make(map[string]int)
-	}
-	natHoleActiveMu.Unlock()
+	// ★ 修复：oldIP == "" 时说明是换网络后首次，只更新地址，不清 failCounts
+	//   （failCounts 已在 OnNetworkChanged 清空，无需重复清）
+	if oldIP != "" {
+		natHoleActiveMu.Lock()
+		count := len(failCounts)
+		if count > 0 {
+			failCounts = make(map[string]int)
+		}
+		natHoleActiveMu.Unlock()
 
-	log.Printf("[NAT-HOLE] 本机出口 IP 变化 %s → %s，重置所有失败计数 (count=%d)",
-		oldIP, newIP, count)
+		log.Printf("[NAT-HOLE] 本机出口 IP 变化 %s → %s，重置所有失败计数 (count=%d)",
+			oldIP, newIP, count)
+	} else {
+		log.Printf("[NAT-HOLE] 本机出口 IP 首次设置: %s（换网络后）", newIP)
+	}
 }
 
 // findPeerCI 大小写不敏感查找 peer。
@@ -2257,6 +2276,18 @@ func (e *Edge) hasTrafficFromAny(ips []net.IP, since int64) bool {
 
 // ============ 多 STUN 端点收集 ============
 
+// addAssistedEndpoint 添加 STUN 探测到的辅助端点。
+//
+// ★ 修复：PublicEndpoint 从空设置时（换网络后首次），立即上报，
+//   绕过 reportMetadataThrottled 的 30 秒节流。
+//
+// 场景：A 换网络 → OnNetworkChanged 清空 PublicEndpoint
+//   → STUN 首次响应到达 → addAssistedEndpoint
+//   → 旧版：reportMetadataThrottled 30 秒节流 → 30 秒后才上报新地址
+//   → 服务端 30 秒内看不到 A 的 pubSocket → 不生成打洞指令
+//   → 30 秒内 A 和 B 都是 Unknown → WS 兜底
+//
+// 修复：wasEmpty 时立即上报 → 服务端 T+5s 就知道 A 的新地址。
 func (e *Edge) addAssistedEndpoint(ip string, port int) {
 	if ip == "" || port <= 0 {
 		return
@@ -2279,12 +2310,22 @@ func (e *Edge) addAssistedEndpoint(ip string, port int) {
 	}
 	e.natMeta.AllEndpoints = append(e.natMeta.AllEndpoints, ep)
 	count := len(e.natMeta.AllEndpoints)
+	wasEmpty := e.natMeta.PublicEndpoint == ""
 	e.mu.Unlock()
 
 	e.maybeResetOwnFailCounts(ep)
 
-	log.Printf("[NAT] +assisted: %s (total=%d)", ep, count)
-	e.reportMetadataThrottled()
+	log.Printf("[NAT] +assisted: %s (total=%d, wasEmpty=%v)", ep, count, wasEmpty)
+
+	// ★ 修复：PublicEndpoint 从空设置时（换网络后首次），立即上报
+	//   不等 30s 节流
+	if wasEmpty {
+		atomic.StoreInt64(&e.lastMetadataReportAt, 0)
+		e.reportMetadata()
+		log.Printf("[NAT] PublicEndpoint 首次设置，立即上报 p2p_metadata")
+	} else {
+		e.reportMetadataThrottled()
+	}
 }
 
 func (e *Edge) reportMetadataThrottled() {
