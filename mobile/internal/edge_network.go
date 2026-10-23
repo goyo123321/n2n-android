@@ -1,17 +1,6 @@
 package internal
 
-// 网络切换（WiFi ↔ Cellular）时的状态清理。
-//
-// 为什么需要：
-//   WiFi 切移动网络后，UDP socket 源 IP 变化，旧 P2P 路径必然失效。
-//   但 STUN 探测周期 5 秒 + reportMetadata 节流 30 秒 → 中间 5-35 秒
-//   客户端继续往旧路径发包全丢。
-//
-// 用 ConnectivityManager.NetworkCallback 毫秒级感知，立即清状态 + 通知
-// 服务端重新协调。
-//
-// ★ LAN 保留：LanEndpoints 不清空，2s 保活会重新探测。LAN 路径不依赖
-//   UDP 源 IP（走 L2 桥接），网络切换后可能仍然可达。
+// 网络切换（WiFi ↔ Cellular / WiFi1 → WiFi2）时的状态清理。
 
 import (
 	"log"
@@ -21,10 +10,14 @@ import (
 
 // OnNetworkChanged 网络切换时的状态清理。
 //
+// 触发点：
+//   - Kotlin NetworkCallback.onAvailable（网络类型变化 WiFi ↔ Cellular）
+//   - Kotlin NetworkCallback.onLinkPropertiesChanged（网关变化 WiFi1 → WiFi2）
+//
 // 分六步：
 //  1. 清空打洞失败计数
 //  2. 重置 relayMgr 的 P2P/LAN 状态（保留 TURN/WS）
-//  3. 清空 peer 的 UDPAddr（LanEndpoints 保留）
+//  3. 清空 peer 的 UDPAddr 和 LanEndpoints（旧 LAN 地址不可达）
 //  4. 取消所有 pending timer
 //  5. 立即上报 metadata（绕过 30s 节流）
 //  6. 通知服务端重新协调
@@ -48,7 +41,14 @@ func (e *Edge) OnNetworkChanged(networkType string) {
 		e.relayMgr.ResetP2PStates("network-changed")
 	}
 
-	// 3. 清空所有 peer 的 UDPAddr（LanEndpoints 保留，2s 保活会重新探测）
+	// 3. 清空所有 peer 的 UDPAddr 和 LanEndpoints
+	//
+	// ★ 关键：LanEndpoints 也要清空
+	//   场景：WiFi1 → WiFi2（不同网段），对端的 LAN 地址（192.168.1.20）
+	//   在新网络下不可达。不清空的话，SendToPeer 会先尝试旧 LAN 地址：
+	//   - WriteTo 可能返回 nil（内核接受），但包实际丢了
+	//   - 不会立即失败降级，延迟更高
+	//   清空后，等下次 joined 或 nat_hole_instruction 重新补充。
 	e.peersMu.Lock()
 	count := 0
 	for _, p := range e.peers {
@@ -58,11 +58,10 @@ func (e *Edge) OnNetworkChanged(networkType string) {
 		p.UDPAddr = nil
 		p.lastLANRecvAt = 0
 		p.lastRecvAt = 0
-		// ★ LanEndpoints 不清空 —— LAN 路径不依赖 UDP 源 IP，
-		//   网络切换后（如 WiFi 切移动网络）同 WiFi peer 可能仍可达
+		p.LanEndpoints = nil   // ★ 新增：清空旧 LAN 地址
 	}
 	e.peersMu.Unlock()
-	log.Printf("[Network] 清空 %d 个 peer 的 UDPAddr（保留 LanEndpoints 重新探测）", count)
+	log.Printf("[Network] 清空 %d 个 peer 的 UDPAddr 和 LanEndpoints", count)
 
 	// 4. 取消所有 pending timer
 	e.fallbackTimersMu.Lock()
@@ -83,7 +82,7 @@ func (e *Edge) OnNetworkChanged(networkType string) {
 	atomic.StoreInt64(&e.lastMetadataReportAt, 0)
 	e.reportMetadata()
 
-	// 6. 通知服务端重新协调（让服务端 clearPairStateFor + 广播）
+	// 6. 通知服务端重新协调
 	if e.ws != nil {
 		_ = e.ws.Send(map[string]interface{}{
 			"type":   "network_changed",
