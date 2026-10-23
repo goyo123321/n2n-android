@@ -82,13 +82,10 @@ class N2nVpnService : VpnService() {
     //   1. onAvailable：网络类型变化（WiFi ↔ Cellular ↔ Ethernet）
     //   2. onLinkPropertiesChanged：网关变化（WiFi1 → WiFi2，同类型）
     //
-    // ★ onLinkPropertiesChanged 解决「WiFi1 → WiFi2 同类型不触发」问题：
-    //   onAvailable 只在「网络可用」时触发，WiFi 间切换类型都是 "wifi"，
-    //   旧版 type == prev 直接 return → OnNetworkChanged 永不调用。
-    //   网关变化能准确反映「换到了不同的 WiFi 网络」。
+    // ★ onLinkPropertiesChanged 跳过 TRANSPORT_VPN（避免 tun0 自身触发自己）。
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     @Volatile private var lastNetworkType = ""
-    @Volatile private var lastGateway = ""     // ★ 新增
+    @Volatile private var lastGateway = ""
 
     private val tzReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -227,13 +224,17 @@ class N2nVpnService : VpnService() {
                     }
                 }
 
-                // ★ 新增：网关变化检测
+                // ★ 网关变化检测（WiFi1 → WiFi2 同类型时 onAvailable 不触发）
                 //
-                // WiFi1 → WiFi2 同类型时 onAvailable 不触发，但网关会变化：
-                //   192.168.1.1 → 192.168.2.1
-                // 用网关变化来检测「换到了不同的 WiFi 网络」。
+                // ★ 跳过 TRANSPORT_VPN：VPN 自身接口（tun0）变化时不应触发，
+                //   避免「通知 Go 层 → Go 层重连/重建 → 再次触发」的循环。
                 override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
                     try {
+                        val caps = cm.getNetworkCapabilities(network)
+                        if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) {
+                            return
+                        }
+
                         val gateway = lp.routes
                             .firstOrNull { it.isDefaultRoute }
                             ?.gateway
