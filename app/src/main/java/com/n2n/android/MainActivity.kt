@@ -104,7 +104,6 @@ class MainActivity : AppCompatActivity() {
             toast(getString(R.string.dialog_saved))
         }
 
-        // SOCKS5 开关联动
         binding.switchSocks5.setOnCheckedChangeListener { _, checked ->
             if (!::binding.isInitialized) return@setOnCheckedChangeListener
             if (checked) {
@@ -184,10 +183,6 @@ class MainActivity : AppCompatActivity() {
         outState.putString("socks5Listen", binding.etSocks5Listen.text.toString())
     }
 
-    // ============================================================
-    // 深链延迟启动
-    // ============================================================
-
     private fun scheduleAutoStart(delayMs: Long = 300) {
         cancelPendingAutoStart()
         if (!::binding.isInitialized) return
@@ -208,10 +203,6 @@ class MainActivity : AppCompatActivity() {
         }
         pendingAutoStart = null
     }
-
-    // ============================================================
-    // 主题
-    // ============================================================
 
     private fun applyThemeMode(mode: Int) {
         val nightMode = when (mode) {
@@ -241,10 +232,6 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    // ============================================================
-    // 权限
-    // ============================================================
-
     private fun requestNotifPermissionIfNeeded() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             try {
@@ -255,32 +242,20 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ============================================================
-    // ★ Bug 3 修复：电池优化提示只弹一次
-    // ============================================================
-    //
-    // 旧版：每次冷启动都检查 isIgnoringBatteryOptimizations，未加入白名单就弹
-    //       系统对话框。用户点"不允许"后下次进 App 又弹——骚扰用户。
-    //
-    // 新版：加"已询问"标记，无论用户是否同意，只弹一次。
-    //
     @android.annotation.SuppressLint("BatteryLife")
     private fun requestIgnoreBatteryOptimizationIfNeeded() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
 
-        // ★ 只问一次
         if (Prefs.hasAskedBatteryOptimization(this)) return
 
         try {
             val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
             val pkg = packageName
             if (pm.isIgnoringBatteryOptimizations(pkg)) {
-                // 已在白名单，标记一下避免后续再检查
                 Prefs.markBatteryOptimizationAsked(this)
                 return
             }
 
-            // ★ 先标记，避免弹窗过程中 Activity 重建导致重入
             Prefs.markBatteryOptimizationAsked(this)
 
             try {
@@ -300,31 +275,18 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ============================================================
-    // ★ Bug 1 修复：首次使用对话框只弹一次
-    // ============================================================
-    //
-    // 旧版：只检查 hasEverStartedVpn，未成功启动过 VPN 就每次都弹
-    //       （setCancelable(false) 必须选一个按钮，用户体验很差）。
-    //       Prefs.hasSeenFirstUseDialog 定义了但从未被调用。
-    //
-    // 新版：加 hasSeenFirstUseDialog 检查，无论用户点"现在就填"还是
-    //       "稍后再说"，都标记已看过。
-    //
     private fun checkSignalingUrl() {
         if (!::binding.isInitialized) return
         val currentUrl = binding.etSignalingUrl.text.toString().trim()
         if (currentUrl.isNotEmpty()) return
         if (Prefs.hasEverStartedVpn(this)) return
-
-        // ★ 关键：只看一次
         if (Prefs.hasSeenFirstUseDialog(this)) return
 
         AlertDialog.Builder(this)
             .setTitle(getString(R.string.first_use_title))
             .setMessage(getString(R.string.first_use_message))
             .setPositiveButton(getString(R.string.first_use_fill)) { _, _ ->
-                Prefs.markFirstUseDialogSeen(this)   // ★ 点"现在就填"也标记
+                Prefs.markFirstUseDialogSeen(this)
                 if (isFinishing || isDestroyed || !::binding.isInitialized) return@setPositiveButton
                 binding.etSignalingUrl.requestFocus()
                 binding.etSignalingUrl.setSelection(
@@ -339,15 +301,11 @@ class MainActivity : AppCompatActivity() {
                 } catch (_: Throwable) {}
             }
             .setNegativeButton(getString(R.string.first_use_later)) { _, _ ->
-                Prefs.markFirstUseDialogSeen(this)   // ★ 点"稍后再说"也标记
+                Prefs.markFirstUseDialogSeen(this)
             }
             .setCancelable(false)
             .show()
     }
-
-    // ============================================================
-    // 配置加载 / 保存
-    // ============================================================
 
     private fun loadConfig(savedInstanceState: Bundle?) {
         if (!::binding.isInitialized) return
@@ -379,14 +337,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ============================================================
-    // ★ Bug 4 修复：深链空值保护
-    // ============================================================
-    //
-    // 旧版：data.getQueryParameter("socks5")?.let { ... } 会把空字符串
-    //       当成有效值，覆盖用户已配置的 SOCKS5（清空 + 关开关）。
-    // 新版：用 isNullOrBlank() 判断，空值直接跳过。
-    //
     private fun handleIntentParams(intent: Intent?) {
         if (!::binding.isInitialized) return
         intent ?: return
@@ -395,7 +345,6 @@ class MainActivity : AppCompatActivity() {
             if (intent.action == Intent.ACTION_VIEW && intent.data != null) {
                 val data = intent.data!!
                 if (data.scheme == "n2n" && data.host == "connect") {
-                    // ★ 空值保护：只覆盖非空值
                     data.getQueryParameter("url")?.let {
                         if (it.isNotBlank()) binding.etSignalingUrl.setText(it)
                     }
@@ -485,10 +434,6 @@ class MainActivity : AppCompatActivity() {
             Log.e(TAG, "saveCurrentInput failed", t)
         }
     }
-
-    // ============================================================
-    // 启动 / 停止
-    // ============================================================
 
     private fun saveThenRequest() {
         saveCurrentInput()
@@ -618,14 +563,6 @@ class MainActivity : AppCompatActivity() {
     // UI 刷新
     // ============================================================
 
-    // ============================================================
-    // ★ Bug 2 修复：运行中隐藏整个 bottomBarIdle
-    // ============================================================
-    //
-    // 旧版：只隐藏 btnStart，btnSave 靠 FrameLayout 恰好被 btnStop 覆盖。
-    //       如果未来布局调整（margin / padding），btnSave 可能漏出来。
-    // 新版：直接隐藏整组，btns 一起消失。
-    //
     private fun refreshStatus() {
         if (isFinishing || isDestroyed || !::binding.isInitialized) return
         try {
@@ -662,12 +599,10 @@ class MainActivity : AppCompatActivity() {
                     binding.tvClientId.visibility = View.GONE
                 }
 
-                // ★ 隐藏整组空闲按钮，而不是只隐藏 btnStart
                 binding.bottomBarIdle.visibility = View.GONE
                 binding.btnStop.visibility = View.VISIBLE
                 binding.cardPeers.visibility = View.VISIBLE
 
-                // 运行中禁止改 SOCKS5
                 binding.switchSocks5.isEnabled = false
                 binding.switchSocks5.alpha = 0.5f
                 binding.etSocks5Listen.isEnabled = false
@@ -679,12 +614,10 @@ class MainActivity : AppCompatActivity() {
                 binding.tvClientId.visibility = View.GONE
                 binding.cardStatus.setStrokeColor(getColor(R.color.brand_border))
 
-                // ★ 恢复整组
                 binding.bottomBarIdle.visibility = View.VISIBLE
                 binding.btnStop.visibility = View.GONE
                 binding.cardPeers.visibility = View.GONE
 
-                // 未运行时可改 SOCKS5
                 binding.switchSocks5.isEnabled = true
                 binding.switchSocks5.alpha = 1.0f
                 binding.etSocks5Listen.isEnabled = true
@@ -694,6 +627,13 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ============================================================
+    // ★ 修复：refreshPeers 先比较 code 序列，不一致就全量重建
+    // ============================================================
+    //
+    // 旧版用 existing == peers.length() 做增量更新依据，peer 顺序变化时
+    // （peer 被清理后重连，registeredAt 变新）会错位。
+    // 新版先比较每个位置的 code 序列，一致才增量更新。
     private fun refreshPeers() {
         if (isFinishing || isDestroyed || !::binding.isInitialized) return
         try {
@@ -723,30 +663,41 @@ class MainActivity : AppCompatActivity() {
             val inflater = LayoutInflater.from(this)
             val existing = binding.peersContainer.childCount
 
-            if (existing == peers.length()) {
-                var needRebuild = false
+            // ★ 比较 code 序列，不一致就全量重建
+            var codesMatch = (existing == peers.length())
+            if (codesMatch) {
+                for (i in 0 until peers.length()) {
+                    val p = peers.optJSONObject(i) ?: run {
+                        codesMatch = false
+                        break
+                    }
+                    val row = binding.peersContainer.getChildAt(i)
+                    val tvCode = row?.findViewById<android.widget.TextView>(R.id.tvPeerCode)
+                    if (tvCode == null || tvCode.text?.toString() != p.optString("code", "?")) {
+                        codesMatch = false
+                        break
+                    }
+                }
+            }
+
+            if (codesMatch && existing > 0) {
+                // 序列一致，增量更新（只更新变化的字段）
                 for (i in 0 until peers.length()) {
                     val p = peers.optJSONObject(i) ?: continue
                     val row = binding.peersContainer.getChildAt(i) ?: continue
 
-                    val tvCode = row.findViewById<android.widget.TextView>(R.id.tvPeerCode)
                     val tvVip = row.findViewById<android.widget.TextView>(R.id.tvPeerVip)
                     val tvMeta = row.findViewById<android.widget.TextView>(R.id.tvPeerMeta)
                     val tvBadge = row.findViewById<android.widget.TextView>(R.id.tvPeerBadge)
 
-                    if (tvCode == null || tvVip == null || tvMeta == null || tvBadge == null) {
-                        needRebuild = true
-                        break
-                    }
-
-                    tvCode.text = p.optString("code", "?")
-                    tvVip.text = p.optString("vip", "--")
-                    tvMeta.text = p.optString("natType", "unknown")
+                    tvVip?.text = p.optString("vip", "--")
+                    tvMeta?.text = p.optString("natType", "unknown")
                     applyBadge(tvBadge, p.optString("connType", "unknown"))
                 }
-                if (!needRebuild) return
+                return
             }
 
+            // 序列不一致或首次渲染 → 全量重建
             binding.peersContainer.removeAllViews()
             for (i in 0 until peers.length()) {
                 val p = peers.optJSONObject(i) ?: continue
@@ -762,10 +713,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ★ 加 lan 徽章
     private fun applyBadge(badge: android.widget.TextView?, connType: String) {
         if (badge == null) return
         try {
             val (bgRes, fgRes, label) = when (connType.lowercase()) {
+                "lan" -> Triple(R.color.badge_lan_bg, R.color.badge_lan_fg, "LAN")
                 "p2p" -> Triple(R.color.badge_p2p_bg, R.color.badge_p2p_fg, "P2P")
                 "p2p-avail" -> Triple(R.color.badge_ws_bg, R.color.badge_ws_fg, "P2P~")
                 "turn" -> Triple(R.color.badge_turn_bg, R.color.badge_turn_fg, "TURN")
