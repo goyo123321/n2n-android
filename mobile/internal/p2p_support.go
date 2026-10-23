@@ -103,7 +103,7 @@ func (e *Edge) peerAddrAndMode(peerID string) (*net.UDPAddr, bool) {
 
 // handleP2PFrame 收到 N2NS 帧时的入口。
 //
-// ★ 修复：更新 lastPublicRecvAt（公网包）
+// ★ 修复：Unknown 状态收到 TURN 帧时 MarkFallback（面板不再显示 --）。
 func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) {
 	if e.p2pStreams == nil {
 		return
@@ -157,7 +157,6 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 				p.UDPAddr = &net.UDPAddr{IP: peerAddr.IP, Port: peerAddr.Port}
 			}
 			p.lastRecvAt = now
-			// ★ 修复：公网包更新 lastPublicRecvAt
 			if !newIsLAN {
 				p.lastPublicRecvAt = now
 			}
@@ -177,6 +176,10 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 			if viaTURN && (cur == ConnLAN || cur == ConnP2P) {
 				log.Printf("[P2P] %s 通过 TURN 收到 PONG → 对端已降级，本机跟进", peerID)
 				e.relayMgr.ForceFallback(peerID, "peer-via-turn")
+			} else if viaTURN && cur == ConnUnknown {
+				// ★ 修复：Unknown 收到 TURN PONG → 对端可达，标记 ConnTURN
+				log.Printf("[TURN] %s Unknown 收到 TURN PONG → MarkFallback", peerID)
+				e.relayMgr.MarkFallback(peerID)
 			} else if fromLAN {
 				if cur != ConnLAN {
 					log.Printf("[LAN] 收到 PONG（LAN）→ LAN 直连")
@@ -193,6 +196,10 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 			if viaTURN && (cur == ConnLAN || cur == ConnP2P) {
 				log.Printf("[P2P] %s 通过 TURN 收到数据帧 → 对端已降级，本机跟进", peerID)
 				e.relayMgr.ForceFallback(peerID, "peer-via-turn")
+			} else if viaTURN && cur == ConnUnknown {
+				// ★ 修复：Unknown 收到 TURN 数据帧 → 对端可达，标记 ConnTURN
+				log.Printf("[TURN] %s Unknown 收到 TURN 数据帧 → MarkFallback", peerID)
+				e.relayMgr.MarkFallback(peerID)
 			} else if fromLAN {
 				if cur != ConnLAN {
 					log.Printf("[LAN] 收到数据帧（LAN）→ LAN 直连")
