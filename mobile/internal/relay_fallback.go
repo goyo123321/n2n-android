@@ -604,12 +604,26 @@ func (rm *RelayManager) Report(interval time.Duration) {
 	})
 }
 
-// ResetP2PStates 重置所有 P2P / LAN 状态，保留 TURN/WS。
+// ResetP2PStates 重置所有 P2P / LAN / TURN 状态，保留 WS。
+//
+// ★ 修复：ConnTURN 也重置。
+//
+// 场景：A 从运营商 X WiFi 换到运营商 Y WiFi。
+//   A 的 TURN allocation 是绑在旧网络源 IP 上的，换网络后必然失效
+//   （TURN 服务器会回收旧 allocation）。
+//   旧版：ResetP2PStates 只重置 LAN/P2P/P2PAvailable，保留 ConnTURN
+//   → A 的 states[B] 仍是 ConnTURN → A 的 SendToPeer(ConnTURN)
+//   → TURN relay 已失效 → 走 WS 兜底 → 面板显示 TURN 但实际 WS
+//   → A 换到同 LAN 后不会自动升级到 ConnLAN
+//
+// 修复：TURN 也重置为 Unknown → A 换网络后立即降级到 WS
+//   → 等服务端下发 nat_hole_instruction 或 B 的 probe 到达
+//   → 通过 MarkLAN/MarkP2P 升级到正确状态
 func (rm *RelayManager) ResetP2PStates(reason string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 	for peerID, state := range rm.states {
-		if state == ConnLAN || state == ConnP2P || state == ConnP2PAvailable {
+		if state == ConnLAN || state == ConnP2P || state == ConnP2PAvailable || state == ConnTURN {
 			rm.states[peerID] = ConnUnknown
 			log.Printf("[连接] %s %s → Unknown（%s）", peerID, state, reason)
 		}
