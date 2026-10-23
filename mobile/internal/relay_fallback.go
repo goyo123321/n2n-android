@@ -159,7 +159,11 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 }
 
 // ForceFallback 强制降级。
+//
 // ★ 白名单覆盖：peer-via-turn / peer-via-ws / no-traffic-30s / p2p-avail-timeout / network-changed / lan-endpoints-cleared
+// ★ 修复：降级后立即上报 connection_status，不等 10s Report ticker。
+//   否则服务端 shouldRetireSuccess 看到的 aToB/bToA 还是旧的（lan/p2p），
+//   不重新协调打洞。
 func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
@@ -201,6 +205,24 @@ func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	if rm.edge != nil {
 		rm.edge.cancelP2PAvailTimeout(peerId)
 		rm.edge.reportP2PStatus(peerId, 0)
+
+		// ★ 修复：ForceFallback 后立即上报 connection_status，
+		//   不等 10s Report ticker。否则服务端 shouldRetireSuccess
+		//   看到的 aToB/bToA 还是旧的（lan/p2p），不重新协调打洞。
+		//
+		// 注意：rm.mu 已 Lock（defer Unlock），直接遍历 rm.states
+		if rm.ws != nil {
+			conns := make(map[string]string)
+			for id, t := range rm.states {
+				conns[id] = string(t)
+			}
+			if len(conns) > 0 {
+				_ = rm.ws.Send(map[string]interface{}{
+					"type":    "connection_status",
+					"payload": map[string]interface{}{"connections": conns},
+				})
+			}
+		}
 	}
 }
 
@@ -335,10 +357,6 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 		}
 
 		// ★ 修复：LanEndpoints 为空说明对端 LAN 已消失（joined lan=0 时会被清空）
-		//
-		// 场景：joined 到达时清空 LanEndpoints，但状态仍是 ConnLAN
-		//   → 立即降级到 ConnP2PAvailable，尝试公网 UDPAddr
-		// 旧版：for 循环空转 → sent=false → 5 次后才降级
 		if len(target.LanEndpoints) == 0 && (target.UDPAddr == nil || isPrivateIPv4(target.UDPAddr.IP)) {
 			log.Printf("[连接] %s LanEndpoints 为空，且 UDPAddr 无公网地址，降级", peerId)
 			rm.mu.Lock()
@@ -478,11 +496,6 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 				} else {
 					log.Printf("[TURN] 发送到 %s 失败（临时）: %v", peerId, sendErr)
 					// ★ 修复：连续失败 3 次清空 relay 地址，等对端重新上报
-					//
-					// 场景：对端 TURN relay 重新分配（旧 relay 失效），
-					//   本端用旧地址发 → 全丢，等对端 turn_relay_info 广播才更新。
-					// 修复：3 次失败后主动清空 relay 地址，走 WS 兜底，
-					//   对端下次 turn_relay_info 或 joined 时更新新地址。
 					rm.mu.Lock()
 					rm.failCounts[peerId]++
 					fc := rm.failCounts[peerId]
