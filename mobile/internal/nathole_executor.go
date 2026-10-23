@@ -223,9 +223,12 @@ func (e *Edge) collectScanTargets(instr *NatHoleInstruction) []*net.UDPAddr {
 }
 
 func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
-	if e.relayMgr != nil && e.relayMgr.GetState(instr.TargetMac) == ConnP2P {
-		log.Printf("[NAT-HOLE] 跳过指令 target=%s（已 P2P）", instr.TargetMac)
-		return nil
+	if e.relayMgr != nil {
+		st := e.relayMgr.GetState(instr.TargetMac)
+		if st == ConnLAN || st == ConnP2P {
+			log.Printf("[NAT-HOLE] 跳过指令 target=%s（已 %s）", instr.TargetMac, st)
+			return nil
+		}
 	}
 
 	natHoleActiveMu.Lock()
@@ -461,8 +464,8 @@ func (e *Edge) resetFailCount(peerID string) {
 
 // recordP2PSuccess 记录打洞成功时的 peer 地址。
 //
-// ★ registeredAt 兜底：lastLANRecvAt == 0 时从注册时间起算，
-//   避免初始 LAN peer 永不移交到公网。
+// ★ registeredAt 兜底：lastLANRecvAt == 0 时从注册时间起算。
+// ★ LAN 命中：打洞命中的是 LAN 地址 → 直接 MarkLAN（只从 ConnUnknown 升级）。
 func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAddr) {
 	e.peersMu.Lock()
 	if p, ok := e.peers[instr.TargetMac]; ok {
@@ -503,10 +506,21 @@ func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAd
 			VirtualIP:    instr.TargetVirtualIp,
 			UDPAddr:      targetAddr,
 			lastRecvAt:   time.Now().UnixMilli(),
-			registeredAt: time.Now().UnixMilli(), // ★ 新增
+			registeredAt: time.Now().UnixMilli(),
 		}
 	}
 	e.peersMu.Unlock()
+
+	// ★ 新增：打洞命中 LAN 地址 → 直接 MarkLAN
+	//   只在 ConnUnknown 时升级（ConnP2PAvailable 说明已握手成功在等数据帧，
+	//   让 notePeerCommon 的 LAN 数据帧处理来 MarkLAN 更可靠）
+	if isPrivateIPv4(targetAddr.IP) && e.relayMgr != nil {
+		curState := e.relayMgr.GetState(instr.TargetMac)
+		if curState == ConnUnknown {
+			log.Printf("[LAN] 打洞命中 LAN 地址 %s → LAN 直连", targetAddr)
+			e.relayMgr.MarkLAN(instr.TargetMac)
+		}
+	}
 }
 
 func (e *Edge) reportInProgress(instr *NatHoleInstruction) {
