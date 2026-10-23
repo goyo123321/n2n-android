@@ -34,6 +34,8 @@ const transportTCP = 6
 //
 // RFC 5766 §7.2.2：TURN over TCP 分帧时，每条消息前 2 bit 是 0b01，
 // 消息长度按 4 字节对齐（padding 不计入 length 字段）。
+//
+// ★ 兼容：如果没有 0b01 前缀，按裸 STUN 读（部分实现可能不发分帧头）。
 func readTCPPacket(conn net.Conn) ([]byte, error) {
 	header := make([]byte, 4)
 	if _, err := io.ReadFull(conn, header); err != nil {
@@ -149,6 +151,11 @@ func (t *TURNTCPAllocation) sign(msg []byte) []byte {
 	return out
 }
 
+// sendRequest 发送 STUN 请求。
+//
+// ★ 修复：TCP control connection 需要 STUN over TCP 分帧头（wrapTCPFrame）。
+//   旧版直接 controlConn.Write(msg) → coturn 严格模式丢弃
+//   → Allocate / Refresh / Connect 全部无效。
 func (t *TURNTCPAllocation) sendRequest(msgType uint16, attrs []stunAttr, withAuth bool) (*stunMessage, error) {
 	txid := randTxID()
 
@@ -174,7 +181,12 @@ func (t *TURNTCPAllocation) sendRequest(msgType uint16, attrs []stunAttr, withAu
 		break
 	}
 
-	if _, err := t.controlConn.Write(msg); err != nil {
+	// ★ 修复：TCP control connection 需要 STUN over TCP 分帧头
+	var wire []byte
+	if len(msg) > 0 {
+		wire = wrapTCPFrame(msg)
+	}
+	if _, err := t.controlConn.Write(wire); err != nil {
 		return nil, fmt.Errorf("发送失败: %w", err)
 	}
 
@@ -323,6 +335,10 @@ func (t *TURNTCPAllocation) extractAllocation(resp *stunMessage) error {
 }
 
 // Dial 建立到目标 peer 的 TCP 隧道（RFC 6062）。
+//
+// ★ 修复：ConnectionBind 需要 STUN over TCP 分帧头（wrapTCPFrame）。
+//   旧版直接 dataConn.Write(bindMsg) → coturn 严格模式丢弃
+//   → TCP 隧道建立失败。
 func (t *TURNTCPAllocation) Dial(targetIP string, targetPort int) (net.Conn, error) {
 	t.mu.Lock()
 	if t.stopped {
@@ -378,7 +394,9 @@ func (t *TURNTCPAllocation) Dial(targetIP string, targetPort int) (net.Conn, err
 	bindMsg := buildSTUNMsg(msgConnectionBindReq, txid, bindAttrs)
 	bindMsg = t.sign(bindMsg)
 
-	if _, err := dataConn.Write(bindMsg); err != nil {
+	// ★ 修复：data connection 的 ConnectionBind 需要 STUN over TCP 分帧头
+	wireBind := wrapTCPFrame(bindMsg)
+	if _, err := dataConn.Write(wireBind); err != nil {
 		dataConn.Close()
 		return nil, fmt.Errorf("发送 ConnectionBind 失败: %w", err)
 	}
@@ -406,6 +424,9 @@ func (t *TURNTCPAllocation) Dial(targetIP string, targetPort int) (net.Conn, err
 }
 
 // SendTo 给指定 peer 发送数据。首次会建立 tunnel。
+//
+// ★ 注意：这是 RFC 6062 data connection，传输原始 TCP 字节，
+//   不是 STUN 消息，不需要 STUN over TCP 分帧头。
 func (t *TURNTCPAllocation) SendTo(peerAddr *net.UDPAddr, data []byte) error {
 	if !t.IsAlive() {
 		return fmt.Errorf("TCP allocation 未就绪")
