@@ -9,6 +9,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -70,6 +73,18 @@ class N2nVpnService : VpnService() {
 
     private var protectedUdpSocket: DatagramSocket? = null
     private var protectedStunSocket: DatagramSocket? = null
+
+    // ============================================================
+    // ★ 新增：网络变化监听
+    // ============================================================
+    //
+    // WiFi ↔ Cellular 切换时，UDP socket 源 IP 变化，旧 P2P 路径必然失效。
+    // STUN 探测周期 5 秒太慢，中间 5-35 秒客户端继续往旧路径发包全丢。
+    //
+    // 用 ConnectivityManager.NetworkCallback 毫秒级感知，立即通知 Go 层
+    // 清 P2P 状态 + 通知服务端重新协调。
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    @Volatile private var lastNetworkType = ""
 
     private val tzReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -171,7 +186,71 @@ class N2nVpnService : VpnService() {
             )
         } catch (_: Throwable) {}
 
+        // ★ 新增：注册网络变化回调
+        registerNetworkCallback()
+
         ktLog("onCreate: 进程启动/Service 创建")
+    }
+
+    // ============================================================
+    // ★ 新增：网络变化回调注册/注销
+    // ============================================================
+
+    private fun registerNetworkCallback() {
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val cb = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: android.net.Network) {
+                    try {
+                        val caps = cm.getNetworkCapabilities(network) ?: return
+                        val type = when {
+                            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+                            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+                            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
+                            caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "vpn"
+                            else -> "unknown"
+                        }
+                        val prev = lastNetworkType
+                        if (type == prev) return
+                        lastNetworkType = type
+                        if (prev.isEmpty()) {
+                            ktLog("[Network] 初始网络: $type")
+                            return
+                        }
+                        ktLog("[Network] 变化: $prev → $type，通知 Go 层清 P2P 状态")
+                        N2nController.notifyNetworkChanged(type)
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "NetworkCallback.onAvailable failed", t)
+                    }
+                }
+
+                override fun onLost(network: android.net.Network) {
+                    // 紧随 onAvailable 触发，不必单独处理
+                    // 真正的「无网络」由后续 onAvailable 的 type 变化覆盖
+                }
+            }
+            cm.registerNetworkCallback(
+                NetworkRequest.Builder()
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .build(),
+                cb
+            )
+            networkCallback = cb
+        } catch (t: Throwable) {
+            ktLog("[Network] 注册 NetworkCallback 失败: ${t.message}")
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        try {
+            networkCallback?.let {
+                (getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager)
+                    .unregisterNetworkCallback(it)
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "unregisterNetworkCallback failed", t)
+        }
+        networkCallback = null
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -275,12 +354,11 @@ class N2nVpnService : VpnService() {
         val preferredIp = intent.getStringExtra(EXTRA_PREFERRED_IP) ?: ""
         val roomId = intent.getStringExtra(EXTRA_ROOM_ID) ?: "default-room"
 
-        // ★ P2 修复：clientId 为空/缺失时兜底到持久化 ID
+        // ★ clientId 为空/缺失时兜底到持久化 ID
         //
         // 问题：若通过 SDK / 命令行 / adb shell am start 传入空 clientId，
         //       FetchVIP 和 Start 两次调用会各自生成随机 ID，
         //       导致 TUN 的 IP 和 Go 层 VIP 不一致 → 连接建立但数据不通。
-        // 修复：与 MainActivity.saveCurrentInput 的兜底逻辑保持一致。
         val clientId = (intent.getStringExtra(EXTRA_CLIENT_ID)?.takeIf { it.isNotBlank() })
             ?: Prefs.loadOrCreateClientId(this)
 
@@ -747,6 +825,9 @@ class N2nVpnService : VpnService() {
         notificationActive = false
 
         try { unregisterReceiver(tzReceiver) } catch (_: Throwable) {}
+
+        // ★ 新增：注销网络回调
+        unregisterNetworkCallback()
 
         try { handler.removeCallbacksAndMessages(null) } catch (_: Throwable) {}
         handleStop()
