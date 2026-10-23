@@ -17,7 +17,7 @@ import (
 //   4. IP 匹配 AssistedEndpoints（HardNAT 端口漂移兜底，★ 要求唯一命中）
 //   5. IP 匹配 UDPAddr（★ 要求唯一命中）
 //
-// ★ 修复（本轮）：assisted / udp 的 IP 级兜底必须唯一命中才返回。
+// ★ 修复：assisted / udp 的 IP 级兜底必须唯一命中才返回。
 //   旧版 map 遍历顺序随机 → 多 peer 同 CGNAT 出口（同 IP 不同端口）
 //   时可能返回错误 peer → 状态机串包。
 func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
@@ -110,17 +110,18 @@ func (e *Edge) peerAddrAndMode(peerID string) (*net.UDPAddr, bool) {
 	viaTURN := true
 	if e.relayMgr != nil {
 		st := e.relayMgr.GetState(peerID)
-		viaTURN = st != ConnP2P && st != ConnP2PAvailable
+		viaTURN = st != ConnLAN && st != ConnP2P && st != ConnP2PAvailable
 	}
 	return p.UDPAddr, viaTURN
 }
 
 // handleP2PFrame 收到 N2NS 帧时的入口。
 //
-// 状态机判定：
-//   - viaTURN=false 的 PONG / 数据帧 → MarkP2P
-//   - viaTURN=true 且当前 ConnP2P → 对端已降级，本机跟进 ForceFallback("peer-via-turn")
-//   - viaTURN=true 且非 P2P → 保持当前状态
+// 状态机判定（区分 LAN / 公网 / TURN 来源）：
+//   - viaTURN=false 且源 IP 是私网 → MarkLAN
+//   - viaTURN=false 且源 IP 是公网 → MarkP2P
+//   - viaTURN=true 且当前 ConnLAN/ConnP2P → 对端已降级，本机跟进 ForceFallback("peer-via-turn")
+//   - viaTURN=true 且非 LAN/P2P → 保持当前状态
 func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) {
 	if e.p2pStreams == nil {
 		return
@@ -179,36 +180,45 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 		e.peersMu.Unlock()
 	}
 
-	// 状态机判定
+	// ★ 状态机判定（区分 LAN / 公网 / TURN 来源）
 	if e.relayMgr != nil {
 		cur := e.relayMgr.GetState(peerID)
+		fromLAN := !viaTURN && isPrivateIPv4(peerAddr.IP)
 
 		switch f.Type {
 		case p2pTypePING:
 			// 静默：只更新 lastRecvAt（上方已完成）
 
 		case p2pTypePONG:
-			if viaTURN && cur == ConnP2P {
+			if viaTURN && (cur == ConnLAN || cur == ConnP2P) {
 				log.Printf("[P2P] %s 通过 TURN 收到 PONG → 对端已降级，本机跟进", peerID)
 				e.relayMgr.ForceFallback(peerID, "peer-via-turn")
-			} else if !viaTURN && cur != ConnP2P {
-				log.Printf("[P2P] 收到 PONG（UDP 直连）→ P2P 直连（双向通道已验证）")
+			} else if fromLAN {
+				if cur != ConnLAN {
+					log.Printf("[LAN] 收到 PONG（LAN）→ LAN 直连")
+					e.relayMgr.MarkLAN(peerID)
+				}
+			} else if !viaTURN && cur != ConnLAN && cur != ConnP2P {
+				log.Printf("[P2P] 收到 PONG（公网）→ P2P 直连（双向通道已验证）")
 				e.relayMgr.MarkP2P(peerID)
-			} else if viaTURN && cur != ConnP2P {
-				log.Printf("[TURN] 通过 TURN 收到 PONG → 保持 P2PAvailable（不标记 P2P，等待直连 PONG）")
+			} else if viaTURN && cur != ConnLAN && cur != ConnP2P {
+				log.Printf("[TURN] 通过 TURN 收到 PONG → 保持 P2PAvailable")
 			}
 
 		default:
-			if viaTURN && cur == ConnP2P {
+			if viaTURN && (cur == ConnLAN || cur == ConnP2P) {
 				log.Printf("[P2P] %s 通过 TURN 收到数据帧 → 对端已降级，本机跟进", peerID)
 				e.relayMgr.ForceFallback(peerID, "peer-via-turn")
-			} else if !viaTURN && cur != ConnP2P {
-				log.Printf("[P2P] 收到数据帧（stream=%d type=%d）→ P2P 直连",
-					f.StreamID, f.Type)
+			} else if fromLAN {
+				if cur != ConnLAN {
+					log.Printf("[LAN] 收到数据帧（LAN）→ LAN 直连")
+					e.relayMgr.MarkLAN(peerID)
+				}
+			} else if !viaTURN && cur != ConnLAN && cur != ConnP2P {
+				log.Printf("[P2P] 收到数据帧（公网）→ P2P 直连")
 				e.relayMgr.MarkP2P(peerID)
-			} else if viaTURN && cur != ConnP2P {
-				log.Printf("[TURN] 通过 TURN 收到数据帧（stream=%d type=%d）→ 保持当前状态",
-					f.StreamID, f.Type)
+			} else if viaTURN && cur != ConnLAN && cur != ConnP2P {
+				log.Printf("[TURN] 通过 TURN 收到数据帧 → 保持当前状态")
 			}
 		}
 	}
