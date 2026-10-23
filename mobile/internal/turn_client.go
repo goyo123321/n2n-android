@@ -170,6 +170,10 @@ func (tc *TURNClient) FetchAndSetup(ctx context.Context) (err error) {
 	return tc.setupAllocation(ctx)
 }
 
+// setupAllocation 建立 TURN Allocation。
+//
+// ★ 修复：注册 lite.onClosed 回调，Refresh 连续失败时立即触发重建，
+//   不等 30s StartReconnectLoop。
 func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 	tc.mu.RLock()
 	srv := tc.server
@@ -191,10 +195,13 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 	log.Printf("[TURN] 尝试 UDP transport: %s", turnAddr)
 	lite := NewTURNLiteWithTCP(turnAddr, srv.Username, srv.Password, false)
 	lite.onMessage = tc.wrapOnMessage()
+	// ★ 修复：Refresh 连续失败立即重建
+	lite.onClosed = tc.makeOnClosed()
 	if err := lite.Allocate(); err != nil {
 		log.Printf("[TURN] UDP transport 失败: %v，尝试 TCP transport", err)
 		lite2 := NewTURNLiteWithTCP(turnAddr, srv.Username, srv.Password, true)
 		lite2.onMessage = tc.wrapOnMessage()
+		lite2.onClosed = tc.makeOnClosed()
 		if err2 := lite2.Allocate(); err2 != nil {
 			log.Printf("[TURN] TURN over TCP 失败: %v，尝试 RFC 6062 TCP allocation", err2)
 
@@ -227,6 +234,53 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 		log.Printf("[TURN] ✅ UDP transport 就绪: %s", tc.relayAddr)
 	}
 	return nil
+}
+
+// makeOnClosed 构造 TURNLite.onClosed 回调。
+//
+// ★ 修复：Refresh 连续失败时，TURNLite 会调 onClosed()。
+//   本回调立即触发重建，不等 StartReconnectLoop 的 30s 轮询。
+func (tc *TURNClient) makeOnClosed() func() {
+	return func() {
+		log.Printf("[TURN] TURNLite 主动关闭（Refresh 失败），立即触发重建")
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[TURN] 立即重建 panic: %v\n%s", r, debug.Stack())
+				}
+			}()
+
+			// 短暂延迟，避免 TURNLite.Close() 的 stopCh 竞态
+			time.Sleep(500 * time.Millisecond)
+
+			// 检查是否还在运行（可能被 Stop() 关掉了）
+			select {
+			case <-tc.stopCh:
+				return
+			default:
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			if err := tc.FetchAndSetup(ctx); err != nil {
+				log.Printf("[TURN] Refresh 失败后立即重建失败: %v（30 秒后 StartReconnectLoop 重试）", err)
+				return
+			}
+
+			log.Printf("[TURN] ✅ Refresh 失败后立即重建成功: %s", tc.GetRelayAddr())
+
+			if tc.edge != nil && tc.edge.ws != nil {
+				_ = tc.edge.ws.Send(map[string]interface{}{
+					"type":      "turn_relay_info",
+					"relayAddr": tc.GetRelayAddr(),
+				})
+			}
+			if tc.edge != nil && tc.edge.relayMgr != nil {
+				tc.edge.relayMgr.UpgradeRelaysToTURN()
+			}
+		}()
+	}
 }
 
 func (tc *TURNClient) wrapOnMessage() func([]byte, net.Addr) {
