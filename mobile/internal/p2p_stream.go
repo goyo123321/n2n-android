@@ -304,7 +304,6 @@ func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 	return out
 }
 
-// sendP2PFrame 发送一帧到对端的所有候选地址。
 func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	s.mu.Lock()
 	viaTURN := s.viaTURN
@@ -884,14 +883,13 @@ func (s *P2PStream) close(reason string) {
 	log.Printf("[P2P-STREAM] %d 关闭 (%s)", s.ID, reason)
 }
 
-// ============ N2NW / N2NA 二进制帧（WS 中继数据面） ============
+// ============ N2NW / N2NA 二进制帧 ============
 
 const (
 	n2nwHdrMin  = 6
 	n2nwPeerMax = 255
 )
 
-// buildN2NWFrame 构造 N2NW 帧。
 func buildN2NWFrame(targetID string, payload []byte) []byte {
 	idBytes := []byte(targetID)
 	if len(idBytes) > n2nwPeerMax {
@@ -911,20 +909,14 @@ func buildN2NWFrame(targetID string, payload []byte) []byte {
 
 // handleAppStreamBinary 处理服务端转发来的 WS 二进制帧。
 //
-// ★ 新增：N2NW 分支收到数据但当前状态是 LAN/P2P/P2PAvailable
-//   → 对端已降级到 WS，本机跟进 ForceFallback("peer-via-ws")。
-//
-//   旧版只更新 lastRecvAt，不检查状态 → 单向 P2P 但对端走 WS 时，
-//   本机停在 ConnP2P 继续往对端公网地址发数据全丢，30s 后才被
-//   sendP2PIdleKeepalive 降级。
+// ★ 修复：N2NW 分支收到数据时用 RecordWSFrame（5 秒内 ≥3 帧才降级）
+//   避免单帧就 ForceFallback 导致震荡
 func (e *Edge) handleAppStreamBinary(data []byte) {
-	// N2NA 分支（app_stream 二进制数据面）
 	if isN2NAFrame(data) {
 		e.handleN2NAFrame(data)
 		return
 	}
 
-	// N2NW 分支（IPv4 数据面）
 	if len(data) < n2nwHdrMin {
 		return
 	}
@@ -949,7 +941,6 @@ func (e *Edge) handleAppStreamBinary(data []byte) {
 		return
 	}
 
-	// 更新发送方 peer 的活跃时间
 	now := time.Now().UnixMilli()
 	e.peersMu.Lock()
 	if p, ok := e.peers[senderID]; ok {
@@ -957,16 +948,14 @@ func (e *Edge) handleAppStreamBinary(data []byte) {
 	}
 	e.peersMu.Unlock()
 
-	// ★ 新增：WS 收到数据但当前状态是 LAN/P2P/P2PAvailable → 对端已降级
+	// ★ 修复：用 RecordWSFrame 计数，5 秒内 ≥3 帧才降级
+	//   避免 B 的 LAN probe 和 TURN 失败兜底 WS 导致 A 震荡
 	if e.relayMgr != nil {
 		st := e.relayMgr.GetState(senderID)
 		if st == ConnLAN || st == ConnP2P || st == ConnP2PAvailable {
-			log.Printf("[WS-BIN] %s 通过 WS 收到数据帧（当前 %s）→ 对端已降级，本机跟进",
-				senderID, st)
-			e.relayMgr.ForceFallback(senderID, "peer-via-ws")
+			e.relayMgr.RecordWSFrame(senderID)
 		}
 	}
 
-	// 送 TUN（onRemotePacket 内部校验 dstIP == 本机 VIP）
 	e.onRemotePacket(payload)
 }
