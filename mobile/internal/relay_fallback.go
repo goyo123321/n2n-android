@@ -84,6 +84,11 @@ func (rm *RelayManager) MarkP2P(peerId string) {
 }
 
 // MarkLAN 标记 LAN 直连已验证。
+//
+// LAN 和公网 P2P 分开：
+//   - LAN 不需要 2s 保活（不对抗 WiFi 省电）
+//   - LAN 60s 无流量才降级（而非 30s）
+//   - LAN 不受 force_fallback 影响（服务端已跳过 LAN peer）
 func (rm *RelayManager) MarkLAN(peerId string) {
 	rm.mu.Lock()
 	prev := rm.states[peerId]
@@ -104,7 +109,7 @@ func (rm *RelayManager) MarkLAN(peerId string) {
 	}
 }
 
-// DemoteLANToP2P LAN 60s 无流量时降级到公网 P2P。
+// DemoteLANToP2P LAN 60s 无流量时降级到公网 P2P（不是 TURN）。
 func (rm *RelayManager) DemoteLANToP2P(peerId, reason string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
@@ -116,6 +121,8 @@ func (rm *RelayManager) DemoteLANToP2P(peerId, reason string) {
 }
 
 // MarkFallback 从 Unknown 状态降级到 TURN/WS。
+//
+// ★ ConnLAN / ConnP2P / ConnP2PAvailable 视为「已建立」，不降级。
 func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.mu.Lock()
 
@@ -162,7 +169,8 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 
 // ForceFallback 强制降级。
 //
-// ★ 白名单新增 "peer-via-ws"：WS 收到数据帧说明对端已降级到 WS，本机必须跟进。
+// ★ ConnLAN 白名单：peer-via-turn / peer-via-ws / no-traffic-30s / network-changed
+// ★ ConnP2P 白名单：no-traffic-30s / p2p-avail-timeout / peer-via-turn / peer-via-ws
 func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
@@ -268,6 +276,7 @@ func (rm *RelayManager) MarkRelay(peerId string) {
 	rm.MarkFallback(peerId)
 }
 
+// ShouldRelay LAN / P2P / P2PAvailable 都算「不中继」。
 func (rm *RelayManager) ShouldRelay(peerId string) bool {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
@@ -323,9 +332,14 @@ func (rm *RelayManager) SendViaRelay(data []byte) error {
 
 // SendToPeer 按当前状态发送数据。
 //
-// ★ 修复：ConnLAN 分支失败后走 MarkP2P（不再直接 rm.states[peerId] = ConnP2P）。
-//   直接赋值绕过了 reportP2PStatus / cancelFallbackTimer / cancelP2PAvailTimeout，
-//   违反「所有状态变化走 Mark* 函数」原则。
+// ★ 修复：ConnLAN 分支 LAN 发送失败后降级到 ConnP2PAvailable（不是 ConnP2P）。
+//
+// 原因：LAN 失败说明对端已不在本 LAN（可能对端换了网络，或本端换了网络）。
+// 直接用 UDPAddr 发公网包，WriteTo 可能成功但 NAT 丢包。
+// 降级到 ConnP2PAvailable 后：
+//   - 不会跳过 nat_hole_instruction（只有 ConnLAN/ConnP2P 才跳过）
+//   - 60s 内收不到 PONG/数据帧 → 降级 TURN/WS
+//   - 服务端 punchState 能看到 p2pStatus=2，继续协调打洞
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
 	state := rm.GetState(peerId)
 
@@ -356,9 +370,21 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 			return true
 		}
 
-		// ★ LAN 失败 → 降级到 P2P，走 MarkP2P（不直接改 states）
-		rm.MarkP2P(peerId)
-		log.Printf("[连接] %s LAN 发送失败，降级到 P2P", peerId)
+		// ★ 修复：LAN 失败 → 降级到 ConnP2PAvailable（待验证），不是 ConnP2P
+		rm.mu.Lock()
+		wasLAN := rm.states[peerId] == ConnLAN
+		if wasLAN {
+			rm.states[peerId] = ConnP2PAvailable
+		}
+		rm.mu.Unlock()
+
+		if wasLAN {
+			log.Printf("[连接] %s LAN 发送失败，降级到 P2PAvailable（等待验证）", peerId)
+			if rm.edge != nil {
+				rm.edge.reportP2PStatus(peerId, 2)
+				rm.edge.scheduleP2PAvailTimeout(peerId)
+			}
+		}
 
 		if target.UDPAddr != nil && !isPrivateIPv4(target.UDPAddr.IP) {
 			if _, err := rm.edge.udpConn.WriteTo(data, target.UDPAddr); err == nil {
@@ -494,6 +520,12 @@ func (rm *RelayManager) Report(interval time.Duration) {
 }
 
 // ResetP2PStates 重置所有 P2P / LAN 状态，保留 TURN/WS。
+//
+// 网络切换（WiFi ↔ Cellular / WiFi1 → WiFi2）后：P2P/LAN 的 UDP 路径
+// 可能失效，但 TURN 走中继、WS 走 TCP 信令，源 IP 变化不影响，必须保留。
+//
+// 注意：LanEndpoints 本身由 edge.OnNetworkChanged 清空（对端换了网络，
+// 旧 LAN 地址不可达），这里只改状态。
 func (rm *RelayManager) ResetP2PStates(reason string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
