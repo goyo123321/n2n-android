@@ -95,18 +95,6 @@ func extractPortFromEndpoint(ep string) int {
 	return port
 }
 
-// 注意：以下函数定义在 edge.go / lan.go / p2p_stream.go 里，本文件直接调用：
-//   - lastIndexByte         → edge.go
-//   - extractIPFromEndpoint → edge.go
-//   - jsonInt               → edge.go
-//   - isPrivateIPv4         → lan.go
-//   - sortLANByAffinity     → lan.go
-//   - localPrefixes         → lan.go
-//   - safeGo                → edge.go
-//   - hasTrafficFromTarget  → edge.go
-//   - hasTrafficFromAny     → edge.go
-//   - buildN2NWFrame        → p2p_stream.go
-
 func (e *Edge) startFailCountResetLoop() {
 	safeGo("fail-count-reset", func() {
 		ticker := time.NewTicker(5 * time.Minute)
@@ -239,7 +227,6 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		return nil
 	}
 
-	// 去重 key 用 target@rung，允许同一 target 的多个 rung 并行
 	activeKey := fmt.Sprintf("%s@%d", instr.TargetMac, instr.BehaviorIndex)
 	if natHoleActive[activeKey] {
 		natHoleActiveMu.Unlock()
@@ -344,12 +331,22 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		case <-time.After(300 * time.Millisecond):
 		}
 
-		if e.hasTrafficFromTarget(instr.TargetMac, startAt) {
+		// ★ 优先判 LAN 命中
+		if e.hasTrafficFromTargetLAN(instr.TargetMac, startAt) {
 			res.State = PunchStateSucceeded
 			res.Attempts = attempts
-			res.Detail = fmt.Sprintf("候选命中 (%d 个端点)", len(assistedTargets))
+			res.Detail = "LAN 命中"
+			log.Printf("[NAT-HOLE] ✅ 成功 (LAN) role=%d target=%s attempts=%d",
+				instr.Role, targetAddr.IP, attempts)
+			e.resetFailCount(instr.TargetMac)
+			return res
+		}
+		if e.hasTrafficFromTargetPublic(instr.TargetMac, startAt) {
+			res.State = PunchStateSucceeded
+			res.Attempts = attempts
+			res.Detail = fmt.Sprintf("公网命中 (%d 个端点)", len(assistedTargets))
 			e.recordP2PSuccess(instr, targetAddr)
-			log.Printf("[NAT-HOLE] ✅ 成功 (candidates) role=%d target=%s attempts=%d",
+			log.Printf("[NAT-HOLE] ✅ 成功 (公网 candidates) role=%d target=%s attempts=%d",
 				instr.Role, targetAddr.IP, attempts)
 			e.resetFailCount(instr.TargetMac)
 			return res
@@ -408,7 +405,9 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 				}
 			}
 
-			if e.hasTrafficFromTarget(instr.TargetMac, startAt) {
+			// ★ LAN 或公网命中都算成功
+			if e.hasTrafficFromTargetLAN(instr.TargetMac, startAt) ||
+				e.hasTrafficFromTargetPublic(instr.TargetMac, startAt) {
 				success = true
 				break
 			}
@@ -425,10 +424,18 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		if success {
 			res.State = PunchStateSucceeded
 			res.Attempts = attempts
-			res.Detail = fmt.Sprintf("端口扫描成功 (tier=±%d)", half)
-			e.recordP2PSuccess(instr, targetAddr)
-			log.Printf("[NAT-HOLE] ✅ 成功 role=%d target=%s attempts=%d tier=±%d",
-				instr.Role, targetAddr.IP, attempts, half)
+
+			isLANHit := e.hasTrafficFromTargetLAN(instr.TargetMac, startAt)
+			if isLANHit {
+				res.Detail = fmt.Sprintf("LAN 命中 (tier=±%d)", half)
+				log.Printf("[NAT-HOLE] ✅ 成功 (LAN) role=%d target=%s attempts=%d tier=±%d",
+					instr.Role, targetAddr.IP, attempts, half)
+			} else {
+				res.Detail = fmt.Sprintf("公网命中 (tier=±%d)", half)
+				e.recordP2PSuccess(instr, targetAddr)
+				log.Printf("[NAT-HOLE] ✅ 成功 (公网) role=%d target=%s attempts=%d tier=±%d",
+					instr.Role, targetAddr.IP, attempts, half)
+			}
 			e.resetFailCount(instr.TargetMac)
 			return res
 		}
@@ -463,9 +470,6 @@ func (e *Edge) resetFailCount(peerID string) {
 }
 
 // recordP2PSuccess 记录打洞成功时的 peer 地址。
-//
-// ★ registeredAt 兜底：lastLANRecvAt == 0 时从注册时间起算。
-// ★ LAN 命中：打洞命中的是 LAN 地址 → 直接 MarkLAN（只从 ConnUnknown 升级）。
 func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAddr) {
 	e.peersMu.Lock()
 	if p, ok := e.peers[instr.TargetMac]; ok {
@@ -479,7 +483,6 @@ func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAd
 		} else if !oldIsLAN && newIsLAN {
 			shouldUpdate = true
 		} else if oldIsLAN && !newIsLAN {
-			// ★ registeredAt 兜底
 			lastLAN := p.lastLANRecvAt
 			if lastLAN == 0 {
 				lastLAN = p.registeredAt
@@ -500,6 +503,9 @@ func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAd
 			p.UDPAddr = targetAddr
 		}
 		p.lastRecvAt = now
+		if !newIsLAN {
+			p.lastPublicRecvAt = now
+		}
 	} else {
 		e.peers[instr.TargetMac] = &PeerInfo{
 			ClientID:     instr.TargetMac,
@@ -511,9 +517,7 @@ func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAd
 	}
 	e.peersMu.Unlock()
 
-	// ★ 新增：打洞命中 LAN 地址 → 直接 MarkLAN
-	//   只在 ConnUnknown 时升级（ConnP2PAvailable 说明已握手成功在等数据帧，
-	//   让 notePeerCommon 的 LAN 数据帧处理来 MarkLAN 更可靠）
+	// 打洞命中 LAN 地址 → 直接 MarkLAN
 	if isPrivateIPv4(targetAddr.IP) && e.relayMgr != nil {
 		curState := e.relayMgr.GetState(instr.TargetMac)
 		if curState == ConnUnknown {
