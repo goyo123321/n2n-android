@@ -96,13 +96,7 @@ object N2nController {
                     }
                     if (!accepted) {
                         Log.w(TAG, "startAsync 完成时 running 已被置 false，回收 Client")
-                        // ★ P2 修复：明确告知 UI 启动被取消，避免 UI 误以为成功
-                        //
-                        // 触发条件：c.start() 成功后、执行到 synchronized 前，
-                        //          另一个线程调用了 stop()（running.set(false)）。
-                        // 旧行为：result 仍为 ""，UI 认为成功 → 状态显示"运行中"，
-                        //         但 isRunning() 返回 false → 状态每秒刷新回"未运行"。
-                        // 新行为：result = "cancelled" → 调用方走失败分支。
+                        // ★ 明确告知 UI 启动被取消，避免 UI 误以为成功
                         result = "cancelled"
                         try {
                             c.stop()
@@ -178,6 +172,30 @@ object N2nController {
     } catch (t: Throwable) {
         Log.e(TAG, "getPeersJSON failed", t)
         "[]"
+    }
+
+    // ============================================================
+    // ★ 新增：网络变化通知（由 N2nVpnService.NetworkCallback 调用）
+    // ============================================================
+    //
+    // WiFi ↔ Cellular 切换时立即清 Go 层 P2P 状态，避免旧 UDP 路径持续丢包。
+    // Go 层会：
+    //   1. 重置 relayMgr 的 P2P 状态（保留 TURN/WS）
+    //   2. 清空所有 peer 的 UDPAddr
+    //   3. 立即上报 p2p_metadata（绕过 30s 节流）
+    //   4. 通知服务端 clearPairStateFor + 广播 peer_network_changed
+    fun notifyNetworkChanged(type: String) {
+        val c = synchronized(clientLock) { client }
+        if (c == null) {
+            Log.d(TAG, "notifyNetworkChanged($type)：未运行，忽略")
+            return
+        }
+        try {
+            c.notifyNetworkChanged(type)
+            Log.i(TAG, "notifyNetworkChanged($type)：已通知 Go 层重置 P2P 状态")
+        } catch (t: Throwable) {
+            Log.e(TAG, "notifyNetworkChanged($type) failed", t)
+        }
     }
 
     fun getLogs(): String {
