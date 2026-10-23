@@ -94,7 +94,7 @@ type TURNLite struct {
 	permMu      sync.Mutex
 
 	onMessage func([]byte, net.Addr)
-	// ★ Refresh 连续失败主动关闭时通知 TURNClient 立即重建
+	// Refresh 连续失败主动关闭时通知 TURNClient 立即重建
 	onClosed func()
 
 	pendingMu sync.Mutex
@@ -275,9 +275,9 @@ func randTxID() [12]byte {
 
 // sendRequest 发送 STUN 请求。
 //
-// ★ 修复：TCP transport 需要 STUN over TCP 分帧头（wrapTCPFrame）。
-//   旧版直接 conn.Write(msg) → coturn 严格模式丢弃 Send indication
-//   / Refresh / CreatePermission → TURN over TCP 后续消息全部无效。
+// 修复：TCP transport 需要 STUN over TCP 分帧头（wrapTCPFrame）。
+// 旧版直接 conn.Write(msg) → coturn 严格模式丢弃 Send indication
+// / Refresh / CreatePermission → TURN over TCP 后续消息全部无效。
 func (t *TURNLite) sendRequest(msgType uint16, attrs []stunAttr, withAuth bool) (*stunMessage, error) {
 	txid := randTxID()
 
@@ -294,7 +294,7 @@ func (t *TURNLite) sendRequest(msgType uint16, attrs []stunAttr, withAuth bool) 
 		msg = t.sign(msg)
 	}
 
-	// ★ 修复：TCP transport 需要 STUN over TCP 分帧头
+	// 修复：TCP transport 需要 STUN over TCP 分帧头
 	var wire []byte
 	if t.useTCP {
 		wire = wrapTCPFrame(msg)
@@ -498,9 +498,14 @@ func (t *TURNLite) ensurePermission(ip net.IP, port int) error {
 
 // SendTo 发送数据到对端。
 //
-// ★ 修复：TCP transport 需要 STUN over TCP 分帧头（wrapTCPFrame）。
-//   旧版直接 conn.Write(msg) → coturn 严格模式丢弃 Send indication
-//   → TURN over TCP 的 B→A 数据全部无效。
+// 修复：TCP transport 需要 STUN over TCP 分帧头（wrapTCPFrame）。
+// 旧版直接 conn.Write(msg) → coturn 严格模式丢弃 Send indication
+// → TURN over TCP 的 B→A 数据全部无效。
+//
+// 修复（本版本）：UDP socket 在换网络后不一定报错（源 IP 变了但 socket
+// 还开着），但 SendTo 返回 nil 时数据实际丢了。TCP transport 会报错，
+// UDP 不会。只有 isNetworkUnreachable（网络不可达）才触发 Close + 重建。
+// 真正的「假成功」场景由 edge_network.go 的 RebuildAllocation 兜底。
 func (t *TURNLite) SendTo(data []byte, peerAddr *net.UDPAddr) error {
 	if t.conn == nil {
 		return fmt.Errorf("TURN 未就绪")
@@ -517,7 +522,7 @@ func (t *TURNLite) SendTo(data []byte, peerAddr *net.UDPAddr) error {
 		{typ: attrData, value: data},
 	})
 
-	// ★ 修复：TCP transport 需要 STUN over TCP 分帧头
+	// 修复：TCP transport 需要 STUN over TCP 分帧头
 	var wire []byte
 	if t.useTCP {
 		wire = wrapTCPFrame(msg)
@@ -530,8 +535,20 @@ func (t *TURNLite) SendTo(data []byte, peerAddr *net.UDPAddr) error {
 	if t.stopped {
 		return fmt.Errorf("已关闭")
 	}
+
+	// ★ 修复（本版本）：UDP socket 换网络后不一定报错，但数据实际丢了。
+	//   TCP transport 会报错，UDP 不会。只有 isNetworkUnreachable 才触发
+	//   Close + 重建。真正的「假成功」由 edge_network.go 的
+	//   RebuildAllocation 兜底。
 	_, err := t.conn.Write(wire)
-	return err
+	if err != nil {
+		if isNetworkUnreachable(err) {
+			log.Printf("[TURN-Lite] SendTo socket 失效（网络变化），关闭等待重建")
+			go t.Close()
+		}
+		return err
+	}
+	return nil
 }
 
 func (t *TURNLite) readLoop() {
@@ -648,8 +665,8 @@ func (t *TURNLite) handleIncoming(data []byte) {
 
 // refreshLoop TURN Refresh 循环。
 //
-// ★ Refresh 连续失败 3 次时，主动触发 onClosed 回调，
-//   让 TURNClient 立即重建，不等 30s StartReconnectLoop。
+// Refresh 连续失败 3 次时，主动触发 onClosed 回调，
+// 让 TURNClient 立即重建，不等 30s StartReconnectLoop。
 func (t *TURNLite) refreshLoop() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -768,10 +785,6 @@ func parseErrorCode(data []byte) int {
 // wrapTCPFrame STUN over TCP 分帧（RFC 5766 §7.2.2）
 //
 // 格式：首字节 0b01（0x01）+ 2 字节长度（不含 padding）+ padding（4 字节对齐）
-//
-// ★ 修复：TURNLite 的 TCP transport 之前直接 conn.Write(msg)，
-//   缺分帧头 → coturn 严格模式下丢弃 Send indication / Refresh / CreatePermission
-//   → TURN over TCP 后续消息全部无效。
 //
 // 供 turn_lite_tcp.go 的 TURNTCPAllocation 复用。
 func wrapTCPFrame(msg []byte) []byte {
