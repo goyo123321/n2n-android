@@ -160,7 +160,10 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 
 // ForceFallback 强制降级。
 //
-// ★ 白名单覆盖：peer-via-turn / peer-via-ws / no-traffic-30s / p2p-avail-timeout / network-changed / lan-endpoints-cleared
+// ★ 白名单覆盖：
+//   peer-via-turn / peer-via-ws / no-traffic-30s / p2p-avail-timeout
+//   / network-changed / lan-endpoints-cleared / peer-uses-turn（服务端强制同步）
+//
 // ★ 修复：降级后立即上报 connection_status，不等 10s Report ticker。
 //   否则服务端 shouldRetireSuccess 看到的 aToB/bToA 还是旧的（lan/p2p），
 //   不重新协调打洞。
@@ -177,7 +180,8 @@ func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 			reason != "peer-via-ws" &&
 			reason != "no-traffic-30s" &&
 			reason != "network-changed" &&
-			reason != "lan-endpoints-cleared" {
+			reason != "lan-endpoints-cleared" &&
+			reason != "peer-uses-turn" {
 			return
 		}
 		log.Printf("[连接] %s 从 LAN 降级 (force: %s)", peerId, reason)
@@ -187,7 +191,8 @@ func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 		if reason != "no-traffic-30s" &&
 			reason != "p2p-avail-timeout" &&
 			reason != "peer-via-turn" &&
-			reason != "peer-via-ws" {
+			reason != "peer-via-ws" &&
+			reason != "peer-uses-turn" {
 			return
 		}
 		log.Printf("[连接] %s 从 P2P 降级 (force: %s)", peerId, reason)
