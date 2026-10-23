@@ -310,10 +310,6 @@ func (e *Edge) sendP2PIdleKeepalive() {
 
 		if st == ConnLAN {
 			// ★ LAN 每 30s 发一次 P2P probe（保活 + 探测）
-			//
-			// 旧版 LAN 完全不做保活，60s 无流量就降级。
-			// 新版每 30s 发一次 P2P probe（21 字节），既保活又探测。
-			// 流量：3 peer * 30s * 21B = 7.5KB/小时 = 180KB/天，可忽略。
 			if p.lastRecvAt > 0 && now-p.lastRecvAt > lanProbeIntervalMs {
 				lanProbePeers = append(lanProbePeers, id)
 			}
@@ -1181,7 +1177,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 				return
 			}
 			if st == ConnP2PAvailable {
-				// 已握手成功等待数据帧验证，无需重复打洞
 				log.Printf("[NAT-HOLE] 跳过指令 target=%s（已 P2PAvailable），上报 p2p_status=2",
 					instr.TargetMac)
 				e.reportP2PStatus(instr.TargetMac, 2)
@@ -1415,7 +1410,14 @@ func (e *Edge) peerExists(peerID string) bool {
 
 // registerPeer 处理三种 UDPAddr 切换场景。
 //
-// ★ 修复：joined 明确上报 lan=0（对端 LAN 消失）时清空本地 LanEndpoints。
+// ★ 修复：joined 明确上报 lan=0（对端 LAN 消失）时：
+//   1. 清空本地 LanEndpoints
+//   2. 如果当前 UDPAddr 是私网，切回公网 UDPAddr
+//   3. 如果当前状态是 ConnLAN，立即 ForceFallback("lan-endpoints-cleared")
+//
+// 旧版只清空 LanEndpoints，UDPAddr 还是上次从 LAN 包学到的私网地址
+// → SendToPeer 检查私网 + !selfOnLAN → 跳过 UDP → 走 WS 兜底
+// → 58 秒黑洞
 func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	var udpAddr *net.UDPAddr
 	if pubIP != "" && pubPort > 0 {
@@ -1491,19 +1493,28 @@ func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string,
 			p.AssistedEndpoints = assisted
 		}
 
-		// ★ 修复：joined 明确上报 lan=0（对端 LAN 消失）时清空本地 LanEndpoints
-		//
-		// 场景：对端 WiFi 切换 / 移动网络切换 / LAN 检测失败 → joined lanEndpoints=[]
-		// 旧版：len(sortedLAN) > 0 才更新，= [] 时什么都不做 → 旧的 LanEndpoints 保留
-		//      → A 继续往旧 LAN 发包 → 58 秒全丢
-		// 修复：= [] 且本地有旧值时清空 + 如果当前是 ConnLAN 立即降级
+		// ★ 修复：joined lan=0 时清空 LanEndpoints + 切回公网 UDPAddr
 		if len(sortedLAN) > 0 {
 			p.LanEndpoints = sortedLAN
 		} else if p.LanEndpoints != nil && len(p.LanEndpoints) > 0 {
 			log.Printf("[P2P] %s joined 时 lan=0，清空本地 LanEndpoints（旧值: %v）",
 				pid, p.LanEndpoints)
 			p.LanEndpoints = nil
-			// LAN 消失，如果当前是 ConnLAN 立即降级
+
+			// ★ 关键修复：LAN 消失后，如果当前 UDPAddr 是私网，切回公网
+			if p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP) {
+				if pubIP != "" && pubPort > 0 {
+					newAddr := &net.UDPAddr{IP: net.ParseIP(pubIP), Port: pubPort}
+					log.Printf("[P2P] %s joined lan=0 且 UDPAddr 是私网，切到公网: %s → %s",
+						pid, p.UDPAddr, newAddr)
+					p.UDPAddr = newAddr
+				} else {
+					log.Printf("[P2P] %s joined lan=0 且 UDPAddr 是私网，但公网地址未知，清空 UDPAddr",
+						pid)
+					p.UDPAddr = nil
+				}
+			}
+
 			if e.relayMgr != nil && e.relayMgr.GetState(pid) == ConnLAN {
 				e.relayMgr.ForceFallback(pid, "lan-endpoints-cleared")
 			}
@@ -2325,14 +2336,12 @@ func (e *Edge) reportMetadata() {
 		metaPayload["lanSubnets"] = cidrs
 	}
 
+	subnetCount := 0
+	if s, ok := metaPayload["lanSubnets"].([]string); ok {
+		subnetCount = len(s)
+	}
 	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%q multiExit=%v assisted=%d lan=%d subnets=%d features=[n2na,n2nw]",
-		nm.NATType, nm.PublicEndpoint, nm.MultiExit, len(nm.AllEndpoints), len(lanEndpoints),
-		func() int {
-			if p, ok := metaPayload["lanSubnets"].([]string); ok {
-				return len(p)
-			}
-			return 0
-		}())
+		nm.NATType, nm.PublicEndpoint, nm.MultiExit, len(nm.AllEndpoints), len(lanEndpoints), subnetCount)
 
 	if ws == nil {
 		return
