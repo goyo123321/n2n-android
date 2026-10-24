@@ -160,12 +160,15 @@ func isCGNATOverlay(ip net.IP) bool {
 // localPrefixes 返回本机所有可能是 LAN 前缀的网段，用于 LAN 亲和度排序
 // 和 lanSubnets 上报。
 //
-// ★ 修复：Android 上 net.Interfaces() 经常返回空/受限，
-//   用 detectOutboundIP（UDP connect 骗内核）兜底推断 /24。
-//   否则：
+// ★ 修复：detectOutboundIP 兜底
+//
+// Android 上 net.Interfaces() 经常返回空/受限（VPN 启动后接口状态变化），
+// 用 UDP connect 骗内核拿出口 IP，推断 /24 网段。
+// 否则：
 //   - shouldShareLan 返回 false → 同 LAN 走公网打洞
 //   - 双 WAN 场景 lanSubnets 为空 → 无法用 cidrOverlaps 判断
 //   - A 换网络后 lanSubnets 为空 → 服务端不识别同 LAN
+//   - sendICMPDirect 的 selfOnLAN=false → ICMP 走公网，延迟 10~50ms
 func localPrefixes(selfVIP string) []*net.IPNet {
 	var result []*net.IPNet
 	seen := map[string]bool{}
@@ -198,7 +201,7 @@ func localPrefixes(selfVIP string) []*net.IPNet {
 		result = append(result, ipnet)
 	}
 
-	// 路径 1：net.Interfaces()
+	// 路径 1：net.Interfaces()（可能返回空）
 	ifaces, err := net.Interfaces()
 	if err == nil {
 		for _, iface := range ifaces {
@@ -221,9 +224,6 @@ func localPrefixes(selfVIP string) []*net.IPNet {
 	}
 
 	// ★ 路径 2：detectOutboundIP 兜底
-	//
-	// Android 上 net.Interfaces() 可能返回空/受限，用 UDP connect 骗内核
-	// 拿到出口 IP，推断 /24 网段。
 	if outIP := detectOutboundIP(); outIP != nil {
 		mask := net.CIDRMask(24, 32)
 		outNet := &net.IPNet{IP: outIP.Mask(mask), Mask: mask}
