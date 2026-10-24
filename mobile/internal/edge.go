@@ -98,9 +98,10 @@ type Edge struct {
 	tunStateLogMu sync.Mutex
 
 	lastMetadataReportAt int64
-	lastDataFrameAt      int64
 
-	// ★ 修复：bool → int，状态变化时重新上报
+	lastDataFrameAt int64
+
+	// peerID -> 上次上报的 p2pStatus
 	p2pStatusReported   map[string]int
 	p2pStatusReportedMu sync.Mutex
 
@@ -233,7 +234,7 @@ const p2pKeepaliveInterval = 15 * time.Second
 const p2pIdleKeepaliveInterval = 2 * time.Second
 const p2pIdleDeadMs = 30000
 const lanIdleDeadMs = 60000
-const lanProbeIntervalMs = 30000 // ★ LAN 每 30s 发一次 probe（保活 + 探测）
+const lanProbeIntervalMs = 30000
 
 func (e *Edge) startP2PKeepalive() {
 	log.Printf("[P2P-Keepalive] 启动：非 P2P 通道每 %v，P2P 通道每 %v（防 WiFi 省电）",
@@ -316,7 +317,6 @@ func (e *Edge) sendP2PIdleKeepalive() {
 		st := e.relayMgr.GetState(id)
 
 		if st == ConnLAN {
-			// ★ LAN 每 30s 发一次 P2P probe（保活 + 探测）
 			if p.lastRecvAt > 0 && now-p.lastRecvAt > lanProbeIntervalMs {
 				lanProbePeers = append(lanProbePeers, id)
 			}
@@ -331,7 +331,6 @@ func (e *Edge) sendP2PIdleKeepalive() {
 		}
 
 		if st == ConnP2P && p.lastP2PRecvAt > 0 && now-p.lastP2PRecvAt > p2pIdleDeadMs {
-			// ★ 修复：只检查 P2P 收包时间，不检查总 lastRecvAt
 			log.Printf("[P2P] %s P2P 真实数据 %ds 未更新（lastRecvAt 可能被 TURN 包刷新），判定 P2P 失效",
 				id, (now-p.lastP2PRecvAt)/1000)
 			deadPeers = append(deadPeers, id)
@@ -342,18 +341,15 @@ func (e *Edge) sendP2PIdleKeepalive() {
 	}
 	e.peersMu.RUnlock()
 
-	// LAN 每 30s 发一次 P2P probe（保活）
 	for _, id := range lanProbePeers {
 		e.p2pStreams.sendP2PProbe(id)
 	}
 
-	// LAN 60s 无流量 → 降级到公网 P2P
 	for _, id := range lanDeadPeers {
 		log.Printf("[LAN] %s 60s 无流量，降级到公网 P2P", id)
 		e.relayMgr.DemoteLANToP2P(id, "no-traffic-60s")
 	}
 
-	// P2P 30s 无 P2P 真实数据 → TURN/WS
 	for _, id := range deadPeers {
 		log.Printf("[P2P] %s %ds 无 P2P 真实数据，判定 P2P 失效，强制降级",
 			id, p2pIdleDeadMs/1000)
@@ -491,7 +487,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		p2pAvailTimers:    make(map[string]*time.Timer),
 		lastNoPeerLog:     make(map[string]int64),
 		tunStateLog:       make(map[string]ConnType),
-		p2pStatusReported: make(map[string]int), // ★ int
+		p2pStatusReported: make(map[string]int),
 		tunWriteCh:        make(chan []byte, 4096),
 		doneCh:            make(chan struct{}),
 		natMeta: &NATMetadata{
@@ -994,7 +990,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		}
 
 		e.p2pStatusReportedMu.Lock()
-		e.p2pStatusReported = make(map[string]int) // ★ int
+		e.p2pStatusReported = make(map[string]int)
 		e.p2pStatusReportedMu.Unlock()
 
 		e.p2pAvailTimersMu.Lock()
@@ -1303,7 +1299,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 				p.lastRecvAt = time.Now().UnixMilli()
 			}
 			e.peersMu.Unlock()
-			log.Printf("[Network] %s ws-reconnected，保留 P2P 状态", from)
+			log.Printf("[Network] %s ws-reconnected，保留 P2P/LAN 状态", from)
 			return
 		}
 
@@ -1312,13 +1308,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		}
 
 		e.peersMu.Lock()
-		oldTurnRelay := ""
-		oldUDPAddr := ""
 		if p := e.peers[from]; p != nil {
-			oldTurnRelay = p.TurnRelayAddr
-			if p.UDPAddr != nil {
-				oldUDPAddr = p.UDPAddr.String()
-			}
 			p.UDPAddr = nil
 			p.lastLANRecvAt = 0
 			p.lastPublicRecvAt = 0
@@ -1331,10 +1321,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			p.LanEndpoints = nil
 		}
 		e.peersMu.Unlock()
-		if oldTurnRelay != "" || oldUDPAddr != "" {
-			log.Printf("[Network] %s 已清空 TurnRelayAddr=%q UDPAddr=%q",
-				from, oldTurnRelay, oldUDPAddr)
-		}
 
 		natHoleActiveMu.Lock()
 		delete(failCounts, from)
@@ -1415,6 +1401,9 @@ func (e *Edge) maybeResetFailCountForPeer(peerID, newPubIP string, newPubPort in
 	}
 }
 
+// maybeResetOwnFailCounts 本机出口 IP 变化时重置失败计数。
+//
+// ★ 修复：oldIP == "" 时不 return，而是更新 PublicEndpoint。
 func (e *Edge) maybeResetOwnFailCounts(newEndpoint string) {
 	if newEndpoint == "" {
 		return
@@ -1460,6 +1449,7 @@ func (e *Edge) maybeResetOwnFailCounts(newEndpoint string) {
 	}
 }
 
+// findPeerCI 大小写不敏感查找 peer。
 func (e *Edge) findPeerCI(peerID string) *PeerInfo {
 	if peerID == "" {
 		return nil
@@ -1482,6 +1472,7 @@ func (e *Edge) peerExists(peerID string) bool {
 	return e.findPeerCI(peerID) != nil
 }
 
+// registerPeer 处理三种 UDPAddr 切换场景。
 func (e *Edge) registerPeer(pid, vip, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	var udpAddr *net.UDPAddr
 	if pubIP != "" && pubPort > 0 {
@@ -1717,6 +1708,12 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	})
 }
 
+// reportP2PStatus 上报 p2pStatus 给服务端。
+//
+// ★ 根据 status 传不同 state：
+//   status=3（P2P/LAN）→ state=3（成功）
+//   status=2（P2PAvailable）→ state=1（InProgress）
+//   status=0（降级到 TURN/WS）→ state=2（失败，服务端清 anySucceeded）
 func (e *Edge) reportP2PStatus(peerID string, status int) {
 	if e.ws == nil || peerID == "" {
 		return
@@ -1830,6 +1827,7 @@ func (e *Edge) udpReadLoop() {
 	}
 }
 
+// tunReadLoop TUN 读循环。TCP / UDP / ICMP 全部走 SendToPeer。
 func (e *Edge) tunReadLoop() {
 	buf := make([]byte, 65535)
 	for {
@@ -1880,6 +1878,20 @@ func (e *Edge) tunReadLoop() {
 				atomic.StoreInt64(&e.lastDataFrameAt, time.Now().UnixMilli())
 			} else {
 				e.logNoPeerThrottled(dstIP, n)
+			}
+			continue
+		}
+
+		// ICMP 走 sendICMPDirect（严格按状态机走）
+		if proto == 1 {
+			e.sendICMPDirect(target, buf[:n])
+			atomic.StoreInt64(&e.lastDataFrameAt, time.Now().UnixMilli())
+			if n >= 10 {
+				actualState := ConnUnknown
+				if e.relayMgr != nil {
+					actualState = e.relayMgr.GetState(target.ClientID)
+				}
+				e.logTunForward(target.ClientID, dstIP, n, proto, true, actualState)
 			}
 			continue
 		}
@@ -1954,63 +1966,188 @@ func (e *Edge) selfIsOnTargetLAN(target *PeerInfo) bool {
 	return false
 }
 
-// sendICMPDirect ICMP 发送。
+// sendICMPDirect ICMP 发送，严格按状态机走（与 Termux 的 sendICMP 一致）。
 //
-// ★ 修复：不再依赖 selfOnLAN，直接遍历 LanEndpoints 尝试。
+// ★ 修复：与 TCP/UDP 一致，ICMP 严格按 relayMgr 状态走。
 //
-// 旧版要求 selfOnLAN=true 才走 LAN，但 selfOnLAN 依赖 localPrefixes，
-// Android 上 localPrefixes 可能返回空（iface.Addrs() 返回 *net.IPAddr），
-// 导致跳过 LAN 走公网，ping 延迟从 9ms 升到 100ms。
+//   - ConnTURN:       TURN relay → 失败走 WS
+//   - ConnRelay:      WS
+//   - ConnLAN:        LAN → 私网 UDPAddr → 公网 UDPAddr → WS（不降级状态）
+//   - ConnP2P/avail:  selfOnLAN 时优先 LAN → UDPAddr → WS
+//   - ConnUnknown:    兜底 LAN → UDPAddr → TURN → WS（不改状态）
 //
-// 新版：LanEndpoints 有值就尝试，发到 LAN 成功就用，失败继续下一个。
-// LAN 端点是对端上报的可达地址，尝试成本低（一次 WriteToUDP）。
+// 与 TCP/UDP 的差异：ICMP 不参与 failCounts 降级。它是应答包，单次
+// 发送失败不应影响 TCP/UDP 的状态。LAN 状态下 LAN 失败也不主动降级
+// 到 P2PAvailable——让 sendP2PIdleKeepalive 的 60s 无流量检测去降级。
 func (e *Edge) sendICMPDirect(target *PeerInfo, pkt []byte) {
 	if target == nil {
 		return
 	}
 
-	// 1. LAN 优先：不检查 selfOnLAN，直接遍历 LanEndpoints
-	if len(target.LanEndpoints) > 0 && e.udpConn != nil {
+	if e.relayMgr == nil {
+		e.sendICMPBestEffort(target, pkt)
+		return
+	}
+
+	state := e.relayMgr.GetState(target.ClientID)
+
+	switch state {
+	case ConnTURN:
+		if target.TurnRelayAddr != "" && e.turnClient != nil && e.turnClient.IsReady() {
+			relayAddr, err := net.ResolveUDPAddr("udp", target.TurnRelayAddr)
+			if err == nil {
+				if sendErr := e.turnClient.Send(pkt, relayAddr); sendErr == nil {
+					atomic.StoreInt64(&e.lastDataFrameAt, time.Now().UnixMilli())
+					return
+				}
+			}
+		}
+		if e.ws != nil {
+			frame := buildN2NWFrame(target.ClientID, pkt)
+			_ = e.ws.SendBinary(frame)
+			atomic.StoreInt64(&e.lastDataFrameAt, time.Now().UnixMilli())
+		}
+
+	case ConnRelay:
+		if e.ws != nil {
+			frame := buildN2NWFrame(target.ClientID, pkt)
+			_ = e.ws.SendBinary(frame)
+			atomic.StoreInt64(&e.lastDataFrameAt, time.Now().UnixMilli())
+		}
+
+	case ConnLAN:
+		sent := false
+		if e.udpConn != nil && len(target.LanEndpoints) > 0 {
+			for _, lan := range target.LanEndpoints {
+				ra, err := net.ResolveUDPAddr("udp", lan)
+				if err != nil || ra == nil || ra.IP == nil {
+					continue
+				}
+				if _, err := e.udpConn.WriteTo(pkt, ra); err == nil {
+					sent = true
+					break
+				}
+			}
+		}
+		if !sent && target.UDPAddr != nil && isPrivateIPv4(target.UDPAddr.IP) && e.udpConn != nil {
+			if _, err := e.udpConn.WriteTo(pkt, target.UDPAddr); err == nil {
+				sent = true
+			}
+		}
+		if sent {
+			atomic.StoreInt64(&e.lastDataFrameAt, time.Now().UnixMilli())
+			return
+		}
+		if target.UDPAddr != nil && !isPrivateIPv4(target.UDPAddr.IP) && e.udpConn != nil {
+			if _, err := e.udpConn.WriteTo(pkt, target.UDPAddr); err == nil {
+				atomic.StoreInt64(&e.lastDataFrameAt, time.Now().UnixMilli())
+				return
+			}
+		}
+		if e.ws != nil {
+			frame := buildN2NWFrame(target.ClientID, pkt)
+			_ = e.ws.SendBinary(frame)
+			atomic.StoreInt64(&e.lastDataFrameAt, time.Now().UnixMilli())
+		}
+
+	case ConnP2P, ConnP2PAvailable:
+		selfOnLAN := e.selfIsOnTargetLAN(target)
+		sent := false
+
+		if selfOnLAN && e.udpConn != nil && len(target.LanEndpoints) > 0 {
+			for _, lan := range target.LanEndpoints {
+				ra, err := net.ResolveUDPAddr("udp", lan)
+				if err != nil || ra == nil || ra.IP == nil {
+					continue
+				}
+				if _, err := e.udpConn.WriteTo(pkt, ra); err == nil {
+					sent = true
+					break
+				}
+			}
+		}
+		if !sent && target.UDPAddr != nil && e.udpConn != nil {
+			skip := false
+			if isPrivateIPv4(target.UDPAddr.IP) && !selfOnLAN {
+				skip = true
+				log.Printf("[ICMP] %s UDPAddr=%s 是私网且本机不在该 LAN，跳过（避免黑洞）",
+					target.ClientID, target.UDPAddr)
+			}
+			if !skip {
+				if _, err := e.udpConn.WriteTo(pkt, target.UDPAddr); err == nil {
+					sent = true
+				}
+			}
+		}
+		if sent {
+			atomic.StoreInt64(&e.lastDataFrameAt, time.Now().UnixMilli())
+			return
+		}
+		if e.ws != nil {
+			frame := buildN2NWFrame(target.ClientID, pkt)
+			_ = e.ws.SendBinary(frame)
+			atomic.StoreInt64(&e.lastDataFrameAt, time.Now().UnixMilli())
+		}
+
+	default:
+		e.sendICMPBestEffort(target, pkt)
+	}
+}
+
+// sendICMPBestEffort ICMP 兜底发送（状态 Unknown 或 relayMgr 未就绪时）。
+//
+// 按 LAN → UDPAddr → TURN → WS 顺序尝试，不改 relayMgr 状态。
+func (e *Edge) sendICMPBestEffort(target *PeerInfo, pkt []byte) {
+	if target == nil {
+		return
+	}
+
+	selfOnLAN := e.selfIsOnTargetLAN(target)
+
+	// 1. LAN
+	if selfOnLAN && e.udpConn != nil && len(target.LanEndpoints) > 0 {
 		for _, lan := range target.LanEndpoints {
 			ra, err := net.ResolveUDPAddr("udp", lan)
 			if err != nil || ra == nil || ra.IP == nil {
 				continue
 			}
 			if _, err := e.udpConn.WriteTo(pkt, ra); err == nil {
+				atomic.StoreInt64(&e.lastDataFrameAt, time.Now().UnixMilli())
 				return
 			}
 		}
 	}
 
-	// 2. UDPAddr 兜底：私网地址跳过，除非本机也在该 LAN
+	// 2. UDPAddr（私网跳过，除非本机也在该 LAN）
 	if target.UDPAddr != nil && e.udpConn != nil {
 		skip := false
-		if isPrivateIPv4(target.UDPAddr.IP) && !e.selfIsOnTargetLAN(target) {
+		if isPrivateIPv4(target.UDPAddr.IP) && !selfOnLAN {
 			skip = true
-			log.Printf("[ICMP] %s UDPAddr=%s 是私网且本机不在该 LAN，跳过（避免黑洞）",
-				target.ClientID, target.UDPAddr)
 		}
 		if !skip {
 			if _, err := e.udpConn.WriteTo(pkt, target.UDPAddr); err == nil {
+				atomic.StoreInt64(&e.lastDataFrameAt, time.Now().UnixMilli())
 				return
 			}
 		}
 	}
 
-	// 3. TURN 兜底
+	// 3. TURN
 	if target.TurnRelayAddr != "" && e.turnClient != nil && e.turnClient.IsReady() {
 		relayAddr, err := net.ResolveUDPAddr("udp", target.TurnRelayAddr)
 		if err == nil {
 			if sendErr := e.turnClient.Send(pkt, relayAddr); sendErr == nil {
+				atomic.StoreInt64(&e.lastDataFrameAt, time.Now().UnixMilli())
 				return
 			}
 		}
 	}
 
-	// 4. WS 兜底（ICMP 走 WS 中继，牺牲延迟换可靠）
+	// 4. WS
 	if e.ws != nil {
 		frame := buildN2NWFrame(target.ClientID, pkt)
 		_ = e.ws.SendBinary(frame)
+		atomic.StoreInt64(&e.lastDataFrameAt, time.Now().UnixMilli())
 	}
 }
 
@@ -2074,6 +2211,12 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 	e.notePeerCommon(addr, true, true, false)
 }
 
+// notePeerCommon 统一处理所有来源的 UDP 包。
+//
+// ★ 修复：
+//   - isRealData && !viaTURN → 更新 lastP2PRecvAt
+//   - viaTURN && cur == ConnUnknown → MarkFallback（面板不再显示 --）
+//   - viaTURN && cur == ConnLAN/ConnP2P → ForceFallback("peer-via-turn")
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
 	now := time.Now().UnixMilli()
 
@@ -2291,6 +2434,7 @@ func (e *Edge) sendProbeTo(addr *net.UDPAddr) {
 	e.writeProbe(addr, probe, false)
 }
 
+// hasTrafficFromTarget 检测是否收到对端任何包（LAN 或公网）
 func (e *Edge) hasTrafficFromTarget(peerID string, since int64) bool {
 	if peerID == "" {
 		return false
@@ -2304,6 +2448,7 @@ func (e *Edge) hasTrafficFromTarget(peerID string, since int64) bool {
 	return p.lastRecvAt >= since
 }
 
+// hasTrafficFromTargetLAN 检测是否收到对端 LAN 包
 func (e *Edge) hasTrafficFromTargetLAN(peerID string, since int64) bool {
 	if peerID == "" {
 		return false
@@ -2317,6 +2462,7 @@ func (e *Edge) hasTrafficFromTargetLAN(peerID string, since int64) bool {
 	return p.lastLANRecvAt >= since
 }
 
+// hasTrafficFromTargetPublic 检测是否收到对端公网包
 func (e *Edge) hasTrafficFromTargetPublic(peerID string, since int64) bool {
 	if peerID == "" {
 		return false
@@ -2349,6 +2495,11 @@ func (e *Edge) hasTrafficFromAny(ips []net.IP, since int64) bool {
 	return false
 }
 
+// ============ 多 STUN 端点收集 ============
+
+// addAssistedEndpoint 添加 STUN 探测到的辅助端点。
+//
+// ★ 修复：wasEmpty || ipChanged 都立即上报，绕过 30 秒节流。
 func (e *Edge) addAssistedEndpoint(ip string, port int) {
 	if ip == "" || port <= 0 {
 		return
@@ -2459,6 +2610,7 @@ func (e *Edge) reportMetadata() {
 		metaPayload["lanEndpoints"] = lanEndpoints
 	}
 
+	// 上报 lanSubnets（服务端 shouldShareLan 判 CIDR 重叠）
 	if prefixes := localPrefixes(vip); len(prefixes) > 0 {
 		cidrs := make([]string, 0, len(prefixes))
 		for _, n := range prefixes {
@@ -2485,111 +2637,4 @@ func jsonInt(v interface{}) int {
 		return int(f)
 	}
 	return 0
-}
-
-// localPrefixes 返回本机所有可能是 LAN 前缀的网段，用于 LAN 亲和度排序
-// 和 lanSubnets 上报。
-//
-// ★ 修复：同时处理 *net.IPNet 和 *net.IPAddr。
-//
-//   Android 的 iface.Addrs() 有时返回 *net.IPAddr（不带 mask），
-//   旧版只处理 *net.IPNet，导致 localPrefixes 返回空：
-//     - selfOnLAN 永远 false → ICMP 走公网 → ping 延迟 100ms
-//     - lanSubnets 不上报 → 服务端 shouldShareLan 失效 → 同 WiFi 不走 LAN
-//     - sortLANByAffinity 返回原序 → LAN 亲和度失效
-//
-//   新版：*net.IPAddr 用 /24 兜底 mask（实际 LAN 前缀通常不超过 /24）。
-func localPrefixes(selfVIP string) []*net.IPNet {
-	var result []*net.IPNet
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return nil
-	}
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-		for _, addr := range addrs {
-			var ip4 net.IP
-			var mask net.IPMask
-
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip4 = v.IP.To4()
-				mask = v.Mask
-			case *net.IPAddr:
-				// ★ 修复：Android 的 iface.Addrs() 有时返回 *net.IPAddr
-				ip4 = v.IP.To4()
-				// 兜底用 /24，实际 LAN 前缀通常不会超过这个范围
-				mask = net.CIDRMask(24, 32)
-			default:
-				continue
-			}
-
-			if ip4 == nil {
-				continue
-			}
-			if isCGNATOverlay(ip4) {
-				continue
-			}
-			if selfVIP != "" && ip4.String() == selfVIP {
-				continue
-			}
-			if !isPrivateIPv4(ip4) {
-				continue
-			}
-			if ip4.IsLoopback() || ip4.IsLinkLocalUnicast() {
-				continue
-			}
-
-			ipnet := &net.IPNet{
-				IP:   ip4.Mask(mask),
-				Mask: mask,
-			}
-			result = append(result, ipnet)
-		}
-	}
-	return result
-}
-
-func sortLANByAffinity(lan []string, prefixes []*net.IPNet) []string {
-	if len(lan) < 2 || len(prefixes) == 0 {
-		return lan
-	}
-	type entry struct {
-		ep    string
-		score int
-	}
-	scored := make([]entry, len(lan))
-	for i, ep := range lan {
-		host, _, err := net.SplitHostPort(ep)
-		if err != nil {
-			host = ep
-		}
-		ip := net.ParseIP(host)
-		score := 0
-		if ip != nil && !isCGNATOverlay(ip) {
-			for _, p := range prefixes {
-				if p.Contains(ip) {
-					ones, _ := p.Mask.Size()
-					if ones > score {
-						score = ones
-					}
-				}
-			}
-		}
-		scored[i] = entry{ep, score}
-	}
-	sort.SliceStable(scored, func(i, j int) bool {
-		return scored[i].score > scored[j].score
-	})
-	out := make([]string, len(scored))
-	for i, s := range scored {
-		out[i] = s.ep
-	}
-	return out
 }
