@@ -30,7 +30,7 @@ type PeerInfo struct {
 	lastRecvAt        int64
 	lastLANRecvAt     int64
 	lastPublicRecvAt  int64
-	lastP2PRecvAt     int64
+	lastP2PRecvAt     int64 // ★ P2P 直连真实数据帧时间（viaTURN=false 且 isRealData=true）
 	loggedReady       bool
 	hasRealData       bool
 	AssistedEndpoints []string
@@ -100,6 +100,7 @@ type Edge struct {
 	lastMetadataReportAt int64
 	lastDataFrameAt      int64
 
+	// ★ 修复：bool → int，状态变化时重新上报
 	p2pStatusReported   map[string]int
 	p2pStatusReportedMu sync.Mutex
 
@@ -232,7 +233,7 @@ const p2pKeepaliveInterval = 15 * time.Second
 const p2pIdleKeepaliveInterval = 2 * time.Second
 const p2pIdleDeadMs = 30000
 const lanIdleDeadMs = 60000
-const lanProbeIntervalMs = 30000
+const lanProbeIntervalMs = 30000 // ★ LAN 每 30s 发一次 probe（保活 + 探测）
 
 func (e *Edge) startP2PKeepalive() {
 	log.Printf("[P2P-Keepalive] 启动：非 P2P 通道每 %v，P2P 通道每 %v（防 WiFi 省电）",
@@ -291,6 +292,11 @@ func (e *Edge) sendP2PKeepalive() {
 	}
 }
 
+// sendP2PIdleKeepalive P2P 状态发 probe + 无流量降级检测。
+//
+// ★ LAN 状态：每 30s 发一次 P2P probe（保活 + 探测），60s 无流量降级到 P2P。
+// ★ P2P 状态：30s 无 **P2P 真实数据** 降级到 TURN/WS（用 lastP2PRecvAt，不用 lastRecvAt）。
+// ★ P2PAvailable：交给 60s 超时处理。
 func (e *Edge) sendP2PIdleKeepalive() {
 	if e.relayMgr == nil || e.p2pStreams == nil {
 		return
@@ -310,6 +316,7 @@ func (e *Edge) sendP2PIdleKeepalive() {
 		st := e.relayMgr.GetState(id)
 
 		if st == ConnLAN {
+			// ★ LAN 每 30s 发一次 P2P probe（保活 + 探测）
 			if p.lastRecvAt > 0 && now-p.lastRecvAt > lanProbeIntervalMs {
 				lanProbePeers = append(lanProbePeers, id)
 			}
@@ -324,6 +331,7 @@ func (e *Edge) sendP2PIdleKeepalive() {
 		}
 
 		if st == ConnP2P && p.lastP2PRecvAt > 0 && now-p.lastP2PRecvAt > p2pIdleDeadMs {
+			// ★ 修复：只检查 P2P 收包时间，不检查总 lastRecvAt
 			log.Printf("[P2P] %s P2P 真实数据 %ds 未更新（lastRecvAt 可能被 TURN 包刷新），判定 P2P 失效",
 				id, (now-p.lastP2PRecvAt)/1000)
 			deadPeers = append(deadPeers, id)
@@ -334,15 +342,18 @@ func (e *Edge) sendP2PIdleKeepalive() {
 	}
 	e.peersMu.RUnlock()
 
+	// LAN 每 30s 发一次 P2P probe（保活）
 	for _, id := range lanProbePeers {
 		e.p2pStreams.sendP2PProbe(id)
 	}
 
+	// LAN 60s 无流量 → 降级到公网 P2P
 	for _, id := range lanDeadPeers {
 		log.Printf("[LAN] %s 60s 无流量，降级到公网 P2P", id)
 		e.relayMgr.DemoteLANToP2P(id, "no-traffic-60s")
 	}
 
+	// P2P 30s 无 P2P 真实数据 → TURN/WS
 	for _, id := range deadPeers {
 		log.Printf("[P2P] %s %ds 无 P2P 真实数据，判定 P2P 失效，强制降级",
 			id, p2pIdleDeadMs/1000)
@@ -480,7 +491,7 @@ func Start(cfg *Config, tunFd int, udpFd int, stunFd int) (*Edge, error) {
 		p2pAvailTimers:    make(map[string]*time.Timer),
 		lastNoPeerLog:     make(map[string]int64),
 		tunStateLog:       make(map[string]ConnType),
-		p2pStatusReported: make(map[string]int),
+		p2pStatusReported: make(map[string]int), // ★ int
 		tunWriteCh:        make(chan []byte, 4096),
 		doneCh:            make(chan struct{}),
 		natMeta: &NATMetadata{
@@ -727,6 +738,7 @@ func (e *Edge) Stop() {
 	close(e.doneCh)
 	e.closeMu.Unlock()
 
+	// ★ 清理 pending network change timer
 	e.pendingNetChangeMu.Lock()
 	if e.pendingNetChangeT != nil {
 		e.pendingNetChangeT.Stop()
@@ -982,7 +994,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		}
 
 		e.p2pStatusReportedMu.Lock()
-		e.p2pStatusReported = make(map[string]int)
+		e.p2pStatusReported = make(map[string]int) // ★ int
 		e.p2pStatusReportedMu.Unlock()
 
 		e.p2pAvailTimersMu.Lock()
@@ -1010,7 +1022,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		e.reportMetadata()
 		atomic.StoreInt64(&e.lastMetadataReportAt, time.Now().UnixMilli())
 
-		// ★ 补发 network_changed（防止切换瞬间发送丢失导致服务端 punchState 残留）
+		// ★ 补发 network_changed（防止切换瞬间丢失导致服务端 punchState 残留）
 		if e.ws != nil {
 			_ = e.ws.Send(map[string]interface{}{
 				"type":   "network_changed",
@@ -1019,11 +1031,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			log.Printf("[Network] WS 重连，补发 network_changed (reason=ws-reconnected)")
 		}
 
-		// ★ 新增：主动触发一次 STUN 探测
-		//
-		// 场景：A 换网络 + WSS 断流重连。如果只等 5 秒保活周期，
-		//       B 有 5 秒用旧 UDPAddr 丢包。主动探测把窗口压到 ~1 秒。
-		//       响应到达后 addAssistedEndpoint 会因 ipChanged 立即上报。
+		// ★ 主动触发一次 STUN 探测（不等 5s 保活周期）
 		safeGo("reconnect-stun-probe", func() {
 			time.Sleep(300 * time.Millisecond)
 			if e.udpConn == nil {
@@ -1289,14 +1297,13 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		reason, _ := msg["reason"].(string)
 		log.Printf("[Network] %s 网络变化 (%s)，重置与其相关的状态", from, reason)
 
-		// ★ ws-reconnected 不代表对端换网络
 		if reason == "ws-reconnected" {
 			e.peersMu.Lock()
 			if p := e.peers[from]; p != nil {
 				p.lastRecvAt = time.Now().UnixMilli()
 			}
 			e.peersMu.Unlock()
-			log.Printf("[Network] %s ws-reconnected，保留 P2P/LAN 状态", from)
+			log.Printf("[Network] %s ws-reconnected，保留 P2P 状态", from)
 			return
 		}
 
@@ -1947,6 +1954,66 @@ func (e *Edge) selfIsOnTargetLAN(target *PeerInfo) bool {
 	return false
 }
 
+// sendICMPDirect ICMP 发送。
+//
+// ★ 修复：不再依赖 selfOnLAN，直接遍历 LanEndpoints 尝试。
+//
+// 旧版要求 selfOnLAN=true 才走 LAN，但 selfOnLAN 依赖 localPrefixes，
+// Android 上 localPrefixes 可能返回空（iface.Addrs() 返回 *net.IPAddr），
+// 导致跳过 LAN 走公网，ping 延迟从 9ms 升到 100ms。
+//
+// 新版：LanEndpoints 有值就尝试，发到 LAN 成功就用，失败继续下一个。
+// LAN 端点是对端上报的可达地址，尝试成本低（一次 WriteToUDP）。
+func (e *Edge) sendICMPDirect(target *PeerInfo, pkt []byte) {
+	if target == nil {
+		return
+	}
+
+	// 1. LAN 优先：不检查 selfOnLAN，直接遍历 LanEndpoints
+	if len(target.LanEndpoints) > 0 && e.udpConn != nil {
+		for _, lan := range target.LanEndpoints {
+			ra, err := net.ResolveUDPAddr("udp", lan)
+			if err != nil || ra == nil || ra.IP == nil {
+				continue
+			}
+			if _, err := e.udpConn.WriteTo(pkt, ra); err == nil {
+				return
+			}
+		}
+	}
+
+	// 2. UDPAddr 兜底：私网地址跳过，除非本机也在该 LAN
+	if target.UDPAddr != nil && e.udpConn != nil {
+		skip := false
+		if isPrivateIPv4(target.UDPAddr.IP) && !e.selfIsOnTargetLAN(target) {
+			skip = true
+			log.Printf("[ICMP] %s UDPAddr=%s 是私网且本机不在该 LAN，跳过（避免黑洞）",
+				target.ClientID, target.UDPAddr)
+		}
+		if !skip {
+			if _, err := e.udpConn.WriteTo(pkt, target.UDPAddr); err == nil {
+				return
+			}
+		}
+	}
+
+	// 3. TURN 兜底
+	if target.TurnRelayAddr != "" && e.turnClient != nil && e.turnClient.IsReady() {
+		relayAddr, err := net.ResolveUDPAddr("udp", target.TurnRelayAddr)
+		if err == nil {
+			if sendErr := e.turnClient.Send(pkt, relayAddr); sendErr == nil {
+				return
+			}
+		}
+	}
+
+	// 4. WS 兜底（ICMP 走 WS 中继，牺牲延迟换可靠）
+	if e.ws != nil {
+		frame := buildN2NWFrame(target.ClientID, pkt)
+		_ = e.ws.SendBinary(frame)
+	}
+}
+
 func (e *Edge) tunWriteLoop() {
 	for {
 		select {
@@ -2282,18 +2349,6 @@ func (e *Edge) hasTrafficFromAny(ips []net.IP, since int64) bool {
 	return false
 }
 
-// ============ 多 STUN 端点收集 ============
-
-// addAssistedEndpoint 添加 STUN 探测到的辅助端点。
-//
-// ★ 修复：wasEmpty || ipChanged 都立即上报，绕过 30 秒节流。
-//
-// 场景：
-//   - wasEmpty：换网络后首次 STUN 响应，PublicEndpoint 从空变非空
-//   - ipChanged：WSS 重连时 _reconnected 先上报了旧地址（natMeta.PublicEndpoint 是旧值），
-//                随后 STUN 响应带回新 IP。旧版 wasEmpty=false 走 30 秒节流，
-//                B 有 30 秒用旧 UDPAddr 丢包。新版 ipChanged=true 立即上报，
-//                把窗口压到 STUN 一个周期（~5 秒，配合 _reconnected 主动探测更快）。
 func (e *Edge) addAssistedEndpoint(ip string, port int) {
 	if ip == "" || port <= 0 {
 		return
@@ -2430,4 +2485,111 @@ func jsonInt(v interface{}) int {
 		return int(f)
 	}
 	return 0
+}
+
+// localPrefixes 返回本机所有可能是 LAN 前缀的网段，用于 LAN 亲和度排序
+// 和 lanSubnets 上报。
+//
+// ★ 修复：同时处理 *net.IPNet 和 *net.IPAddr。
+//
+//   Android 的 iface.Addrs() 有时返回 *net.IPAddr（不带 mask），
+//   旧版只处理 *net.IPNet，导致 localPrefixes 返回空：
+//     - selfOnLAN 永远 false → ICMP 走公网 → ping 延迟 100ms
+//     - lanSubnets 不上报 → 服务端 shouldShareLan 失效 → 同 WiFi 不走 LAN
+//     - sortLANByAffinity 返回原序 → LAN 亲和度失效
+//
+//   新版：*net.IPAddr 用 /24 兜底 mask（实际 LAN 前缀通常不超过 /24）。
+func localPrefixes(selfVIP string) []*net.IPNet {
+	var result []*net.IPNet
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ip4 net.IP
+			var mask net.IPMask
+
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip4 = v.IP.To4()
+				mask = v.Mask
+			case *net.IPAddr:
+				// ★ 修复：Android 的 iface.Addrs() 有时返回 *net.IPAddr
+				ip4 = v.IP.To4()
+				// 兜底用 /24，实际 LAN 前缀通常不会超过这个范围
+				mask = net.CIDRMask(24, 32)
+			default:
+				continue
+			}
+
+			if ip4 == nil {
+				continue
+			}
+			if isCGNATOverlay(ip4) {
+				continue
+			}
+			if selfVIP != "" && ip4.String() == selfVIP {
+				continue
+			}
+			if !isPrivateIPv4(ip4) {
+				continue
+			}
+			if ip4.IsLoopback() || ip4.IsLinkLocalUnicast() {
+				continue
+			}
+
+			ipnet := &net.IPNet{
+				IP:   ip4.Mask(mask),
+				Mask: mask,
+			}
+			result = append(result, ipnet)
+		}
+	}
+	return result
+}
+
+func sortLANByAffinity(lan []string, prefixes []*net.IPNet) []string {
+	if len(lan) < 2 || len(prefixes) == 0 {
+		return lan
+	}
+	type entry struct {
+		ep    string
+		score int
+	}
+	scored := make([]entry, len(lan))
+	for i, ep := range lan {
+		host, _, err := net.SplitHostPort(ep)
+		if err != nil {
+			host = ep
+		}
+		ip := net.ParseIP(host)
+		score := 0
+		if ip != nil && !isCGNATOverlay(ip) {
+			for _, p := range prefixes {
+				if p.Contains(ip) {
+					ones, _ := p.Mask.Size()
+					if ones > score {
+						score = ones
+					}
+				}
+			}
+		}
+		scored[i] = entry{ep, score}
+	}
+	sort.SliceStable(scored, func(i, j int) bool {
+		return scored[i].score > scored[j].score
+	})
+	out := make([]string, len(scored))
+	for i, s := range scored {
+		out[i] = s.ep
+	}
+	return out
 }
