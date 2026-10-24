@@ -3,7 +3,6 @@ package internal
 import (
 	"log"
 	"net"
-	"runtime/debug"
 	"sync"
 	"time"
 )
@@ -19,16 +18,7 @@ const (
 	ConnRelay        ConnType = "relay"
 )
 
-func safeGo(name string, fn func()) {
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("[panic] %s: %v\n%s", name, r, debug.Stack())
-			}
-		}()
-		fn()
-	}()
-}
+// safeGo 定义在 edge.go 里。
 
 type RelayManager struct {
 	mu         sync.RWMutex
@@ -38,8 +28,9 @@ type RelayManager struct {
 	states     map[string]ConnType
 	failCounts map[string]int
 
-	// peer-via-ws 震荡保护：5 秒内累计 ≥5 个 WS 帧才降级
-	// 且要求 5 秒内没有 P2P 真实数据（lastP2PRecvAt 保护）
+	// ★ peer-via-ws 震荡保护
+	//   5 秒内累计 ≥5 个 WS 帧才降级
+	//   且要求 5 秒内没有 P2P 真实数据（lastRecvAt 保护）
 	wsFrameCounts map[string]int
 	wsFirstAt     map[string]int64
 }
@@ -56,6 +47,7 @@ func NewRelayManager(ws *WSTransport, turnClient *TURNClient, edge *Edge) *Relay
 	}
 }
 
+// MarkP2PAvailable 标记打洞握手成功（等待数据帧验证）。
 func (rm *RelayManager) MarkP2PAvailable(peerID string) {
 	rm.mu.Lock()
 	cur := rm.states[peerID]
@@ -72,6 +64,52 @@ func (rm *RelayManager) MarkP2PAvailable(peerID string) {
 	if rm.edge != nil {
 		rm.edge.cancelP2PAvailTimeout(peerID)
 		rm.edge.reportP2PStatus(peerID, 2)
+	}
+}
+
+func (rm *RelayManager) MarkP2P(peerId string) {
+	rm.mu.Lock()
+
+	// ★ 修复：当前是 ConnLAN 且 LAN 活跃时，拒绝降级到 P2P
+	//
+	// 场景：A 发 ICMP 走公网（A 的 selfOnLAN 判断失败），B 收到后
+	// notePeerCommon 调 MarkP2P，导致 B 从 ConnLAN 降到 ConnP2P。
+	// 这样 B 后续的 ICMP 响应也走公网，延迟从 <5ms 升到 10~50ms。
+	//
+	// 修复：如果当前是 ConnLAN 且 30s 内收到过 LAN 包，拒绝降级。
+	// LAN 真正失效时，sendP2PIdleKeepalive 的 60s 无流量检测会
+	// 主动调 DemoteLANToP2P，不依赖 MarkP2P。
+	if rm.states[peerId] == ConnLAN && rm.edge != nil {
+		rm.edge.peersMu.RLock()
+		var lastLAN int64
+		if p := rm.edge.peers[peerId]; p != nil {
+			lastLAN = p.lastLANRecvAt
+		}
+		rm.edge.peersMu.RUnlock()
+
+		if lastLAN > 0 && time.Now().UnixMilli()-lastLAN < 30000 {
+			rm.mu.Unlock()
+			log.Printf("[连接] %s 当前 ConnLAN 且 LAN 活跃（%ds 前收到），拒绝 MarkP2P",
+				peerId, (time.Now().UnixMilli()-lastLAN)/1000)
+			return
+		}
+	}
+
+	if rm.states[peerId] == ConnP2P {
+		rm.mu.Unlock()
+		return
+	}
+	prev := rm.states[peerId]
+	rm.states[peerId] = ConnP2P
+	delete(rm.failCounts, peerId)
+	rm.mu.Unlock()
+
+	log.Printf("[连接] %s → P2P 直连（prev=%s，数据面已验证）", peerId, prev)
+	rm.cancelFallbackTimer(peerId)
+
+	if rm.edge != nil {
+		rm.edge.cancelP2PAvailTimeout(peerId)
+		rm.edge.reportP2PStatus(peerId, 3)
 	}
 }
 
@@ -105,59 +143,6 @@ func (rm *RelayManager) DemoteLANToP2P(peerId, reason string) {
 	}
 	rm.states[peerId] = ConnP2P
 	log.Printf("[连接] %s LAN → P2P（%s）", peerId, reason)
-}
-
-// MarkP2P 标记 P2P 直连已验证。
-//
-// ★ 修复：ConnLAN 保护
-//
-// 场景：A 发 ICMP 走公网（A 的 selfOnLAN 判断失败），B 收到后
-// notePeerCommon 调 MarkP2P，导致 B 从 ConnLAN 降到 ConnP2P。
-// 这样 B 后续的 ICMP 响应也走公网，延迟从 <5ms 升到 10~50ms。
-//
-// 修复：如果当前是 ConnLAN 且 30s 内收到过 LAN 包，拒绝降级。
-// LAN 真正失效时，sendP2PIdleKeepalive 的 60s 无流量检测会
-// 主动调 DemoteLANToP2P，不依赖 MarkP2P。
-func (rm *RelayManager) MarkP2P(peerId string) {
-	// 进锁前检查，避免 rm.mu 与 peersMu 嵌套反向
-	if rm.edge != nil {
-		rm.mu.RLock()
-		cur := rm.states[peerId]
-		rm.mu.RUnlock()
-
-		if cur == ConnLAN {
-			rm.edge.peersMu.RLock()
-			var lastLAN int64
-			if p := rm.edge.peers[peerId]; p != nil {
-				lastLAN = p.lastLANRecvAt
-			}
-			rm.edge.peersMu.RUnlock()
-
-			if lastLAN > 0 && time.Now().UnixMilli()-lastLAN < 30000 {
-				log.Printf("[连接] %s 当前 ConnLAN 且 LAN 活跃（%ds 前收到），拒绝 MarkP2P",
-					peerId, (time.Now().UnixMilli()-lastLAN)/1000)
-				return
-			}
-		}
-	}
-
-	rm.mu.Lock()
-	if rm.states[peerId] == ConnP2P {
-		rm.mu.Unlock()
-		return
-	}
-	prev := rm.states[peerId]
-	rm.states[peerId] = ConnP2P
-	delete(rm.failCounts, peerId)
-	rm.mu.Unlock()
-
-	log.Printf("[连接] %s → P2P 直连（prev=%s，数据面已验证）", peerId, prev)
-	rm.cancelFallbackTimer(peerId)
-
-	if rm.edge != nil {
-		rm.edge.cancelP2PAvailTimeout(peerId)
-		rm.edge.reportP2PStatus(peerId, 3)
-	}
 }
 
 // MarkFallback 从 Unknown 状态降级到 TURN/WS。
@@ -206,8 +191,6 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 }
 
 // ForceFallback 强制降级。
-//
-// 允许 ConnLAN / ConnP2P 在特定 reason 下降级。
 func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
@@ -216,7 +199,7 @@ func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 		return
 	}
 
-	// ConnLAN 分支
+	// ★ ConnLAN 分支
 	if rm.states[peerId] == ConnLAN {
 		if reason != "peer-via-turn" &&
 			reason != "peer-via-ws" &&
@@ -229,7 +212,7 @@ func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 		log.Printf("[连接] %s 从 LAN 降级 (force: %s)", peerId, reason)
 	}
 
-	// ConnP2P 分支
+	// ★ ConnP2P 分支
 	if rm.states[peerId] == ConnP2P {
 		if reason != "no-traffic-30s" &&
 			reason != "p2p-avail-timeout" &&
@@ -252,6 +235,19 @@ func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	if rm.edge != nil {
 		rm.edge.cancelP2PAvailTimeout(peerId)
 		rm.edge.reportP2PStatus(peerId, 0)
+
+		if rm.ws != nil {
+			conns := make(map[string]string)
+			for id, t := range rm.states {
+				conns[id] = string(t)
+			}
+			if len(conns) > 0 {
+				_ = rm.ws.Send(map[string]interface{}{
+					"type":    "connection_status",
+					"payload": map[string]interface{}{"connections": conns},
+				})
+			}
+		}
 	}
 }
 
@@ -356,21 +352,41 @@ func (rm *RelayManager) ClearPeer(peerID string) {
 	if peerID == "" {
 		return
 	}
+
 	rm.mu.Lock()
-	defer rm.mu.Unlock()
 	delete(rm.states, peerID)
 	delete(rm.failCounts, peerID)
 	delete(rm.wsFrameCounts, peerID)
 	delete(rm.wsFirstAt, peerID)
+
+	conns := make(map[string]string)
+	for id, t := range rm.states {
+		conns[id] = string(t)
+	}
+	rm.mu.Unlock()
+
+	if rm.ws != nil {
+		_ = rm.ws.Send(map[string]interface{}{
+			"type":    "connection_status",
+			"payload": map[string]interface{}{"connections": conns},
+		})
+	}
 }
 
 func (rm *RelayManager) ClearAll() {
 	rm.mu.Lock()
-	defer rm.mu.Unlock()
 	rm.states = make(map[string]ConnType)
 	rm.failCounts = make(map[string]int)
 	rm.wsFrameCounts = make(map[string]int)
 	rm.wsFirstAt = make(map[string]int64)
+	rm.mu.Unlock()
+
+	if rm.ws != nil {
+		_ = rm.ws.Send(map[string]interface{}{
+			"type":    "connection_status",
+			"payload": map[string]interface{}{"connections": map[string]string{}},
+		})
+	}
 }
 
 func (rm *RelayManager) cancelFallbackTimer(peerID string) {
@@ -472,6 +488,8 @@ func (rm *RelayManager) SendViaRelay(data []byte) error {
 }
 
 // SendToPeer 按当前状态发送数据。
+//
+// ★ 修复：ConnTURN 分支每次发送前检查 TURN 是否真的就绪。
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
 	state := rm.GetState(peerId)
 
@@ -505,13 +523,13 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 			if err != nil || ra == nil || ra.IP == nil {
 				continue
 			}
-			if _, err := rm.edge.udpConn.WriteToUDP(data, ra); err == nil {
+			if _, err := rm.edge.udpConn.WriteTo(data, ra); err == nil {
 				sent = true
 				break
 			}
 		}
 		if !sent && target.UDPAddr != nil && isPrivateIPv4(target.UDPAddr.IP) {
-			if _, err := rm.edge.udpConn.WriteToUDP(data, target.UDPAddr); err == nil {
+			if _, err := rm.edge.udpConn.WriteTo(data, target.UDPAddr); err == nil {
 				sent = true
 			}
 		}
@@ -536,7 +554,7 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 		}
 
 		if target.UDPAddr != nil && !isPrivateIPv4(target.UDPAddr.IP) {
-			if _, err := rm.edge.udpConn.WriteToUDP(data, target.UDPAddr); err == nil {
+			if _, err := rm.edge.udpConn.WriteTo(data, target.UDPAddr); err == nil {
 				return true
 			}
 		}
@@ -552,18 +570,16 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 			return false
 		}
 
-		sent := false
 		selfOnLAN := rm.edge.selfIsOnTargetLAN(target)
+		sent := false
 
-		if selfOnLAN && target.UDPAddr != nil &&
-			!isPrivateIPv4(target.UDPAddr.IP) &&
-			len(target.LanEndpoints) > 0 {
+		if selfOnLAN && len(target.LanEndpoints) > 0 {
 			for _, lan := range target.LanEndpoints {
 				ra, err := net.ResolveUDPAddr("udp", lan)
 				if err != nil || ra == nil || ra.IP == nil {
 					continue
 				}
-				if _, err := rm.edge.udpConn.WriteToUDP(data, ra); err == nil {
+				if _, err := rm.edge.udpConn.WriteTo(data, ra); err == nil {
 					sent = true
 					break
 				}
@@ -578,7 +594,7 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 					peerId, target.UDPAddr)
 			}
 			if !skip {
-				if _, err := rm.edge.udpConn.WriteToUDP(data, target.UDPAddr); err == nil {
+				if _, err := rm.edge.udpConn.WriteTo(data, target.UDPAddr); err == nil {
 					sent = true
 				} else {
 					log.Printf("[P2P] UDP 发送到 %s 失败: %v", peerId, err)
@@ -610,6 +626,7 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 		return rm.ws.SendBinary(buildN2NWFrame(peerId, data)) == nil
 
 	case ConnTURN:
+		// ★ 修复：每次发送前检查 TURN 是否真的就绪
 		if rm.turnClient == nil || !rm.turnClient.IsReady() {
 			log.Printf("[TURN] %s TURN 未就绪（可能已断开），直接走 WS 兜底", peerId)
 			rm.mu.Lock()
@@ -625,9 +642,31 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 			relayAddr, err := net.ResolveUDPAddr("udp", target.TurnRelayAddr)
 			if err == nil {
 				if sendErr := rm.turnClient.Send(data, relayAddr); sendErr == nil {
+					rm.mu.Lock()
+					delete(rm.failCounts, peerId)
+					rm.mu.Unlock()
 					return true
 				} else {
 					log.Printf("[TURN] 发送到 %s 失败（临时）: %v", peerId, sendErr)
+					rm.mu.Lock()
+					rm.failCounts[peerId]++
+					fc := rm.failCounts[peerId]
+					rm.mu.Unlock()
+					if fc >= 3 {
+						log.Printf("[TURN] %s 连续失败 %d 次，清空 relay 地址等重新上报", peerId, fc)
+						rm.mu.Lock()
+						delete(rm.failCounts, peerId)
+						rm.mu.Unlock()
+						if rm.edge != nil {
+							rm.edge.peersMu.Lock()
+							if p := rm.edge.peers[peerId]; p != nil {
+								oldRelay := p.TurnRelayAddr
+								p.TurnRelayAddr = ""
+								log.Printf("[TURN] 清空 %s 的旧 relay 地址 %q", peerId, oldRelay)
+							}
+							rm.edge.peersMu.Unlock()
+						}
+					}
 					if rm.ws != nil {
 						_ = rm.ws.SendBinary(buildN2NWFrame(peerId, data))
 					}
