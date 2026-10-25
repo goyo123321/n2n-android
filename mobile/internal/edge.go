@@ -2213,7 +2213,16 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 
 // notePeerCommon 统一处理所有来源的 UDP 包。
 //
-// ★ 修复：
+// ★ P0-1' 修复：TURN 场景下 addr 是对端的 relay 地址（TURN Data Indication
+//   的 XOR-PEER-ADDRESS），不在该 peer 的 UDPAddr / LanEndpoints /
+//   AssistedEndpoints 里。加一个 TurnRelayAddr 反向匹配分支，否则
+//   TURN 场景下 best == nil，P0-1 / P0-2 全部空转。
+//
+//   Android 的 TUN 数据面掩盖了这个问题：即使匹配失败，onRemotePacket
+//   仍会写回 TUN，ping 依然通。但面板状态卡 p2p/p2p-avail，与实际走 TURN
+//   不符。Termux 没有 TUN，匹配失败会直接丢包（表现为 ping 不稳定）。
+//
+// ★ P0-2（Android 原本就有）：isRealData 分支加 viaTURN 处理。
 //   - isRealData && !viaTURN → 更新 lastP2PRecvAt
 //   - viaTURN && cur == ConnUnknown → MarkFallback（面板不再显示 --）
 //   - viaTURN && cur == ConnLAN/ConnP2P → ForceFallback("peer-via-turn")
@@ -2274,6 +2283,26 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 			bestScore = score
 		}
 	}
+
+	// ★ P0-1'：TURN 场景下 addr 是对端 relay 地址，按 TurnRelayAddr 反查
+	//
+	// 场景：A 已降级到 TURN，通过 TURN 服务器给 B 发数据帧。
+	// B 的 turnClient.onMessage 收到的 addr 是 A 的 TURN relay 地址
+	// （TURN Data Indication 的 XOR-PEER-ADDRESS），
+	// 它不在 A 的 UDPAddr / LanEndpoints / AssistedEndpoints 里。
+	//
+	// 不加这段的话，P0-1 在 TURN 场景下匹配失败，状态机不更新，
+	// 面板状态卡 p2p/p2p-avail（TUN 数据面掩盖，ping 仍通但状态不对）。
+	if best == nil && viaTURN {
+		addrStr := addr.String()
+		for _, p := range e.peers {
+			if p.TurnRelayAddr != "" && p.TurnRelayAddr == addrStr {
+				best = p
+				break
+			}
+		}
+	}
+
 	if best == nil {
 		e.peersMu.Unlock()
 		return
@@ -2333,6 +2362,7 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 		return
 	}
 
+	// ★ P0-2：isRealData 分支加 viaTURN 处理（Android 原本已有）
 	if isRealData {
 		cur := e.relayMgr.GetState(clientID)
 
